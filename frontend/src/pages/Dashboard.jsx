@@ -139,15 +139,15 @@ export default function Dashboard() {
       {/* Primary KPI Row */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 md:gap-6 mb-4">
         <Kpi label="Shipped Revenue" value={fmtINR(kpis.operating_revenue)}
-             sub={`${kpis.order_count} orders · from shipped qty only`}
+             sub={`${kpis.order_count} orders · realized from shipped qty`}
              icon={TrendingUp} testId="kpi-revenue" kpiId="revenue"
              onClick={() => openKpi("revenue")} />
         <Kpi label="Invoice Value" value={fmtINR(kpis.invoice_value)}
              sub={`GST collected ${fmtINR(kpis.gst_collected)}`}
              icon={Receipt} testId="kpi-invoice" kpiId="invoice"
              onClick={() => openKpi("invoice")} />
-        <Kpi label="Net Profit" value={fmtINR(kpis.net_profit)}
-             sub={`${kpis.margin_percent.toFixed(1)}% margin`}
+        <Kpi label="Realized Profit" value={fmtINR(kpis.net_profit)}
+             sub={`${kpis.margin_percent.toFixed(1)}% margin · on shipped qty`}
              tone="success" icon={TrendingUp} testId="kpi-profit" kpiId="profit"
              onClick={() => openKpi("profit")} />
         <Kpi label="Total Cost" value={fmtINR(kpis.total_cost)}
@@ -155,6 +155,24 @@ export default function Dashboard() {
              tone="danger" icon={TrendingDown} testId="kpi-cost" kpiId="cost"
              onClick={() => openKpi("cost")} />
       </div>
+
+      {/* Phase 4 — Estimated vs Realized (order-book potential) */}
+      {(kpis.estimated_revenue || 0) > 0 && (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6 mb-4"
+             data-testid="dash-estimated-row">
+          <Kpi label="Estimated Revenue" value={fmtINR(kpis.estimated_revenue || 0)}
+               sub={`Full order-book value · unrealized ${fmtINR(kpis.unrealized_revenue || 0)}`}
+               icon={ClipboardList} small testId="kpi-est-revenue" />
+          <Kpi label="Estimated Profit" value={fmtINR(kpis.estimated_net_profit || 0)}
+               sub={`${(kpis.estimated_margin_percent || 0).toFixed(1)}% margin · unrealized ${fmtINR(kpis.unrealized_net_profit || 0)}`}
+               tone="success" icon={TrendingUp} small testId="kpi-est-profit" />
+          <Kpi label="Unrealized (in transit)"
+               value={fmtINR(kpis.unrealized_net_profit || 0)}
+               sub={`Profit still to book once shipments complete`}
+               tone={(kpis.unrealized_net_profit || 0) > 0.5 ? "primary" : "default"}
+               icon={Truck} small testId="kpi-unrealized" />
+        </div>
+      )}
 
       {/* Party settlement row — Party Ledger v2 */}
       {partyLedger && (

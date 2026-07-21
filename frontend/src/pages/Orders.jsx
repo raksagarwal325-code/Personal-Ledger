@@ -80,8 +80,12 @@ export default function Orders() {
       invoice: a.invoice + (o.invoice_total || 0),
       received: a.received + (o.total_received || 0),
       outstanding: a.outstanding + (o.outstanding_balance || 0),
+      est_revenue: a.est_revenue + (o.estimated_operating_revenue || o.operating_revenue || 0),
+      est_profit: a.est_profit + (o.estimated_net_profit || o.net_profit || 0),
+      unrealized_profit: a.unrealized_profit + (o.unrealized_net_profit || 0),
     }),
-    { revenue: 0, cost: 0, profit: 0, invoice: 0, received: 0, outstanding: 0 }
+    { revenue: 0, cost: 0, profit: 0, invoice: 0, received: 0, outstanding: 0,
+      est_revenue: 0, est_profit: 0, unrealized_profit: 0 }
   ), [orders]);
 
   const toggle = (id) => setExpanded((prev) => {
@@ -164,17 +168,29 @@ export default function Orders() {
         <div className="card-warm px-5 py-4">
           <div className="label-caps">Operating Revenue</div>
           <div className="serif text-2xl num mt-1" data-testid="orders-total-rev">{fmtINR(totals.revenue)}</div>
+          <div className="text-[10px] mt-1" style={{ color: "var(--muted)" }}>
+            realized · est {fmtINR(totals.est_revenue)}
+          </div>
         </div>
         <div className="card-warm px-5 py-4">
           <div className="label-caps">Invoice value</div>
           <div className="serif text-2xl num mt-1">{fmtINR(totals.invoice)}</div>
         </div>
         <div className="card-warm px-5 py-4">
-          <div className="label-caps">Net profit</div>
+          <div className="label-caps">Realized Profit</div>
           <div className="serif text-2xl num mt-1"
                style={{ color: totals.profit >= 0 ? "var(--sage)" : "var(--danger)" }}
                data-testid="orders-total-profit">
             {fmtINR(totals.profit)}
+          </div>
+          <div className="text-[10px] mt-1" style={{ color: "var(--muted)" }}
+               data-testid="orders-total-est-profit">
+            est {fmtINR(totals.est_profit)}
+            {totals.unrealized_profit > 0.5 && (
+              <span style={{ color: "var(--terracotta)" }}>
+                {" · "}unrealized {fmtINR(totals.unrealized_profit)}
+              </span>
+            )}
           </div>
         </div>
         <div className="card-warm px-5 py-4">
@@ -193,16 +209,18 @@ export default function Orders() {
       {/* Table */}
       <div className="card-warm overflow-hidden">
         <div className="overflow-x-auto max-h-[70vh]">
-          <table className="ledger-table w-full min-w-[1000px]" data-testid="orders-table">
+          <table className="ledger-table w-full min-w-[1180px]" data-testid="orders-table">
             <thead>
               <tr>
                 <th style={{ width: 40 }}></th>
                 <th>Date</th>
                 <th>Client</th>
                 <th>Items</th>
-                <th className="num">Operating Rev</th>
+                <th className="num">Realized Rev</th>
+                <th className="num">Est. Rev</th>
                 <th className="num">Total Cost</th>
-                <th className="num">Profit</th>
+                <th className="num">Realized Profit</th>
+                <th className="num">Est. Profit</th>
                 <th className="num">Outstanding</th>
                 <th>Status</th>
                 <th></th>
@@ -210,10 +228,10 @@ export default function Orders() {
             </thead>
             <tbody>
               {loading && (
-                <tr><td colSpan="10" className="text-center py-10 text-sm" style={{ color: "var(--muted)" }}>Loading…</td></tr>
+                <tr><td colSpan="12" className="text-center py-10 text-sm" style={{ color: "var(--muted)" }}>Loading…</td></tr>
               )}
               {!loading && orders.length === 0 && (
-                <tr><td colSpan="10" className="text-center py-10 text-sm" style={{ color: "var(--muted)" }}>
+                <tr><td colSpan="12" className="text-center py-10 text-sm" style={{ color: "var(--muted)" }}>
                   No orders yet. Click "New order" to create one.
                 </td></tr>
               )}
@@ -252,10 +270,25 @@ export default function Orders() {
                         )}
                       </td>
                       <td className="num font-medium">{fmtINR(o.operating_revenue)}</td>
+                      <td className="num" style={{ color: "var(--muted)" }}
+                          data-testid={`order-est-rev-${o.id}`}>
+                        {fmtINR(o.estimated_operating_revenue || o.operating_revenue || 0)}
+                      </td>
                       <td className="num" style={{ color: "var(--muted)" }}>{fmtINR(o.total_cost)}</td>
                       <td className="num font-medium"
                           style={{ color: o.net_profit >= 0 ? "var(--sage)" : "var(--danger)" }}>
                         {fmtINR(o.net_profit)}
+                      </td>
+                      <td className="num"
+                          style={{ color: "var(--muted)" }}
+                          data-testid={`order-est-profit-${o.id}`}>
+                        {fmtINR(o.estimated_net_profit || o.net_profit || 0)}
+                        {(o.unrealized_net_profit || 0) > 0.5 && (
+                          <div className="text-[10px] mt-0.5"
+                               style={{ color: "var(--terracotta)" }}>
+                            +{fmtINR(o.unrealized_net_profit)} unrealized
+                          </div>
+                        )}
                       </td>
                       <td className="num"
                           style={{ color: (o.outstanding_balance || 0) > 0.5 ? "var(--terracotta)" : "var(--muted)" }}>
@@ -292,8 +325,65 @@ export default function Orders() {
                     </tr>
                     {isOpen && (
                       <tr>
-                        <td colSpan={10} className="p-0" style={{ background: "var(--surface-alt)" }}>
+                        <td colSpan={12} className="p-0" style={{ background: "var(--surface-alt)" }}>
                           <div className="px-6 py-5">
+                            {/* Phase 4 — Revenue recognition */}
+                            <div className="rounded-md bg-white p-4 border mb-5"
+                                 style={{ borderColor: "var(--border-warm)" }}
+                                 data-testid={`order-rev-recognition-${o.id}`}>
+                              <div className="flex items-center justify-between mb-3">
+                                <div className="label-caps">Revenue recognition</div>
+                                <div className="text-xs" style={{ color: "var(--muted)" }}>
+                                  {o.shipped_qty_total || 0} of {o.ordered_qty_total || 0} qty shipped
+                                  {" · "}{(o.shipment_progress_percent || 0).toFixed(0)}%
+                                </div>
+                              </div>
+                              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                                <div>
+                                  <div className="text-xs" style={{ color: "var(--muted)" }}>Realized revenue</div>
+                                  <div className="serif text-lg num mt-0.5">{fmtINR(o.operating_revenue || 0)}</div>
+                                </div>
+                                <div>
+                                  <div className="text-xs" style={{ color: "var(--muted)" }}>Estimated revenue</div>
+                                  <div className="serif text-lg num mt-0.5">
+                                    {fmtINR(o.estimated_operating_revenue || o.operating_revenue || 0)}
+                                  </div>
+                                </div>
+                                <div>
+                                  <div className="text-xs" style={{ color: "var(--muted)" }}>Realized profit</div>
+                                  <div className="serif text-lg num mt-0.5"
+                                       style={{ color: (o.net_profit || 0) >= 0 ? "var(--sage)" : "var(--danger)" }}>
+                                    {fmtINR(o.net_profit || 0)}
+                                  </div>
+                                  <div className="text-[10px] mt-0.5" style={{ color: "var(--muted)" }}>
+                                    {(o.margin_percent || 0).toFixed(1)}% margin
+                                  </div>
+                                </div>
+                                <div>
+                                  <div className="text-xs" style={{ color: "var(--muted)" }}>Estimated profit</div>
+                                  <div className="serif text-lg num mt-0.5"
+                                       style={{ color: (o.estimated_net_profit || 0) >= 0 ? "var(--sage)" : "var(--danger)" }}>
+                                    {fmtINR(o.estimated_net_profit || o.net_profit || 0)}
+                                  </div>
+                                  <div className="text-[10px] mt-0.5" style={{ color: "var(--muted)" }}>
+                                    {(o.estimated_margin_percent || 0).toFixed(1)}% margin
+                                  </div>
+                                </div>
+                              </div>
+                              {(o.unrealized_net_profit || 0) > 0.5 && (
+                                <div className="mt-3 pt-3 border-t text-xs"
+                                     style={{ borderColor: "var(--border-warm)", color: "var(--terracotta)" }}>
+                                  Unrealized profit still to book once remaining shipments complete:{" "}
+                                  <span className="font-medium">{fmtINR(o.unrealized_net_profit)}</span>
+                                  {(o.unrealized_revenue || 0) > 0 && (
+                                    <span style={{ color: "var(--muted)" }}>
+                                      {" · "}on {fmtINR(o.unrealized_revenue)} of pending revenue
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+
                             <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-5 text-sm">
                               <div>
                                 <div className="label-caps">Product sales</div>

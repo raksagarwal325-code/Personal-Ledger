@@ -237,6 +237,7 @@ class Order(OrderBase):
     # SHIPPED aggregates (recognized — used everywhere for revenue/profit)
     shipped_qty_total: float = 0
     shipped_product_sales: float = 0
+    product_sales_total: float = 0     # alias of shipped_product_sales (legacy name used by dashboard/UI)
     factory_cost_total: float = 0
     outside_cost_total: float = 0
     other_revenue_total: float = 0
@@ -250,6 +251,22 @@ class Order(OrderBase):
     net_profit: float = 0
     margin_percent: float = 0
     shipment_progress_percent: float = 0  # shipped_qty / ordered_qty * 100
+
+    # Phase 4 — ESTIMATED (potential) aggregates: what the order will yield
+    # if every remaining unshipped unit is eventually shipped at the
+    # committed rates. `realized_*` are the same numbers already exposed above
+    # (operating_revenue / net_profit) — kept as explicit aliases for the UI.
+    estimated_factory_cost_total: float = 0
+    estimated_outside_cost_total: float = 0
+    estimated_operating_revenue: float = 0
+    estimated_total_cost: float = 0
+    estimated_net_profit: float = 0
+    estimated_margin_percent: float = 0
+    realized_revenue: float = 0          # alias of operating_revenue
+    realized_net_profit: float = 0       # alias of net_profit
+    revenue_recognized: float = 0        # PRD-mandated name = operating_revenue
+    unrealized_revenue: float = 0        # estimated_operating_revenue - operating_revenue
+    unrealized_net_profit: float = 0     # estimated_net_profit - net_profit
 
     # Payment aggregates (from customer_payments allocations)
     total_received: float = 0
@@ -386,6 +403,10 @@ def compute_order_aggregates(order: dict) -> dict:
     shipped_product_sales = 0.0
     factory_cost_total = 0.0
     outside_cost_total = 0.0
+    # Phase 4 — estimated (full-order) factory & outside costs, i.e. what these
+    # would total if every ordered unit were shipped.
+    estimated_factory_cost_total = 0.0
+    estimated_outside_cost_total = 0.0
 
     for it in items:
         ordered_qty = float(it.get("qty") or 0)
@@ -403,9 +424,13 @@ def compute_order_aggregates(order: dict) -> dict:
         shipped_product_sales += item_ordered_sales * ratio
 
         for k in ("factory_complete", "factory_glass", "factory_fitting"):
-            factory_cost_total += float(it.get(k) or 0) * ratio
+            v = float(it.get(k) or 0)
+            factory_cost_total += v * ratio
+            estimated_factory_cost_total += v
         for k in ("outside_complete", "outside_glass", "outside_fitting"):
-            outside_cost_total += float(it.get(k) or 0) * ratio
+            v = float(it.get(k) or 0)
+            outside_cost_total += v * ratio
+            estimated_outside_cost_total += v
 
     other_revenue_total = sum(float((e or {}).get("amount") or 0) for e in (order.get("other_revenue") or []))
     other_expense_total = sum(float((e or {}).get("amount") or 0) for e in (order.get("other_expense") or []))
@@ -482,6 +507,37 @@ def compute_order_aggregates(order: dict) -> dict:
     order["shipment_progress_percent"] = progress
     # legacy compatibility fields expected by dashboard/breakdown
     order["product_sales_total"] = shipped_product_sales
+
+    # ─── Phase 4 — estimated (full-order) revenue + profit and realized aliases.
+    # `estimated_*` = what this order will total when every remaining unit is
+    # eventually shipped, at the committed rate + already-recorded freight /
+    # packing / other adjustments. `realized_*` = same as the shipped-qty
+    # values already on the order — kept as explicit fields so the frontend
+    # never has to guess which aggregate is "recognized".
+    estimated_operating_revenue = (ordered_product_sales
+                                   + ship_freight_charged
+                                   + packing_recovery
+                                   + other_revenue_total)
+    estimated_total_cost = (estimated_factory_cost_total
+                            + estimated_outside_cost_total
+                            + packing_cost
+                            + ship_freight_paid
+                            + other_expense_total)
+    estimated_net_profit = estimated_operating_revenue - estimated_total_cost
+    estimated_margin = (estimated_net_profit / estimated_operating_revenue * 100.0
+                        if estimated_operating_revenue else 0)
+    order["estimated_factory_cost_total"] = estimated_factory_cost_total
+    order["estimated_outside_cost_total"] = estimated_outside_cost_total
+    order["estimated_operating_revenue"] = estimated_operating_revenue
+    order["estimated_total_cost"] = estimated_total_cost
+    order["estimated_net_profit"] = estimated_net_profit
+    order["estimated_margin_percent"] = estimated_margin
+    # Aliases — same numbers, PRD-mandated names for the UI.
+    order["realized_revenue"] = operating_revenue
+    order["realized_net_profit"] = net_profit
+    order["revenue_recognized"] = operating_revenue
+    order["unrealized_revenue"] = max(0.0, estimated_operating_revenue - operating_revenue)
+    order["unrealized_net_profit"] = estimated_net_profit - net_profit
     return order
 
 
@@ -1208,6 +1264,23 @@ async def dashboard():
     gst_collected = sum(o.get("tax_amount") or 0 for o in orders)
     margin = (net_profit / operating_revenue * 100.0) if operating_revenue else 0
 
+    # Phase 4 — estimated (full-order) revenue + profit aggregates.
+    # Falls back to realized (operating_revenue / net_profit) for orders that
+    # pre-date the Phase 4 backfill and don't yet have the new fields.
+    estimated_revenue = sum((o.get("estimated_operating_revenue")
+                             if o.get("estimated_operating_revenue") is not None
+                             else o.get("operating_revenue") or 0) for o in orders)
+    estimated_total_cost = sum((o.get("estimated_total_cost")
+                                if o.get("estimated_total_cost") is not None
+                                else o.get("total_cost") or 0) for o in orders)
+    estimated_net_profit = sum((o.get("estimated_net_profit")
+                                if o.get("estimated_net_profit") is not None
+                                else o.get("net_profit") or 0) for o in orders)
+    estimated_margin = (estimated_net_profit / estimated_revenue * 100.0
+                        if estimated_revenue else 0)
+    unrealized_revenue = max(0.0, estimated_revenue - operating_revenue)
+    unrealized_net_profit = estimated_net_profit - net_profit
+
     # ─── P0: KPIs `received` / `paid` / `modes` come from CANONICAL sources.
     # Legacy db.payments is intentionally NOT read here — those rows are
     # stamped source='legacy_migrated' and surfaced only in the Cash Book
@@ -1358,6 +1431,16 @@ async def dashboard():
             "total_cost": total_cost,
             "net_profit": net_profit,
             "margin_percent": margin,
+            # Phase 4 — estimated + realized split
+            "estimated_revenue": estimated_revenue,
+            "estimated_total_cost": estimated_total_cost,
+            "estimated_net_profit": estimated_net_profit,
+            "estimated_margin_percent": estimated_margin,
+            "realized_revenue": operating_revenue,          # alias
+            "realized_net_profit": net_profit,              # alias
+            "revenue_recognized": operating_revenue,        # PRD name
+            "unrealized_revenue": unrealized_revenue,
+            "unrealized_net_profit": unrealized_net_profit,
             "gst_collected": gst_collected,
             "outstanding_receivable": outstanding_receivable,
             "outstanding_payable": outstanding_payable,
@@ -3438,10 +3521,14 @@ async def _refresh_stored_aggregates() -> int:
     n = 0
     async for doc in db.orders.find({}):
         doc.pop("_id", None)
-        before = {k: doc.get(k) for k in ("operating_revenue", "total_cost", "net_profit", "invoice_total")}
+        before = {k: doc.get(k) for k in ("operating_revenue", "total_cost", "net_profit",
+                                          "invoice_total", "estimated_operating_revenue",
+                                          "estimated_net_profit")}
         compute_order_aggregates(doc)
-        after = {k: doc.get(k) for k in ("operating_revenue", "total_cost", "net_profit", "invoice_total")}
-        if before != after or "total_received" not in doc:
+        after = {k: doc.get(k) for k in ("operating_revenue", "total_cost", "net_profit",
+                                         "invoice_total", "estimated_operating_revenue",
+                                         "estimated_net_profit")}
+        if before != after or "total_received" not in doc or "estimated_operating_revenue" not in before:
             await db.orders.update_one({"id": doc["id"]}, {"$set": {
                 "product_sales_total": doc["product_sales_total"],
                 "factory_cost_total": doc["factory_cost_total"],
@@ -3456,6 +3543,18 @@ async def _refresh_stored_aggregates() -> int:
                 "margin_percent": doc["margin_percent"],
                 "total_received": doc.get("total_received", 0),
                 "outstanding_balance": doc.get("outstanding_balance", 0),
+                # Phase 4 — estimated + realized aliases
+                "estimated_factory_cost_total": doc["estimated_factory_cost_total"],
+                "estimated_outside_cost_total": doc["estimated_outside_cost_total"],
+                "estimated_operating_revenue": doc["estimated_operating_revenue"],
+                "estimated_total_cost": doc["estimated_total_cost"],
+                "estimated_net_profit": doc["estimated_net_profit"],
+                "estimated_margin_percent": doc["estimated_margin_percent"],
+                "realized_revenue": doc["realized_revenue"],
+                "realized_net_profit": doc["realized_net_profit"],
+                "revenue_recognized": doc["revenue_recognized"],
+                "unrealized_revenue": doc["unrealized_revenue"],
+                "unrealized_net_profit": doc["unrealized_net_profit"],
             }})
             n += 1
     return n

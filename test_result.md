@@ -119,6 +119,135 @@ user_problem_statement: |
   If those end-to-end tests pass, Admin Data Management v1 is complete.
 
 backend:
+  - task: "Phase 4 — Partial-shipment proportional revenue + Estimated vs Realized profit"
+    implemented: true
+    working: true
+    file: "backend/server.py, backend/tests/test_p4_partial_shipment_revenue.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          Phase 4 implemented. Summary of changes:
+            * backend/server.py — extended `compute_order_aggregates` to compute
+              estimated (full-order) factory + outside costs unratioed alongside
+              the existing shipped-ratio realized costs. Added `estimated_*` +
+              `realized_*` + `revenue_recognized` + `unrealized_*` fields on
+              every order.
+            * `Order` model gained the new fields (defaults 0). Added
+              `product_sales_total` to the model as an explicit legacy alias so
+              the frontend can rely on the response schema.
+            * `_refresh_stored_aggregates` now persists the new fields — startup
+              backfill runs automatically and is idempotent.
+            * `/api/dashboard` KPI response now exposes:
+              `estimated_revenue`, `estimated_total_cost`, `estimated_net_profit`,
+              `estimated_margin_percent`, `realized_revenue`, `realized_net_profit`,
+              `revenue_recognized`, `unrealized_revenue`, `unrealized_net_profit`.
+            * New test suite tests/test_p4_partial_shipment_revenue.py — 6/6 pass:
+              - no-shipment: realized=0, estimated>0, unrealized == estimated.
+              - full shipment: realized == estimated, unrealized == 0.
+              - 60% shipment: product sales + factory + outside costs proportioned,
+                freight/packing recorded fully, aggregates all check out.
+              - adding a shipment reduces unrealized.
+              - dashboard exposes all fields with correct alias identities.
+              - dashboard unrealized_net_profit == estimated_net_profit - net_profit.
+          Please independently verify via curl + a fresh order that the
+          proportions hold and no existing endpoint regressed.
+      - working: true
+        agent: "testing"
+        comment: |
+          ✅ PHASE 4 VERIFICATION COMPLETE — ALL 17 TESTS PASSED
+          
+          Executed comprehensive API-level verification covering all requirements:
+          
+          **Order Creation & Math Verification:**
+          ✅ Order A (no shipment, Q=10, R=100, F_total=200, O_total=100):
+            - operating_revenue = 0 ✓
+            - net_profit = 0 ✓
+            - estimated_operating_revenue = 1000 ✓
+            - estimated_total_cost = 300 ✓
+            - estimated_net_profit = 700 ✓
+            - unrealized_revenue = 1000 ✓
+            - unrealized_net_profit = 700 ✓
+            - All alias fields (realized_revenue, revenue_recognized) = 0 ✓
+          
+          ✅ Order B (partial 40%, Q=100, R=50, F_total=1000, O_total=500):
+            - ratio = 0.4, shipped = 40 units
+            - operating_revenue = 2150 (2000 product + 150 freight) ✓
+            - net_profit = 1450 (2150 - 700 cost) ✓
+            - factory_cost_total = 400 (0.4 × 1000) ✓
+            - outside_cost_total = 200 (0.4 × 500) ✓
+            - total_cost = 700 (400 + 200 + 100 freight_paid) ✓
+            - estimated_operating_revenue = 5150 ✓
+            - estimated_total_cost = 1600 ✓
+            - estimated_net_profit = 3550 ✓
+            - unrealized_revenue = 3000 ✓
+            - unrealized_net_profit = 2100 ✓
+          
+          ✅ Order C (full shipment, Q=25, R=200, F_total=1250, O_total=750):
+            - ratio = 1.0, shipped = 25 units
+            - operating_revenue = 5075 = estimated_operating_revenue ✓
+            - net_profit = 3025 = estimated_net_profit ✓
+            - unrealized_revenue = 0 ✓
+            - unrealized_net_profit = 0 ✓
+          
+          **API Endpoint Verification:**
+          ✅ GET /api/orders - All test orders present with correct values
+          
+          ✅ GET /api/dashboard - All Phase 4 KPI fields present:
+            - operating_revenue, net_profit, estimated_revenue, estimated_total_cost,
+              estimated_net_profit, estimated_margin_percent, realized_revenue,
+              realized_net_profit, revenue_recognized, unrealized_revenue,
+              unrealized_net_profit, margin_percent
+          
+          ✅ Dashboard Alias Identities Verified:
+            - realized_revenue == operating_revenue ✓
+            - realized_net_profit == net_profit ✓
+            - revenue_recognized == operating_revenue ✓
+            - unrealized_net_profit == estimated_net_profit - net_profit ✓
+            - unrealized_revenue >= 0 ✓
+            - estimated_revenue >= operating_revenue ✓
+          
+          **Dynamic Shipment Addition:**
+          ✅ Order A after adding 5/10 shipment:
+            - ratio = 0.5
+            - operating_revenue = 500 ✓
+            - net_profit = 350 (500 - 150 cost) ✓
+            - estimated_operating_revenue = 1000 ✓
+            - estimated_net_profit = 700 ✓
+            - unrealized_revenue = 500 ✓
+            - unrealized_net_profit = 350 ✓
+          
+          **Regression Sweep (6/6 endpoints):**
+          ✅ GET /api/dashboard - 200 OK
+          ✅ GET /api/orders - 200 OK
+          ✅ GET /api/customer-payments - 200 OK
+          ✅ GET /api/purchase-payments - 200 OK
+          ✅ GET /api/dashboard/breakdown - 200 OK
+          ✅ GET /api/auth/status - 200 OK (reset_enabled=true)
+          
+          **Cleanup:**
+          ✅ All 3 test orders deleted successfully
+          
+          **Pytest Suite:**
+          ✅ tests/test_p4_partial_shipment_revenue.py - 6/6 tests passed
+          
+          **Math Verification:**
+          All proportional revenue recognition formulas verified:
+          - ratio = shipped_qty / ordered_qty
+          - realized_product_sales = ratio × ordered_product_sales
+          - realized_factory_cost = ratio × factory_cost_total
+          - realized_outside_cost = ratio × outside_cost_total
+          - Freight/packing costs NOT proportioned (event-recorded)
+          - All values within ±0.5 tolerance
+          
+          **Conclusion:**
+          Phase 4 implementation is WORKING CORRECTLY. All math invariants hold,
+          all required fields are present, all alias identities are correct, and
+          no existing endpoints regressed. The feature is production-ready.
+
   - task: "Admin Data Management v1 — ALLOW_ADMIN_DATA_RESET flag & end-to-end reset flow"
     implemented: true
     working: true
@@ -302,7 +431,7 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Admin Data Management v1 — ALLOW_ADMIN_DATA_RESET flag & end-to-end reset flow"
+    - "Phase 4 — Partial-shipment proportional revenue + Estimated vs Realized profit"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -400,3 +529,31 @@ agent_communication:
       No regressions detected. Admin Data Management v1 is fully working end-to-end.
       
       RECOMMENDATION: Feature is complete and ready. Main agent can summarize and finish.
+  - agent: "testing"
+    message: |
+      ✅ PHASE 4 VERIFICATION COMPLETE — ALL TESTS PASSED (17/17)
+      
+      Comprehensive API-level verification executed for Phase 4 (Partial-shipment 
+      proportional revenue + Estimated vs Realized profit split).
+      
+      **Test Coverage:**
+      • Created 3 test orders with exact parameters (no shipment, 40% partial, 100% full)
+      • Verified all math invariants within ±0.5 tolerance
+      • Confirmed all Phase 4 fields present on orders and dashboard
+      • Validated all alias identities (realized_revenue, revenue_recognized, etc.)
+      • Added dynamic shipment to verify ratio recalculation
+      • Regression tested 6 existing endpoints (all 200 OK)
+      • Ran pytest suite (6/6 tests passed)
+      • Cleaned up all test data
+      
+      **Key Findings:**
+      ✅ Proportional revenue recognition math is correct
+      ✅ Estimated vs realized profit split working as specified
+      ✅ Dashboard KPIs expose all required Phase 4 fields
+      ✅ All alias identities hold (realized_revenue == operating_revenue, etc.)
+      ✅ No regressions in existing endpoints
+      ✅ Pytest suite passes (test_p4_partial_shipment_revenue.py)
+      
+      **Conclusion:**
+      Phase 4 is PRODUCTION-READY. All requirements from the review request verified.
+      Main agent can summarize and finish.
