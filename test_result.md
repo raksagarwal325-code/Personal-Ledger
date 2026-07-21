@@ -121,9 +121,9 @@ user_problem_statement: |
 frontend:
   - task: "Phase 4 — Dashboard + Orders UI for Estimated vs Realized profit"
     implemented: true
-    working: true
+    working: false
     file: "frontend/src/pages/Dashboard.jsx, frontend/src/pages/Orders.jsx"
-    stuck_count: 0
+    stuck_count: 1
     priority: "high"
     needs_retesting: false
     status_history:
@@ -258,6 +258,140 @@ frontend:
           • No regressions in existing pages
           
           The UI is production-ready for Phase 4 Estimated vs Realized profit feature.
+      - working: false
+        agent: "testing"
+        comment: |
+          ✅ EDGE CASE TESTING COMPLETE — 3 of 4 cases PASSED, 1 FAILED
+          
+          Re-ran the four Phase 4 UI edge cases that were skipped in the previous test run.
+          Used pre-seeded orders as specified in the review request.
+          
+          **EDGE CASE 1: Zero-ship cost ✅ PASSED**
+          Order: "P4 UI · Zero-ship cost" (id: a240b795-68ba-4475-8a4f-1f3fa2e2add5)
+          Business case: 1 item, qty=10, rate=₹1,000, factory_complete=₹3,000, 
+          outside_complete=₹1,500, NO shipment.
+          
+          Row values verified:
+          • Realized Rev = ₹0 ✅
+          • Est. Rev = ₹10,000 ✅
+          • Total Cost = ₹0 ✅ (no shipment → nothing realized)
+          • Realized Profit = ₹0 ✅
+          • Est. Profit = ₹5,500 with "+₹5,500 unrealized" caption ✅
+          • Status pills: "Confirmed" + "Unpaid" ✅
+          
+          Revenue recognition card (expanded row) verified:
+          • Sub-heading: "0 of 10 qty shipped · 0%" ✅
+          • Realized revenue ₹0 · Estimated revenue ₹10,000 ✅
+          • Realized profit ₹0 (0.0% margin) · Estimated profit ₹5,500 (55.0% margin) ✅
+          • Terracotta footer: "Unrealized profit still to book once remaining 
+            shipments complete: ₹5,500 · on ₹10,000 of pending revenue" ✅
+          
+          **EDGE CASE 2: Big number Indian comma grouping ✅ PASSED**
+          Order: "P4 UI · Big number 12,34,567" (id: 5e5866ed-de10-49e2-b4ee-b44c2ed10273)
+          1 unit shipped at ₹12,34,567.
+          
+          Verified Indian comma grouping (lakhs position):
+          • Realized Rev displays: ₹12,34,567 ✅ (NOT ₹1,234,567 or ₹1234567)
+          • Est. Rev displays: ₹12,34,567 ✅
+          • Comma present in lakhs position (after first 2 digits from right) ✅
+          
+          **EDGE CASE 3: Negative profit ✅ PASSED**
+          Order: "P4 UI · Negative profit" (id: 305d3c2b-28f4-441e-a917-b094bfcd18f0)
+          Cost > Revenue by design.
+          
+          Row values verified:
+          • Realized Profit cell shows "-₹400" ✅
+          • Rendered in RED color: rgb(188, 71, 73) = var(--danger) ✅
+          • Est. Profit cell shows "-₹400" ✅
+          • Row height: 85px (does NOT wrap/break/clip) ✅
+          
+          Revenue recognition card verified:
+          • Displays negative margins: "-400.0% margin" ✅
+          • Sub-card grid renders without breaking ✅
+          • No visual overflow or layout issues ✅
+          
+          **EDGE CASE 4: Live update 0pct ❌ FAILED**
+          Order: "P4 UI · Live update 0pct" (id: dcd1ab6c-891f-4fe8-92c9-640a7e00708e)
+          order_item_id: 95199bcd-e3d3-4267-9bdd-c6f0fe187912
+          
+          Test flow executed:
+          a) ✅ Read initial values from order row:
+             - Realized Rev: ₹0
+             - Est. Rev: ₹10,000
+             - Realized Profit: ₹0
+             - Est. Profit: ₹8,500 with "+₹8,500 unrealized"
+          
+          b) ✅ Read summary tiles:
+             - Operating Revenue: ₹0
+             - Realized Profit: ₹0
+             - Est. Profit tile: "est ₹8,500 · unrealized ₹8,500"
+          
+          c) ✅ Added shipment via API (qty=10, 50% of 20 ordered):
+             - POST /api/orders/{id}/shipments returned 200 OK
+             - Shipment successfully created in backend
+          
+          d) ❌ UI did NOT update without page refresh:
+             - After shipment API call, values remained unchanged:
+               * Realized Rev: ₹0 (expected ₹5,000) ❌
+               * Realized Profit: ₹0 (expected ₹4,250) ❌
+               * Unrealized caption: "+₹8,500 unrealized" (expected "+₹4,250 unrealized") ❌
+               * Status: "Confirmed" (expected "Partially Shipped") ❌
+             - Summary tiles also did not update
+          
+          e) ✅ Dashboard navigation verified backend state:
+             - Navigated to Dashboard (/) which triggers fresh data load
+             - Dashboard KPIs reflect the shipment was processed correctly
+             - Confirmed backend correctly calculated:
+               * Shipped Revenue increased
+               * Realized Profit increased
+               * Unrealized decreased
+          
+          f) ✅ Verified values after page reload:
+             - Returned to Orders page with fresh load
+             - Order now shows correct values:
+               * Realized Rev: ₹5,000 ✅
+               * Realized Profit: ₹4,250 ✅
+               * Est. Profit: ₹8,500 with "+₹4,250 unrealized" ✅
+               * Status: "Partially Shipped" ✅
+          
+          **ROOT CAUSE ANALYSIS:**
+          The Orders page does NOT support real-time updates when changes are made 
+          outside the normal UI flow. The page only refreshes when:
+          1. OrderDialog's onSaved callback is triggered (line 606 in Orders.jsx calls load())
+          2. User manually refreshes the page
+          3. Filter changes trigger useEffect to call load()
+          
+          When a shipment is added via direct API call (as allowed by the review request 
+          as an alternative to UI interaction), the Orders page has no mechanism to detect 
+          this change and refresh the data.
+          
+          The application does NOT implement:
+          - WebSocket connections for real-time updates
+          - Polling mechanism to check for changes
+          - Global state management that would notify components of external changes
+          - Event bus or pub/sub pattern for cross-component updates
+          
+          **IMPACT:**
+          This is a CRITICAL limitation for the "live update" requirement. While the 
+          backend correctly processes shipments and calculates all values, the frontend 
+          does not reflect these changes until the page is manually refreshed or the 
+          OrderDialog's save flow is used.
+          
+          **WORKAROUND:**
+          If the shipment is added through the proper UI flow (clicking Truck icon → 
+          OrderDialog → ShipmentDialog → Save), the onSaved callback WILL trigger 
+          load() and refresh the orders list. However, this was not testable in the 
+          current run because the order already had a shipment from the API test.
+          
+          **SUMMARY:**
+          • Case 1 (Zero-ship cost): ✅ PASSED
+          • Case 2 (Indian comma grouping): ✅ PASSED
+          • Case 3 (Negative profit): ✅ PASSED
+          • Case 4 (Live update): ❌ FAILED - UI does not update without page refresh 
+            when changes are made via direct API calls
+          
+          Setting working=false due to Case 4 failure. The live update requirement is 
+          critical for the Phase 4 feature to be considered complete.
 
 backend:
   - task: "Phase 4 — Partial-shipment proportional revenue + Estimated vs Realized profit"
@@ -622,6 +756,47 @@ agent_communication:
       After Load Test Dataset:
         - 2 test accounts, 2 test purchases, 1 test order, 1 test customer_payment,
           1 test transfer, all tagged is_test_data=true with a common test_dataset_id.
+  - agent: "testing"
+    message: |
+      ✅ PHASE 4 EDGE CASE TESTING COMPLETE — 3 of 4 PASSED, 1 CRITICAL FAILURE
+      
+      Re-ran the four Phase 4 UI edge cases with pre-seeded orders. Results:
+      
+      **PASSED (3/4):**
+      ✅ Case 1 - Zero-ship cost: All values correct (₹0 realized, ₹10,000 estimated, 
+         ₹5,500 unrealized profit), revenue recognition card displays correctly
+      ✅ Case 2 - Indian comma grouping: ₹12,34,567 displays with correct lakhs 
+         position comma (NOT Western format)
+      ✅ Case 3 - Negative profit: -₹400 displays in RED (var(--danger)), no layout 
+         issues, revenue recognition card handles negative margins correctly
+      
+      **FAILED (1/4):**
+      ❌ Case 4 - Live update: UI does NOT update without page refresh when shipment 
+         is added via direct API call. After POST /api/orders/{id}/shipments (200 OK), 
+         the Orders page values remained unchanged (Realized Rev stayed ₹0 instead of 
+         updating to ₹5,000, status stayed "Confirmed" instead of "Partially Shipped").
+      
+      **ROOT CAUSE:**
+      Orders page lacks real-time update mechanism. It only refreshes when:
+      1. OrderDialog's onSaved callback triggers load() (UI flow)
+      2. User manually refreshes page
+      3. Filter changes trigger useEffect
+      
+      No WebSocket, polling, or global state management to detect external changes.
+      
+      **IMPACT:**
+      CRITICAL - The review request specifically requires live updates "WITHOUT 
+      reloading the page" even when using the direct API approach. Backend correctly 
+      processes shipments (verified by Dashboard navigation and page reload), but 
+      frontend doesn't reflect changes until manual refresh.
+      
+      **RECOMMENDATION:**
+      Main agent must implement one of:
+      1. Add polling mechanism to Orders page to periodically refresh data
+      2. Implement WebSocket connection for real-time order updates
+      3. Add global state management (Redux/Zustand) with event bus
+      4. OR clarify that "live update" only applies to UI-initiated changes (not 
+         external API calls), in which case the current implementation is sufficient
   - agent: "testing"
     message: |
       ✅ PHASE 4 UI VERIFICATION COMPLETE — ALL 12 CORE TESTS PASSED
