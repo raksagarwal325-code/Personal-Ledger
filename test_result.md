@@ -142,6 +142,83 @@ backend:
       - working: true
         agent: "testing"
         comment: |
+          All 10 end-to-end steps passed. Auth status reset_enabled=true, sample
+          order/payment/purchase creation OK, preview returns correct
+          collections_affected & preserved, execute deleted 10 collections and
+          preserved 11 (including system_fathers_firm), backup file created on
+          disk with SHA256 verified, dashboard KPIs zeroed, test dataset loaded
+          (2 accounts, 2 purchases, 1 order, 1 customer_payment, 1 transfer),
+          audit logs contain preview + execute + test_dataset_load.
+          MINOR ISSUE: after Load Test Dataset, GET /api/orders returns 500
+          because the test dataset order's OrderItem lacked required fields
+          (main_category, product_name) and its ShipmentItem lacked order_item_id,
+          breaking pydantic serialization. Order is in DB but not listable.
+      - working: "NA"
+        agent: "main"
+        comment: |
+          Fixed load_test_dataset in /app/backend/admin_reset.py: test order now
+          includes a fully-formed OrderItem (id, main_category, product_name,
+          purchase_sources, denorm factory/outside fields) and the ShipmentItem
+          references the same order_item_id with an id on the shipment. Backend
+          restarted. Please rerun the "Load Test Dataset" portion of the flow
+          and confirm GET /api/orders no longer 500s and the test order is
+          visible in the list with is_test_data=true (verify server-side via
+          any endpoint that returns it — the field may be trimmed by the
+          public model, so also spot-check via GET /api/orders returning at
+          least one row and no exception).
+      - working: true
+        agent: "testing"
+        comment: |
+          ✅ FIX VERIFIED — Test dataset order structure fix successful. All 9 targeted tests passed.
+          
+          Test execution (targeted re-verification of the fix):
+          
+          STEP 1 ✓: Admin login successful (admin@artisan.local)
+          STEP 2 ✓: Transaction data reset to clean state (POST /api/admin/data-reset/execute)
+            - Deleted 10 collections: orders, quotations, purchases, customer_payments, 
+              purchase_payments, cash_book_entries, transfers, payments, party_ledger_entries, 
+              admin_migration_reports
+          STEP 3 ✓: Test dataset loaded successfully (POST /api/admin/test-dataset/load)
+            - test_dataset_id: 844079e8-c171-420d-827b-3299bb09e459
+            - Created: accounts=2, purchases=2, orders=1, customer_payments=1, transfers=1
+          
+          **STEP 4 ✓ (KEY FIX VERIFICATION)**: GET /api/orders returned 200 (previously 500)
+            - Test order found: client_name="Test Customer 844079"
+            - Order item[0] structure verified:
+              * id: 84b2943a-aca5-460f-a52e-2f396b2af67d
+              * main_category: "Test Category" ✓
+              * product_name: "Test SKU" ✓
+            - Shipment item[0] structure verified:
+              * order_item_id: 84b2943a-aca5-460f-a52e-2f396b2af67d (matches item id) ✓
+              * qty: 60.0 ✓
+            - Order is properly serializable and listable via API ✓
+          
+          STEP 5 ✓: GET /api/customer-payments returned 200 (1 payment)
+          STEP 6 ✓: GET /api/purchases returned 200 (2 purchases)
+          STEP 7 ✓: GET /api/transfers returned 200 (1 transfer)
+          STEP 8 ✓: GET /api/dashboard returned 200 (no crash from test order)
+            - KPIs: received=15000.0, paid=0, operating_revenue=30000, order_count=1
+          STEP 9 ✓: GET /api/party-ledger-v2/parties returned 200 (55 parties)
+            - system_fathers_firm party present and correctly structured ✓
+          
+          ROOT CAUSE RESOLVED:
+          The previous test dataset order had incomplete OrderItem fields (missing main_category 
+          and product_name) and ShipmentItem fields (missing order_item_id), causing pydantic 
+          validation to fail when GET /api/orders tried to serialize the response. The fix in 
+          admin_reset.py (lines 388-416) now creates a fully-formed test order with:
+          - OrderItem with all required fields (id, main_category, product_name, qty, rate, 
+            product_sales, purchase_sources, denorm factory/outside fields)
+          - ShipmentItem that correctly references the order_item_id
+          
+          NO REGRESSIONS: All other endpoints continue to work correctly. Test dataset is 
+          properly created and all records are accessible via their respective APIs.
+          
+          CONCLUSION: The minor issue flagged in the previous test run is now fully resolved. 
+          Admin Data Management v1 is working correctly end-to-end, including test dataset 
+          loading and order listing.
+      - working: true
+        agent: "testing"
+        comment: |
           ✅ COMPREHENSIVE END-TO-END TEST PASSED — All 10 verification steps completed successfully.
           
           Test execution summary:
@@ -297,3 +374,29 @@ agent_communication:
       
       RECOMMENDATION: Feature is production-ready. Consider fixing the test dataset shipment 
       validation issue if test dataset will be used frequently, otherwise can be deferred.
+  - agent: "testing"
+    message: |
+      ✅ TEST DATASET FIX VERIFICATION COMPLETE — ALL 9 TESTS PASSED
+      
+      Re-verified the fix for GET /api/orders 500 error after loading test dataset.
+      Main agent's changes to /app/backend/admin_reset.py (load_test_dataset function, 
+      lines 388-416) successfully resolved the issue.
+      
+      Test results:
+      • Admin login ✓
+      • Transaction data reset ✓
+      • Test dataset load ✓ (2 accounts, 2 purchases, 1 order, 1 customer_payment, 1 transfer)
+      • **KEY FIX**: GET /api/orders now returns 200 (previously 500) ✓
+      • Test order properly structured with:
+        - OrderItem: main_category="Test Category", product_name="Test SKU" ✓
+        - ShipmentItem: order_item_id correctly references order item, qty=60 ✓
+      • All sanity checks passed (customer-payments, purchases, transfers, dashboard, 
+        party-ledger-v2/parties) ✓
+      
+      Root cause resolved: Test dataset order now includes all required pydantic fields 
+      (main_category, product_name on OrderItem; order_item_id on ShipmentItem), allowing 
+      successful serialization when GET /api/orders is called.
+      
+      No regressions detected. Admin Data Management v1 is fully working end-to-end.
+      
+      RECOMMENDATION: Feature is complete and ready. Main agent can summarize and finish.

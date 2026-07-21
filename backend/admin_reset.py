@@ -382,15 +382,35 @@ async def load_test_dataset(db, *, admin: dict) -> dict:
                     "outstanding_balance": 1500, **stamp}
     await db.purchases.insert_one(out_purchase)
 
-    # An order with a partial shipment
+    # An order with a partial shipment.
+    # NOTE: fields here must satisfy the OrderItem / ShipmentItem pydantic models
+    # in server.py (main_category, product_name, order_item_id are required).
+    order_item_id = str(uuid.uuid4())
+    shipment_id = str(uuid.uuid4())
     order = {"id": str(uuid.uuid4()), "client_name": cust["name"],
              "customer_party_id": cust["id"],
              "order_date": "2025-01-15",
-             "items": [{"description": "Test SKU", "qty": 100, "rate": 300, "amount": 30000}],
+             "items": [{
+                 "id": order_item_id,
+                 "main_category": "Test Category",
+                 "sub_category": "",
+                 "product_name": "Test SKU",
+                 "qty": 100, "rate": 300,
+                 "product_sales": 30000,
+                 "purchase_sources": [],
+                 "factory_complete": 0, "factory_glass": 0, "factory_fitting": 0,
+                 "outside_complete": 0, "outside_glass": 0, "outside_fitting": 0,
+             }],
              "invoice_total": 30000, "operating_revenue": 30000,
              "total_cost": 20000, "net_profit": 10000,
-             "shipments": [{"id": str(uuid.uuid4()), "date": "2025-01-20",
-                            "items": [{"qty": 60}], "freight_paid": 300, "transporter": "BlueDart"}],
+             "shipments": [{"id": shipment_id, "date": "2025-01-20",
+                            "items": [{"order_item_id": order_item_id, "qty": 60}],
+                            "boxes_shipped": 0,
+                            "freight_charged": 0,
+                            "freight_paid": 300,
+                            "transporter": "BlueDart",
+                            "lr_number": "",
+                            "remarks": ""}],
              "shipped_qty_total": 60, "ordered_qty_total": 100,
              "payment_status": "Partial",
              **stamp}
