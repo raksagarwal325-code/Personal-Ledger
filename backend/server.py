@@ -2557,17 +2557,27 @@ async def run_party_migration_now():
 
 
 class PartyRenameIn(BaseModel):
-    display_name: str
+    model_config = ConfigDict(extra="ignore")
+    # Preferred field is `display_name`. `new_name` is accepted as an alias
+    # for callers that document the older key.
+    display_name: Optional[str] = None
+    new_name: Optional[str] = None
 
 
 @api_router.post("/parties/{pid}/rename")
 async def party_rename(pid: str, payload: PartyRenameIn):
     """Rename a party in place — preserves the party_id, pushes the old
     normalized name onto `aliases`. This is a RENAME, not a reassignment;
-    historical transactions continue to resolve through the same party_id."""
+    historical transactions continue to resolve through the same party_id.
+
+    Accepts `display_name` (preferred) or the legacy alias `new_name`.
+    """
     if pid == SYSTEM_FF_ID:
         raise HTTPException(400, "System Father's Firm party cannot be renamed.")
-    p = await rename_party(db, pid, payload.display_name)
+    name = (payload.display_name or payload.new_name or "").strip()
+    if not name:
+        raise HTTPException(400, "display_name (or new_name) is required.")
+    p = await rename_party(db, pid, name)
     if not p:
         raise HTTPException(404, "Party not found")
     return p
