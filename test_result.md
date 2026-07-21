@@ -754,6 +754,17 @@ backend:
     stuck_count: 0
     priority: "high"
     needs_retesting: false
+    completed: true
+    completed_at: "2026-07-21T19:20:00+00:00"
+    completed_by: "user"
+    completion_note: |
+      APPROVED by user on 2026-07-21. Phase 5 (P2 — /api/reconcile
+      invariant engine + Admin UI) is marked COMPLETE. Backend
+      integration tests (20/20), independent verification (81/81),
+      and the live reconciliation run were judged sufficient. A full
+      frontend regression sweep of the ReconciliationCard is optional
+      and does NOT block the P0–P5 programme from closing.
+
     status_history:
       - working: "NA"
         agent: "main"
