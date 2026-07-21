@@ -40,6 +40,18 @@ from transfers import (                                                         
     derive_account_balance, ff_settlement_delta_from_transfers,
     run_transfer_migration, ensure_transfer_indexes,
 )
+from auth import (                                                                                                            # noqa: E402
+    hash_password, verify_password, create_access_token, create_refresh_token,
+    decode_token, new_user_doc, user_public, set_auth_cookies, clear_auth_cookies,
+    get_current_user_from_db, require_admin,
+)
+from admin_reset import (                                                                                                     # noqa: E402
+    preview_reset, execute_reset, create_backup, list_backups, get_backup_meta,
+    delete_backup, load_test_dataset, remove_test_dataset,
+    list_audit_logs, log_audit,
+    is_reset_enabled, current_environment,
+    BACKUP_DIR, APP_VERSION,
+)
 
 
 # ================================================================
@@ -2553,6 +2565,213 @@ async def root():
 
 
 # ================================================================
+# PHASE 6 — Auth (JWT + bcrypt) + Admin Data Management
+# ================================================================
+
+from fastapi import Request, Response, Depends            # noqa: E402
+from fastapi.responses import FileResponse                # noqa: E402
+
+
+class LoginIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    email: str
+    password: str
+
+
+class BootstrapIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    email: str
+    password: str
+    name: Optional[str] = ""
+
+
+class ReauthIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    password: str
+
+
+class ResetIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    scope: Literal["clear_transaction_data", "full_reset"]
+    confirmation_phrase: str
+    understand_checkbox: bool = False
+    password: str
+    keep_accounts: bool = True
+    create_backup_first: bool = True
+
+
+async def _admin_dep(request: Request):
+    """FastAPI dependency wrapper — verifies admin JWT."""
+    return await require_admin(request, db)
+
+
+# ─── Auth endpoints ────────────────────────────────────────────────────────
+
+@api_router.get("/auth/status")
+async def auth_status():
+    """Bootstrap discovery: returns whether an admin exists."""
+    count = await db.users.count_documents({"role": "admin"})
+    return {"has_admin": count > 0,
+            "environment": current_environment(),
+            "reset_enabled": is_reset_enabled()}
+
+
+@api_router.post("/admin/bootstrap")
+async def admin_bootstrap(payload: BootstrapIn, response: Response):
+    """One-time endpoint — rejects once ≥1 admin exists."""
+    if await db.users.count_documents({"role": "admin"}) > 0:
+        raise HTTPException(400, "An admin already exists — bootstrap is closed.")
+    if not payload.email or "@" not in payload.email:
+        raise HTTPException(400, "Valid email required.")
+    if not payload.password or len(payload.password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters.")
+    doc = new_user_doc(payload.email, payload.password, payload.name or "", role="admin")
+    await db.users.insert_one(doc)
+    access = create_access_token(doc["id"], doc["email"], doc["role"])
+    refresh = create_refresh_token(doc["id"])
+    set_auth_cookies(response, access, refresh)
+    return {"user": user_public(doc), "access_token": access}
+
+
+@api_router.post("/auth/login")
+async def auth_login(payload: LoginIn, response: Response):
+    email = (payload.email or "").strip().lower()
+    user = await db.users.find_one({"email": email}, {"_id": 0})
+    if not user or not verify_password(payload.password, user.get("password_hash") or ""):
+        raise HTTPException(401, "Invalid email or password.")
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"last_login_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    access = create_access_token(user["id"], user["email"], user.get("role") or "admin")
+    refresh = create_refresh_token(user["id"])
+    set_auth_cookies(response, access, refresh)
+    return {"user": user_public(user), "access_token": access}
+
+
+@api_router.post("/auth/logout")
+async def auth_logout(response: Response):
+    clear_auth_cookies(response)
+    return {"ok": True}
+
+
+@api_router.get("/auth/me")
+async def auth_me(request: Request):
+    user = await get_current_user_from_db(request, db)
+    return user_public(user)
+
+
+@api_router.post("/auth/reauth")
+async def auth_reauth(payload: ReauthIn, request: Request):
+    """Re-verify the admin password before a sensitive action (e.g. reset)."""
+    user = await get_current_user_from_db(request, db)
+    if not verify_password(payload.password, user.get("password_hash") or ""):
+        raise HTTPException(401, "Password incorrect.")
+    return {"ok": True, "reverified_at": datetime.now(timezone.utc).isoformat()}
+
+
+# ─── Data Management endpoints (all admin-gated) ───────────────────────────
+
+@api_router.post("/admin/data-reset/preview")
+async def admin_preview_reset(payload: dict, admin=Depends(_admin_dep)):
+    scope = (payload or {}).get("scope") or "clear_transaction_data"
+    keep_accounts = bool((payload or {}).get("keep_accounts", True))
+    result = await preview_reset(db, scope, keep_accounts=keep_accounts)
+    await log_audit(db, "data_reset_preview", admin, extra={"scope": scope,
+                                                             "keep_accounts": keep_accounts})
+    return result
+
+
+@api_router.post("/admin/data-reset/execute")
+async def admin_execute_reset(payload: ResetIn, request: Request, admin=Depends(_admin_dep)):
+    if not is_reset_enabled():
+        raise HTTPException(403,
+                            "Data reset is disabled by server configuration "
+                            "(ALLOW_ADMIN_DATA_RESET=false).")
+    # 1. Re-verify admin password
+    if not verify_password(payload.password, admin.get("password_hash") or ""):
+        raise HTTPException(401, "Password incorrect.")
+    # 2. Confirmation phrase check
+    expected = ("CLEAR TRANSACTION DATA" if payload.scope == "clear_transaction_data"
+                else "FULL RESET SAMRAT GLASS ERP")
+    if current_environment() == "production":
+        expected = f"{expected} {datetime.now(timezone.utc).date().isoformat()}"
+    if (payload.confirmation_phrase or "").strip() != expected:
+        raise HTTPException(400, f"Confirmation phrase mismatch. Expected {expected!r}.")
+    # 3. Checkbox
+    if not payload.understand_checkbox:
+        raise HTTPException(400, "You must confirm you understand the action is irreversible.")
+
+    # 4. Backup (must succeed before deletion)
+    backup_meta = None
+    if payload.create_backup_first:
+        try:
+            backup_meta = await create_backup(
+                db, created_by=admin.get("email") or admin.get("id"),
+                note=f"Pre-{payload.scope} backup",
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Backup failed — reset aborted: {e}")
+
+    # 5. Execute
+    report = await execute_reset(
+        db, scope=payload.scope, admin=admin,
+        backup_id=(backup_meta or {}).get("id"),
+        keep_accounts=payload.keep_accounts,
+    )
+    report["backup"] = backup_meta
+    return report
+
+
+@api_router.post("/admin/backups")
+async def admin_create_backup(payload: dict, admin=Depends(_admin_dep)):
+    note = (payload or {}).get("note") or ""
+    meta = await create_backup(db, created_by=admin.get("email") or admin.get("id"), note=note)
+    await log_audit(db, "backup_create", admin, extra={"backup_id": meta["id"]})
+    return meta
+
+
+@api_router.get("/admin/backups")
+async def admin_list_backups(admin=Depends(_admin_dep)):
+    return await list_backups(db)
+
+
+@api_router.get("/admin/backups/{bid}/download")
+async def admin_download_backup(bid: str, admin=Depends(_admin_dep)):
+    meta = await get_backup_meta(db, bid)
+    path = meta.get("storage_location")
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Backup file missing on disk.")
+    return FileResponse(path, media_type="application/zip", filename=meta.get("filename") or f"{bid}.zip")
+
+
+@api_router.delete("/admin/backups/{bid}")
+async def admin_delete_backup(bid: str, admin=Depends(_admin_dep)):
+    result = await delete_backup(db, bid)
+    await log_audit(db, "backup_delete", admin, extra={"backup_id": bid})
+    return result
+
+
+@api_router.post("/admin/test-dataset/load")
+async def admin_load_test_dataset(admin=Depends(_admin_dep)):
+    result = await load_test_dataset(db, admin=admin)
+    await log_audit(db, "test_dataset_load", admin, extra={"dataset_id": result["test_dataset_id"]})
+    return result
+
+
+@api_router.delete("/admin/test-dataset/{dataset_id}")
+async def admin_remove_test_dataset(dataset_id: str, admin=Depends(_admin_dep)):
+    result = await remove_test_dataset(db, dataset_id)
+    await log_audit(db, "test_dataset_remove", admin, extra={"dataset_id": dataset_id})
+    return result
+
+
+@api_router.get("/admin/audit-logs")
+async def admin_get_audit_logs(admin=Depends(_admin_dep), limit: int = 200):
+    return await list_audit_logs(db, limit=limit)
+
+
+# ================================================================
 # PHASE 2 — Party identity admin endpoints
 # ================================================================
 @api_router.get("/party-migration/last-report")
@@ -3200,7 +3419,11 @@ async def business_events(
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    # Phase 6: httpOnly auth cookies require an EXPLICIT origin (browsers reject
+    # wildcard '*' with credentials). Falls back to the wildcard when CORS_ORIGINS
+    # is unset, which is fine for unauthenticated API access.
+    allow_origins=[o.strip() for o in (os.environ.get("CORS_ORIGINS") or "*").split(",") if o.strip()],
+    allow_origin_regex=r"https?://.*\.preview\.emergentagent\.com|https?://localhost(:\d+)?",
     allow_methods=["*"],
     allow_headers=["*"],
 )
