@@ -146,10 +146,35 @@ Multi-phase refactor to make Cash Book a unified timeline sourced from canonical
 
 ## Prioritized backlog
 - **P2 — Phase 5** *(next)*: `/api/reconcile` invariant endpoint + pytest suite.
-  Should assert all Phase 1-4 invariants (canonical Cash Book KPI derivation,
-  party unique index, transfer-cash conservation for account_to_account, FF
-  settlement sign convention, no orphan references, `unrealized_net_profit ==
-  estimated_net_profit - net_profit` on the dashboard).
+  Read-only integrity endpoint that runs every phase-1..4 invariant and
+  returns a structured report. Pre-implementation report was delivered to
+  the user in Jul 2025 (see chat log). Design summary:
+  * Endpoint: `GET /api/reconcile` (+ `POST /api/reconcile/run` alias for admin UI).
+  * Response: `{ok: bool, generated_at, invariants: [{id, description, ok, details, offenders?}], summary: {total, passed, failed}}`.
+  * Invariants covered:
+      P0/P1: Dashboard KPIs `received`, `paid`, `modes` derive only from
+             canonical sources (no `db.payments source='legacy_shim'` rows counted),
+             `db.payments` legacy rows all stamped, no orphan `legacy_shim`.
+      P1:    `parties` unique index holds (no duplicate normalized names within a
+             party type); every `customer_payments.customer_party_id` and
+             `purchases.vendor_party_id` (when set) references an existing party;
+             `system_fathers_firm` party exists and is type='self'.
+      P3:    For every `account_to_account` transfer, sum(from) + sum(to) == 0 on
+             tracked cash across all accounts; `db.transfers[status='reversed']` has
+             a paired `reverses_transfer_id`; every `cash_book_entries[kind=transfer]`
+             that predates the P3 migration has `migrated_to_transfer_id` set;
+             FF `balance_signed` equals the composition of derived party ledger v2
+             entries + `ff_settlement_delta_from_transfers`.
+      P4:    For every order: `operating_revenue + unrealized_revenue ≈
+             estimated_operating_revenue` and `net_profit + unrealized_net_profit
+             == estimated_net_profit`. Realized costs ≤ estimated costs. Dashboard
+             `unrealized_net_profit == estimated_net_profit - net_profit`.
+      Cross: Every `customer_payments.allocations[].order_id` resolves to a real
+             order; `orders[].total_received` == sum of allocations for that order.
+             Every `purchase_payments.allocations[].purchase_id` resolves.
+  * Pytest: `backend/tests/test_p5_reconcile.py` — seeded fixtures produce
+    a `passed_all=true` report; deliberately corrupted fixture triggers each
+    invariant.
 - **P2 — Phase 5**: `/api/reconcile` invariant endpoint + pytest suite.
 - **P2 — Phase 6 (Admin Data Management + Auth)** — ships **last**, after Phase 5. Approved architecture:
   - **Auth**: JWT-based custom (email + password + bcrypt + role field). First admin created via one-time `POST /api/admin/bootstrap` (rejects once ≥1 admin exists). All admin endpoints re-verify the JWT + `role='admin'` server-side; frontend hiding is not sufficient.
