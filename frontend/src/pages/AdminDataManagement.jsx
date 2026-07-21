@@ -7,7 +7,7 @@ import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "../components/ui/dialog";
 import { toast } from "sonner";
-import { AlertTriangle, Download, ShieldAlert, Database, FlaskConical, History, Trash2, Loader2 } from "lucide-react";
+import { AlertTriangle, Download, ShieldAlert, Database, FlaskConical, History, Trash2, Loader2, ShieldCheck, ChevronDown, ChevronRight, Copy, RefreshCcw } from "lucide-react";
 
 const PHRASE = {
   clear_transaction_data: "CLEAR TRANSACTION DATA",
@@ -54,6 +54,191 @@ function ScopeCard({ scope, danger = false, onPreview }) {
   );
 }
 
+// ─── Phase 5 — Reconciliation card ────────────────────────────────────────
+
+function ReconciliationCard({ report, last, busy, onRun, expanded, onToggle }) {
+  const summary = report?.summary || last?.extra?.summary;
+  const healthy = report ? report.healthy : (last?.extra?.healthy ?? null);
+  const lastRunAt = last?.at;
+  const fmtCount = (n, tone) => (
+    <span className="serif text-xl num" style={{ color: tone }}>{n ?? 0}</span>
+  );
+
+  const copyOffenders = async (inv) => {
+    const ids = (inv.offenders || []).map((o) =>
+      o.id || o.order_id || o.payment_id || o.purchase_id || o.vendor_id || JSON.stringify(o)
+    );
+    try {
+      await navigator.clipboard.writeText(ids.join("\n"));
+      toast.success(`Copied ${ids.length} offender id(s).`);
+    } catch (_) {
+      toast.error("Clipboard blocked.");
+    }
+  };
+
+  return (
+    <div className="card-warm p-6 mb-6" data-testid="dm-reconcile-card">
+      <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
+        <div className="flex items-center gap-3">
+          {healthy === true ? (
+            <ShieldCheck size={22} style={{ color: "var(--sage)" }} />
+          ) : healthy === false ? (
+            <ShieldAlert size={22} style={{ color: "var(--danger)" }} />
+          ) : (
+            <ShieldCheck size={22} style={{ color: "var(--muted)" }} />
+          )}
+          <div>
+            <div className="serif text-xl flex items-center gap-2">
+              Reconciliation
+              {healthy === true && (
+                <span className="text-xs px-2 py-0.5 rounded-full"
+                      style={{ background: "var(--sage-tint, #E7EFE6)", color: "var(--sage)" }}
+                      data-testid="dm-reconcile-healthy-badge">
+                  HEALTHY
+                </span>
+              )}
+              {healthy === false && (
+                <span className="text-xs px-2 py-0.5 rounded-full"
+                      style={{ background: "var(--danger-tint, #F7E1DA)", color: "var(--danger)" }}
+                      data-testid="dm-reconcile-unhealthy-badge">
+                  ISSUES FOUND
+                </span>
+              )}
+            </div>
+            <div className="text-xs mt-0.5" style={{ color: "var(--muted)" }}
+                 data-testid="dm-reconcile-last-run">
+              {lastRunAt
+                ? `Last run: ${new Date(lastRunAt).toLocaleString()}${report?.duration_ms ? ` · ${Math.round(report.duration_ms)}ms` : ""}`
+                : "Never run in this session — click Run Reconciliation to check integrity."}
+            </div>
+          </div>
+        </div>
+        <Button variant="outline" onClick={onRun} disabled={busy}
+                data-testid="dm-reconcile-run-btn"
+                className="border-[var(--border-warm)]">
+          {busy ? <Loader2 className="animate-spin" size={16} /> : <RefreshCcw size={16} />}
+          <span className="ml-2">{busy ? "Running…" : "Run Reconciliation"}</span>
+        </Button>
+      </div>
+
+      {summary && (
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4"
+             data-testid="dm-reconcile-counters">
+          <div className="rounded-md p-3 border" style={{ borderColor: "var(--border-warm)" }}>
+            <div className="label-caps">Total</div>
+            {fmtCount(summary.total, "var(--ink)")}
+          </div>
+          <div className="rounded-md p-3 border" style={{ borderColor: "var(--border-warm)" }}>
+            <div className="label-caps">Passed</div>
+            {fmtCount(summary.passed, "var(--sage)")}
+          </div>
+          <div className="rounded-md p-3 border" style={{ borderColor: "var(--border-warm)" }}>
+            <div className="label-caps">Failed</div>
+            {fmtCount(summary.failed, summary.failed > 0 ? "var(--danger)" : "var(--muted)")}
+          </div>
+          <div className="rounded-md p-3 border" style={{ borderColor: "var(--border-warm)" }}>
+            <div className="label-caps">Warnings</div>
+            {fmtCount(summary.warnings, summary.warnings > 0 ? "var(--terracotta)" : "var(--muted)")}
+          </div>
+          <div className="rounded-md p-3 border" style={{ borderColor: "var(--border-warm)" }}>
+            <div className="label-caps">Errors</div>
+            {fmtCount(summary.errors, summary.errors > 0 ? "var(--danger)" : "var(--muted)")}
+          </div>
+        </div>
+      )}
+
+      {report?.warnings?.length > 0 && (
+        <div className="text-xs mb-3 p-2.5 rounded"
+             style={{ background: "var(--warn-tint, #FFF3E1)", color: "var(--terracotta)" }}
+             data-testid="dm-reconcile-warnings">
+          {report.warnings.map((w, i) => (
+            <div key={i}><b>{w.code}:</b> {w.message}</div>
+          ))}
+        </div>
+      )}
+
+      {report?.invariants && (
+        <div className="space-y-2" data-testid="dm-reconcile-invariants">
+          {report.invariants
+            .filter((inv) => inv.status !== "passed")
+            .map((inv) => {
+              const isOpen = expanded[inv.id];
+              const color = inv.status === "failed" ? "var(--danger)"
+                          : inv.status === "error" ? "var(--danger)"
+                          : "var(--terracotta)";
+              return (
+                <div key={inv.id} className="rounded-md border"
+                     style={{ borderColor: "var(--border-warm)" }}
+                     data-testid={`dm-reconcile-inv-${inv.id}`}>
+                  <button type="button"
+                          className="w-full flex items-center gap-2 px-3 py-2 text-left"
+                          onClick={() => onToggle(inv.id)}>
+                    {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                    <span className="text-xs font-medium" style={{ color }}>
+                      {inv.status.toUpperCase()}
+                    </span>
+                    <span className="text-xs" style={{ color: "var(--muted)" }}>
+                      {inv.phase} · {inv.id}
+                    </span>
+                    <span className="text-sm flex-1 truncate ml-2">{inv.description}</span>
+                    {inv.offender_count > 0 && (
+                      <span className="text-xs px-1.5 py-0.5 rounded"
+                            style={{ background: "var(--surface-alt)" }}>
+                        {inv.offender_count} offender{inv.offender_count === 1 ? "" : "s"}
+                        {inv.truncated ? "+" : ""}
+                      </span>
+                    )}
+                  </button>
+                  {isOpen && (
+                    <div className="px-3 pb-3 text-xs space-y-1"
+                         style={{ color: "var(--muted)" }}>
+                      <div><b>Expected:</b> {String(inv.expected)}</div>
+                      <div><b>Actual:</b> {String(inv.actual)}</div>
+                      <div><b>Difference:</b> {String(inv.difference)}</div>
+                      <div><b>Tolerance:</b> {inv.tolerance} · <b>Checked:</b> {inv.checked_count} · <b>Took:</b> {inv.duration_ms}ms</div>
+                      {inv.offenders?.length > 0 && (
+                        <div>
+                          <div className="flex items-center gap-2 mt-1">
+                            <b>Offenders:</b>
+                            <button type="button"
+                                    className="text-xs px-2 py-0.5 border rounded flex items-center gap-1"
+                                    style={{ borderColor: "var(--border-warm)" }}
+                                    onClick={() => copyOffenders(inv)}
+                                    data-testid={`dm-reconcile-copy-${inv.id}`}>
+                              <Copy size={11} /> Copy ids
+                            </button>
+                            {inv.truncated && (
+                              <span style={{ color: "var(--terracotta)" }}>
+                                (truncated — showing 50 of {inv.offender_count})
+                              </span>
+                            )}
+                          </div>
+                          <pre className="mt-1 p-2 rounded text-[11px] overflow-x-auto max-h-48"
+                               style={{ background: "var(--surface-alt)", color: "var(--ink)" }}>
+                            {JSON.stringify(inv.offenders, null, 2)}
+                          </pre>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          {report.invariants.every((inv) => inv.status === "passed") && (
+            <div className="text-xs p-3 rounded"
+                 style={{ background: "var(--sage-tint, #E7EFE6)", color: "var(--sage)" }}
+                 data-testid="dm-reconcile-all-green">
+              All {report.summary.total} invariants passed — data is healthy.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+
 export default function AdminDataManagement() {
   const { user, status } = useAuth();
   const [previewOpen, setPreviewOpen] = useState(false);
@@ -75,16 +260,44 @@ export default function AdminDataManagement() {
   const [audit, setAudit] = useState([]);
   const [ds, setDs] = useState(null);           // most recent test dataset id
 
+  // Phase 5 — reconciliation
+  const [reconcile, setReconcile] = useState(null);        // full report
+  const [reconcileLast, setReconcileLast] = useState(null); // last audit summary
+  const [reconcileBusy, setReconcileBusy] = useState(false);
+  const [expandedInvariants, setExpandedInvariants] = useState({});
+
   const reloadHistory = async () => {
     try {
-      const [b, a] = await Promise.all([
+      const [b, a, last] = await Promise.all([
         api.get("/admin/backups"),
         api.get("/admin/audit-logs?limit=50"),
+        api.get("/admin/reconcile/last").catch(() => ({ data: null })),
       ]);
       setBackups(b.data || []);
       setAudit(a.data || []);
+      setReconcileLast(last?.data || null);
     } catch (e) {
       toast.error(e?.response?.data?.detail || "Failed to load history.");
+    }
+  };
+
+  const runReconcile = async () => {
+    setReconcileBusy(true);
+    try {
+      const r = await api.post("/reconcile/run");
+      setReconcile(r.data);
+      setExpandedInvariants({});
+      // Refresh the audit-log summary card too.
+      const last = await api.get("/admin/reconcile/last").catch(() => ({ data: null }));
+      setReconcileLast(last?.data || null);
+      if (r.data.audit_warning) toast.warning(r.data.audit_warning);
+      else toast.success(r.data.healthy
+        ? `Reconciliation passed — ${r.data.summary.passed}/${r.data.summary.total} invariants.`
+        : `Reconciliation found issues — ${r.data.summary.failed} failed, ${r.data.summary.errors} errored.`);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Reconciliation failed to run.");
+    } finally {
+      setReconcileBusy(false);
     }
   };
 
@@ -218,6 +431,16 @@ export default function AdminDataManagement() {
           )}
         </div>
       </div>
+
+      {/* Phase 5 — Reconciliation card */}
+      <ReconciliationCard
+        report={reconcile}
+        last={reconcileLast}
+        busy={reconcileBusy}
+        onRun={runReconcile}
+        expanded={expandedInvariants}
+        onToggle={(id) => setExpandedInvariants((m) => ({ ...m, [id]: !m[id] }))}
+      />
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-8">
         <ScopeCard scope="clear_transaction_data" onPreview={openPreview} />

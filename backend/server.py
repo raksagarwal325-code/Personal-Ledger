@@ -52,6 +52,7 @@ from admin_reset import (                                                       
     is_reset_enabled, current_environment,
     BACKUP_DIR, APP_VERSION,
 )
+from reconcile import run_reconcile, summarize as summarize_reconcile           # noqa: E402
 
 
 # ================================================================
@@ -2785,6 +2786,13 @@ async def admin_execute_reset(payload: ResetIn, request: Request, admin=Depends(
     if not payload.understand_checkbox:
         raise HTTPException(400, "You must confirm you understand the action is irreversible.")
 
+    # Phase 5 hook — snapshot reconciliation BEFORE reset so we know the
+    # baseline health of the DB going into the destructive operation.
+    try:
+        pre_reconcile = summarize_reconcile(await run_reconcile(db))
+    except Exception as ex:
+        pre_reconcile = {"error": f"pre-reset reconcile failed: {ex}"}
+
     # 4. Backup (must succeed before deletion)
     backup_meta = None
     if payload.create_backup_first:
@@ -2803,6 +2811,13 @@ async def admin_execute_reset(payload: ResetIn, request: Request, admin=Depends(
         keep_accounts=payload.keep_accounts,
     )
     report["backup"] = backup_meta
+    report["pre_reset_reconcile"] = pre_reconcile
+    # Phase 5 hook — snapshot reconciliation AFTER the reset. Expected shape
+    # depends on the scope, but at minimum system_fathers_firm must survive.
+    try:
+        report["post_reset_reconcile"] = summarize_reconcile(await run_reconcile(db))
+    except Exception as ex:
+        report["post_reset_reconcile"] = {"error": f"post-reset reconcile failed: {ex}"}
     return report
 
 
@@ -2852,6 +2867,39 @@ async def admin_remove_test_dataset(dataset_id: str, admin=Depends(_admin_dep)):
 @api_router.get("/admin/audit-logs")
 async def admin_get_audit_logs(admin=Depends(_admin_dep), limit: int = 200):
     return await list_audit_logs(db, limit=limit)
+
+
+# ─── Phase 5 (P2) — /api/reconcile ─────────────────────────────────────────
+
+@api_router.get("/reconcile")
+async def api_reconcile_report(admin=Depends(_admin_dep)):
+    """Read-only integrity report. GUARANTEED zero writes.
+    Runs every domain invariant and returns the full structured report."""
+    return await run_reconcile(db)
+
+
+@api_router.post("/reconcile/run")
+async def api_reconcile_run(admin=Depends(_admin_dep)):
+    """Run the reconciliation and write exactly ONE audit log row.
+    If the audit write fails, the reconciliation report is still returned
+    with an `audit_warning` field so the caller is aware."""
+    report = await run_reconcile(db)
+    try:
+        await log_audit(db, "reconcile_run", admin, extra={
+            "summary": summarize_reconcile(report),
+        })
+    except Exception as ex:
+        report["audit_warning"] = f"Audit log write failed: {ex}"
+    return report
+
+
+@api_router.get("/admin/reconcile/last")
+async def api_reconcile_last(admin=Depends(_admin_dep)):
+    """Return the most recent reconcile_run audit summary, or null."""
+    doc = await db.admin_audit_logs.find_one(
+        {"kind": "reconcile_run"}, {"_id": 0}, sort=[("at", -1)]
+    )
+    return doc or {}
 
 
 # ================================================================
