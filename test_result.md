@@ -755,6 +755,91 @@ backend:
     priority: "high"
     needs_retesting: false
     completed: true
+
+  - task: "Phase 6 · Slice 1 — Shared domain helpers (additive; no callers switched)"
+    implemented: true
+    working: true
+    file: "backend/domain.py, backend/tests/test_p6_domain.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: |
+          Slice 1 of the Phase 6 refactor landed per approved plan +
+          user adjustments (2026-07-21). PURELY ADDITIVE — no caller in
+          server.py, party_ledger_v2.py, transfers.py or admin_reset.py
+          was switched to the new helpers yet. Zero API, DB or UI shape
+          change.
+
+          Additions to backend/domain.py (pure functions, no I/O):
+            * Constant SETTLED_THRESHOLD_PAISE = 50 (party ledger UX
+              threshold; kept distinct from TOLERANCE_PAISE per adjustment §5).
+            * Order helpers: order_shipped_ratio_per_item,
+              order_realized_amounts, order_estimated_amounts,
+              order_unrealized, order_outstanding_from_alloc.
+            * Purchase helpers: purchase_realized_amounts,
+              purchase_outstanding_from_alloc.
+            * Party ledger helpers: party_status_from_paise,
+              party_delta_for_row, CATEGORY_SIGN_MAP.
+            * Account/transfer helpers:
+              apply_transfer_to_account_balance_paise,
+              sum_cashbook_net_for_account_paise, account_balance_paise,
+              sum_ff_settlement_delta_from_transfers_paise.
+            * Composable dashboard metric builders (per adjustment §3 —
+              no single giant dashboard_kpis): compute_receipts,
+              compute_payments, compute_order_metrics,
+              compute_purchase_metrics, compute_transfer_metrics,
+              compute_party_metrics, build_dashboard_kpis.
+          
+          New test file backend/tests/test_p6_domain.py — 65 tests, all
+          pass in 0.09s. Covers:
+            * Money primitives + settled-threshold constant.
+            * Every active-record filter (6 filters).
+            * KPI sums + allocation sums.
+            * Order helpers on 4 synthetic fixtures
+              (full, 40% partial, no-shipment, cancelled).
+            * PROPERTY tests (adjustment §8): for every order,
+              estimated_operating_revenue_paise ==
+              realized_operating_revenue_paise + unrealized_revenue_paise
+              (and same for net_profit). Exact in paise. Parametrised.
+            * Purchase property test: outstanding ==
+              max(0, invoice_total − allocated).
+            * MUTATION-PROTECTION tests (adjustment §9): every major
+              helper is called with deepcopy(input) and the input is
+              asserted equal after the call. 10 helpers covered.
+            * Determinism tests (adjustment §2): same inputs → identical
+              outputs across repeated calls, order-insensitive.
+            * Party ledger + transfer helper tests including boundary
+              (SETTLED_THRESHOLD_PAISE = 50, exactly-on-threshold case).
+            * Composable-builder tests + full build_dashboard_kpis
+              shape/key-set contract.
+            * CI GUARD (adjustment §10) — baseline test that scans every
+              production .py file (excluding domain.py + tests/) and
+              rejects any PR that INCREASES the count of the four banned
+              inline patterns:
+                {float_amount_get: 70, round_calls: 67,
+                 reversed_ne_true: 3, source_ne_legacy_shim: 5}.
+              Baselines will decrement in Slices 2-6.
+
+          Verification run (2026-07-21):
+            * test_p6_domain.py       — 65/65 passed in 0.09s.
+            * test_p4_partial_shipment_revenue.py — 6/6 passed (unchanged).
+            * test_p5_reconcile.py    — 20/20 passed (unchanged, with
+              DB_NAME=test_database env pointing tests at the same DB
+              the API writes to — pre-existing env mismatch, not caused
+              by Slice 1).
+            * Live GET /api/reconcile: healthy=true, engine_version=P5,
+              passed=21/21, failed=0.
+            * Live GET /api/dashboard: KPIs byte-identical to
+              pre-Slice-1 snapshot (op_rev ₹46,98,786; realized profit
+              ₹19,74,465; total_cost ₹27,24,321).
+          
+          Slice 1 exit criteria met. Awaiting reviewer sign-off before
+          starting Slice 2 (switch dashboard() + dashboard_breakdown()
+          to build_dashboard_kpis; add golden-master snapshot test).
+
     completed_at: "2026-07-21T19:20:00+00:00"
     completed_by: "user"
     completion_note: |
@@ -1256,7 +1341,8 @@ metadata:
   run_ui: true
 
 test_plan:
-  current_focus: []
+  current_focus:
+    - "Phase 6 · Slice 1 — additive domain helpers landed; awaiting sign-off for Slice 2 (dashboard switch)"
   stuck_tasks: []
   test_all: false
   test_priority: "stuck_first"

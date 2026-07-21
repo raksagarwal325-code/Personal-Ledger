@@ -9,7 +9,8 @@ Multi-phase refactor to make Cash Book a unified timeline sourced from canonical
 2. **P1 — Auto-create parties + resolve `vendors` / `parties` duplication** *(shipped Feb 2026)*
 3. **P1 — Transfer UI (Rakshit ↔ Father's Firm, bank ↔ cash, account ↔ account)** *(shipped Feb 2026)*
 4. **P1 — Partial-shipment revenue + Estimated vs Realized profit** *(shipped Jul 2025)*
-5. **P2 — `/api/reconcile` + invariant tests** *(shipped Jul 2025)*
+5. **P2 — `/api/reconcile` + invariant tests** *(shipped Jul 2025 · APPROVED and CLOSED Jul 2025)*
+6. **P2 — Shared Domain Calculation Consolidation** — *in progress (Jul 2026)*. Slice 1 landed: additive helpers in `backend/domain.py` + 65-test unit/property/mutation-protection suite in `backend/tests/test_p6_domain.py` + CI-guard baseline (float(x.get('amount')…)=70, round=67, reversed:$ne=3, source:$ne legacy_shim=5) that shrinks per slice. Zero callers switched. All existing test suites unchanged, live reconcile still healthy (21/21), dashboard KPIs byte-identical. Awaiting sign-off before Slice 2 (dashboard() ← build_dashboard_kpis + golden-master snapshot).
 
 ## Architecture (unchanged)
 - FastAPI (`backend/server.py`, `backend/party_ledger_v2.py`) + MongoDB.
