@@ -25,6 +25,37 @@ Multi-phase refactor to make Cash Book a unified timeline sourced from canonical
 - Dashboard reads canonical sources only; legacy `db.payments` never enters KPI computations.
 - Revenue only recognised on shipped quantity.
 
+## What's been implemented (Feb 2026 · Phase 3 · P1 First-Class Transfers)
+### Backend
+- New `db.transfers` collection with `Transfer` / `TransferIn` / `TransferSide` models in `/app/backend/transfers.py`. `db.transfers` is the **sole source of truth** for every transfer event. Account balances and Father's Firm settlement are DERIVED projections — never stored.
+- Endpoints:
+  - `POST /api/transfers` — create (with optional `Idempotency-Key`).
+  - `GET /api/transfers` — filter by kind, account_id, party_id, date range; `include_reversed=true|false`.
+  - `GET /api/transfers/{id}` — read one.
+  - `PUT /api/transfers/{id}` — edit via **reverse + replace** (original stays immutable, `status='reversed'`).
+  - `POST /api/transfers/{id}/reverse` — immutable reversal (creates paired transfer with swapped sides).
+  - `DELETE /api/transfers/{id}` — alias for `/reverse`; never a hard delete.
+  - `GET /api/accounts/{id}/balance` — derived balance (opening + cust/purchase payments + non-transfer cash-book entries ± transfers).
+  - `POST /api/transfer-migration/run` — idempotent legacy → canonical migration.
+- Kinds:
+  - `account_to_account` — Rakshit-account ↔ Rakshit-account (bank↔cash, bank↔bank, etc.). Net tracked-cash = 0.
+  - `rakshit_to_ff` — from Rakshit account to `system_fathers_firm`. Tracked cash −X; FF settlement +X (signed).
+  - `ff_to_rakshit` — from `system_fathers_firm` to Rakshit account. Tracked cash +X; FF settlement −X.
+- Idempotency: sparse unique index on `idempotency_key` + `legacy_cbe_id`. Duplicate submissions return the original document.
+- Validations enforced server-side: positive amount, distinct sides, non-archived accounts, only `system_fathers_firm` party allowed.
+- Reversal is IMMUTABLE — reversal docs cannot themselves be reversed or edited. Reversal is blocked only by DIRECT document dependencies (`depends_on_transfer_ids`), never by unrelated later transfers on the same account.
+- Cash Book projection: `db.transfers` emits ONE canonical row per transfer; any legacy `cash_book_entries[kind='transfer']` stamped with `migrated_to_transfer_id` is suppressed to prevent duplicates.
+- Dashboard KPIs (`received`, `paid`, `modes`, `net_profit`) explicitly exclude transfers (`kind != transfer` filter added on `cash_book_entries`).
+- FF settlement projection (`GET /api/party-ledger-v2/fathers-firm-settlement`) folds in `ff_settlement_delta_from_transfers(db)`.
+- Legacy `POST /api/cash-book-entries` with `kind='transfer'` auto-forwards to `POST /api/transfers` and returns a synthetic `CashBookEntry`-shaped envelope for UI back-compat.
+- Startup: `ensure_transfer_indexes` + `run_transfer_migration` (idempotent, deterministic on `legacy_cbe_id`).
+- MongoDB standalone verified — **no multi-doc transactions**. Design commits one atomic `db.transfers` insert and derives all views idempotently on read.
+
+### Tests
+- New `tests/test_p3_transfers.py` — **17/17 pass** (validations, account-to-account, Rakshit↔FF sign convention with numeric examples, idempotency, reversal restores balances, reversal is immutable, edit = reverse + replace, delete = alias, no-block on unrelated later transfer, Cash Book emits one row per transfer, `/cash-book-entries kind=transfer` auto-forward).
+- testing_agent_v3 verified: `retest_needed=false`, `backend_issues={critical:[], minor:[]}`, `action_items=[]`.
+- Full suite: **187 pass** (baseline 137/36 → **+50 pass** across Phases 1-3).
+
 ## What's been implemented (Feb 2026 · Phase 1 · P0)
 ### Backend
 - New `CashBookEntry` model + `db.cash_book_entries` collection with `kind ∈ {general_income, general_expense, transfer}` and `source ∈ {cash_book, legacy_shim, legacy_migrated}`.
@@ -61,8 +92,8 @@ Multi-phase refactor to make Cash Book a unified timeline sourced from canonical
 | **Full suite (xdist parallel)** | 137 pass / 36 fail | 158/24 | **170/26** | +33 pass overall; the 26 remaining are all pre-existing tech debt or xdist-order flakes |
 
 ## Prioritized backlog
-- **P1 — Phase 3** *(next)*: Enrich Cash Book's Transfer flow to include a first-class `Rakshit ↔ Father's Firm` route posting through Party Ledger v2 `POST /party-transactions category=transfer`. Also expose bank↔cash, cash↔bank, account↔account transfers with account balance updates.
-- **P1 — Phase 4**: Partial-shipment proportional revenue recognition + Estimated vs Realized profit split.
+- **P1 — Phase 4** *(next)*: Partial-shipment proportional revenue recognition + Estimated vs Realized profit split. Order model already stores `shipped_qty_total`/`ordered_qty_total`; UI needs `revenue_recognized` + `realized_profit`.
+- **P2 — Phase 5**: `/api/reconcile` invariant endpoint + pytest suite. Should assert all Phase 1-3 invariants (canonical Cash Book KPI derivation, party unique index, transfer-cash conservation for account_to_account, FF settlement sign convention, no orphan references).
 - **P2 — Phase 5**: `/api/reconcile` invariant endpoint + pytest suite.
 - **P2 — Phase 6 (Admin Data Management + Auth)** — ships **last**, after Phase 5. Approved architecture:
   - **Auth**: JWT-based custom (email + password + bcrypt + role field). First admin created via one-time `POST /api/admin/bootstrap` (rejects once ≥1 admin exists). All admin endpoints re-verify the JWT + `role='admin'` server-side; frontend hiding is not sufficient.
