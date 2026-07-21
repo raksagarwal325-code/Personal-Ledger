@@ -1,0 +1,74 @@
+{
+  "theme": "light",
+  "typography": {
+    "fonts": {
+      "heading": "'Cormorant Garamond', serif",
+      "body": "'Outfit', sans-serif"
+    },
+    "scale": {
+      "h1": "text-4xl sm:text-5xl tracking-tight leading-none font-semibold",
+      "h2": "text-2xl sm:text-3xl tracking-tight leading-tight font-medium",
+      "h3": "text-xl sm:text-2xl tracking-tight font-medium",
+      "h4": "text-lg sm:text-xl font-medium",
+      "body": "text-base leading-relaxed",
+      "small_labels": "text-xs tracking-[0.15em] uppercase font-semibold text-[#7A7571]"
+    },
+    "instructions": "DO NOT use Inter or Roboto. Use Cormorant Garamond for all primary headings, KPIs, and dashboard large numbers to give a boutique ledger feel. Use Outfit for tables, forms, and small text. Ensure all headings have tight tracking (`tracking-tight`)."
+  },
+  "colors": {
+    "palette_name": "Artisan Ledger (Earthy & Warm)",
+    "background": "#FDFBF7",
+    "surface": "#FFFFFF",
+    "surface_alt": "#F5F3EC",
+    "border": "#E8E4D9",
+    "primary": "#C55B43",
+    "primary_hover": "#A84A35",
+    "text_main": "#2C2A29",
+    "text_muted": "#7A7571",
+    "success": "#3A5A40",
+    "warning": "#D4A373",
+    "danger": "#BC4749",
+    "instructions": "Use #FDFBF7 for the main app background to simulate high-quality paper. Surfaces (cards/tables) should be pure white with a 1px border (#E8E4D9). Use the Primary Terracotta (#C55B43) sparingly for CTAs, active states, and key chart elements. Profit/Balance numbers should use the Deep Forest Green (#3A5A40) for success, never standard neon green."
+  },
+  "visual_enhancers": {
+    "texture": "Apply a subtle SVG noise/grain overlay fixed to the body background with opacity 20% to give a tactile paper feel.",
+    "shadows": "Avoid heavy or dark drop shadows. Use subtle, warm ambient shadows: `shadow-[0_4px_20px_-4px_rgba(44,42,41,0.05)]`.",
+    "borders": "Soft roundness. Maximum border-radius of 8px (`rounded-md` or `rounded-lg`). Maintain 1px solid borders on cards using the #E8E4D9 color."
+  },
+  "grids_and_layouts": {
+    "dashboard": "Use the High Density Bento Grid. Base grid `grid-cols-1 md:grid-cols-4`. Gap `gap-6`. KPIs (`col-span-1`), Main charts (`col-span-2` or `col-span-3`), Recent Transactions (`col-span-1` or `col-span-2`).",
+    "spacing": "Generous spacing. Use `p-6` or `p-8` inside all cards. Add extra padding (`pt-12`) around the main container.",
+    "alignment": "Left-align paragraph/label text. Right-align all numerical data in tables (Rate, Qty, Amount, Profit, Balance). Optical alignment for icons."
+  },
+  "component_guidelines": {
+    "tables": "Minimalist accounting tables. Sticky header with a subtle background (`#F5F3EC`). Remove vertical borders, use subtle bottom borders (`border-b border-[#E8E4D9]`) for rows. Right-align monetary columns. Add subtle hover state to rows (`hover:bg-[#FDFBF7]`).",
+    "cards": "Flat background, 1px subtle border, no initial shadow. On hover, apply a slight lift (`-translate-y-0.5`) and subtle shadow.",
+    "forms": "Use Shadcn customized components. Input backgrounds should be `#FFFFFF` with `#E8E4D9` border. Focus ring should be 2px of the Terracotta primary (`focus:ring-[#C55B43]/30`).",
+    "charts": "Use Recharts. Colors: Terracotta, Warm Ochre, Sage Green, Stone. No grid lines except a subtle horizontal axis line. Tooltips must match the card styling (white bg, 1px border, shadow-md)."
+  },
+  "motion": {
+    "hover_states": "All buttons must transition background color and slightly scale down (`active:scale-95`).",
+    "transitions": "Use `transition-colors duration-200 ease-in-out` or specific property transitions, NOT `transition-all`.",
+    "entrance": "Staggered fade-up for dashboard cards."
+  },
+  "accessibility": {
+    "contrast": "Ensure text over the primary Terracotta button is pure white. Muted text must maintain at least 4.5:1 ratio against the off-white background.",
+    "testing_attributes": "All interactive and key informational elements MUST include a `data-testid` attribute (e.g., `data-testid=\"add-transaction-btn\"`, `data-testid=\"net-profit-kpi\"`)."
+  },
+  "universal_guidelines_for_main_agent": [
+    "You have .js files not .tsx files, ensure all component generation and Shadcn integration uses .js/.jsx syntax. Remove TypeScript interfaces and types when copying Shadcn components.",
+    "DO NOT use generic centered layouts or simplistic gradients. Maintain left alignment for content readability.",
+    "DO NOT use complete `transparent` background in header, overlays, or any surface with content underneath. Use glassmorphism or solid fills.",
+    "Incorporate the fonts Cormorant Garamond and Outfit via Google Fonts in index.css or index.html.",
+    "Build the dashboard using standard pure Tailwind classes and HTML structural elements, but utilize Shadcn for Select, Tables, Inputs, DatePicker, Dialogs.",
+    "Use Recharts for the monthly sales trend line and category-wise profit donut chart.",
+    "Export to CSV logic should be clean vanilla JS utilizing Blob and URL.createObjectURL.",
+    "Format monetary values using `Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' })` (assuming INR based on RHUF/UPI context)."
+  ],
+  "libraries": {
+    "icons": "lucide-react (already installed)",
+    "charts": "recharts",
+    "motion": "framer-motion",
+    "toasts": "sonner"
+  }
+}

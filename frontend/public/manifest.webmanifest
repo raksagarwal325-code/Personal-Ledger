@@ -1,0 +1,44 @@
+{
+  "name": "Artisan Ledger — P&L",
+  "short_name": "Artisan",
+  "description": "Personal profit & loss tracker for your lighting & decor workshop.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#FDFBF7",
+  "theme_color": "#C55B43",
+  "categories": ["finance", "business", "productivity"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-maskable.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "New order",
+      "short_name": "New order",
+      "url": "/orders?new=1",
+      "description": "Log a new order from the workshop floor"
+    },
+    {
+      "name": "New payment",
+      "short_name": "New payment",
+      "url": "/payments?new=1"
+    },
+    {
+      "name": "Dashboard",
+      "short_name": "Dashboard",
+      "url": "/"
+    }
+  ]
+}
