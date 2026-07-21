@@ -9,7 +9,7 @@ Multi-phase refactor to make Cash Book a unified timeline sourced from canonical
 2. **P1 — Auto-create parties + resolve `vendors` / `parties` duplication** *(shipped Feb 2026)*
 3. **P1 — Transfer UI (Rakshit ↔ Father's Firm, bank ↔ cash, account ↔ account)** *(shipped Feb 2026)*
 4. **P1 — Partial-shipment revenue + Estimated vs Realized profit** *(shipped Jul 2025)*
-5. **P2 — `/api/reconcile` + invariant tests**
+5. **P2 — `/api/reconcile` + invariant tests** *(shipped Jul 2025)*
 
 ## Architecture (unchanged)
 - FastAPI (`backend/server.py`, `backend/party_ledger_v2.py`) + MongoDB.
@@ -24,6 +24,77 @@ Multi-phase refactor to make Cash Book a unified timeline sourced from canonical
 - Every payment lives in exactly one canonical collection.
 - Dashboard reads canonical sources only; legacy `db.payments` never enters KPI computations.
 - Revenue only recognised on shipped quantity.
+
+## What's been implemented (Jul 2025 · Phase 5 · P2 /api/reconcile invariant engine)
+### Backend
+- `backend/domain.py` (new) — shared domain calculation helpers. Every monetary
+  value flows through `to_paise(x)` / `from_paise(n)` (Decimal, HALF_UP) so
+  comparisons are exact. `money_eq(a, b, tol_paise=1)` is the paise-safe
+  equality primitive. Active-record filters are single-sourced here:
+  `is_order_active` (excludes Cancelled), `is_customer_payment_active` and
+  `is_purchase_payment_active` (exclude voided/reversed),
+  `is_cash_book_entry_canonical` (excludes legacy_shim, reversed, migrated
+  transfers), `is_transfer_active` (excludes reversed), `is_account_active`
+  (excludes archived). Canonical KPI sums: `sum_received_kpi`,
+  `sum_paid_kpi`, `sum_mode_totals` (blank/None mode goes into the ""
+  sentinel bucket for warning reporting), `sum_allocations_to_order`,
+  `sum_allocations_to_purchase`.
+- `backend/reconcile.py` (new) — 21 invariants across P0/P1/P3/P4/X:
+    P0.payments.legacy_stamped, P0.modes.no_unknown_mode,
+    P0.cashbook.ids_unique, P0.cashbook.transfer_appears_once,
+    P1.parties.unique_active, P1.parties.normalized_names_current,
+    P1.parties.system_ff_intact, P1.parties.ff_aliases_only_system,
+    P1.parties.foreign_keys_resolve, P1.vendors.party_id_resolves,
+    P3.transfers.sides_valid, P3.transfers.reversals_valid,
+    P3.transfers.replacement_no_cycle, P3.transfers.idempotency_keys_unique,
+    P3.transfers.migration_no_dupes, P3.transfers.a2a_net_zero,
+    P4.orders.identities,
+    X.cust_alloc.order_resolves, X.cust_alloc.nonneg_capped_and_cached,
+    X.orders.total_received_matches, X.purchase_alloc.and_totals.
+  Report contract: `report_version="1.0"`, `engine_version="P5"`, top-level
+  `healthy`, `run_status`, `generated_at/started_at/completed_at/duration_ms`,
+  `consistency` ∈ {stable, best_effort}, `warnings` list including
+  `concurrent_modification` when collection sizes change during a run.
+  Per-invariant fields: `id, phase, severity, status, description, expected,
+  actual, difference, tolerance, checked_count, offender_count, offenders
+  (capped 50), truncated, duration_ms`. Every invariant runs in a
+  try/except so a broken check emits `status="error"` with traceback
+  captured — never poisons the whole report.
+- `backend/server.py`:
+  - `GET /api/reconcile` — admin-gated, read-only, zero writes.
+  - `POST /api/reconcile/run` — runs reconcile then writes exactly one
+    `admin_audit_logs` row (`kind="reconcile_run"`). If the audit write
+    fails the report is still returned with an `audit_warning` field.
+  - `GET /api/admin/reconcile/last` — most recent reconcile_run row.
+  - `POST /api/admin/data-reset/execute` now snapshots reconciliation
+    BEFORE and AFTER the destructive operation, attaching
+    `pre_reset_reconcile` and `post_reset_reconcile` summaries to the
+    response + audit trail.
+
+### Frontend
+- `AdminDataManagement.jsx` — new `ReconciliationCard` component:
+  HEALTHY / ISSUES FOUND badge, last-run timestamp + duration, per-status
+  counters (Total / Passed / Failed / Warnings / Errors), warnings row
+  (concurrent_modification etc.), and one collapsible row per non-passed
+  invariant with expected/actual/difference/tolerance/checked/duration
+  + offender JSON + "Copy ids" clipboard button.
+
+### Tests
+- `backend/tests/test_p5_reconcile.py` (new) — **20/20 pass**:
+  domain helpers (paise + 1-paise tolerance); report contract
+  (stable ids, versions, schema, HTTP 200 on unhealthy); active-record
+  filters (cancelled order + reversed transfer excluded); cash-book
+  (unstamped legacy transfer, duplicate ids, blank mode warning);
+  transfers (reversal-amount mismatch, replacement-chain cycle,
+  idempotency uniqueness at DB-index level); allocations (overflow,
+  cached-total drift, orders.total_received drift); truncation at 50
+  offenders + `truncated=true`; GET writes zero audit rows, POST writes
+  exactly one, unauth returns 401/403.
+- testing_agent independent verification (Jul 2025): **81/81 checks
+  passed** — 8 groups: endpoint contract & schema, healthy path,
+  POST/audit, GET/read-only, reset integration (pre + post reconcile
+  attached), failure detection via planted broken row, non-admin auth,
+  idempotency across consecutive runs. No regressions.
 
 ## What's been implemented (Jul 2025 · Phase 4 · P1 Partial-shipment revenue + Estimated vs Realized)
 ### Backend
