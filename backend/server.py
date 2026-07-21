@@ -27,6 +27,20 @@ db = client[os.environ['DB_NAME']]
 app = FastAPI(title="Artisan Ledger — Order-based P&L")
 api_router = APIRouter(prefix="/api")
 
+# ─── Local module imports (defined here so all endpoints can use them) ─────
+from party_ledger_v2 import make_router as make_party_ledger_v2_router, ensure_bootstrap as ensure_party_ledger_bootstrap  # noqa: E402
+from party_sync import (                                                                                                     # noqa: E402
+    get_or_create_customer_party, get_or_create_vendor_party,
+    sync_vendor_directory, rename_party, resolve_party,
+    run_party_migration, is_ff_alias, SYSTEM_FF_ID,
+)
+from transfers import (                                                                                                       # noqa: E402
+    Transfer, TransferIn, TransferSide,
+    create_transfer, edit_transfer, reverse_transfer,
+    derive_account_balance, ff_settlement_delta_from_transfers,
+    run_transfer_migration, ensure_transfer_indexes,
+)
+
 
 # ================================================================
 # MODELS
@@ -119,6 +133,9 @@ class Account(BaseModel):
     type: str = "Bank"
     notes: Optional[str] = ""
     archived: bool = False
+    # Phase 3: optional opening balance (used by derive_account_balance).
+    opening_balance: float = 0.0
+    opening_date: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -1183,10 +1200,14 @@ async def dashboard():
     # Legacy db.payments is intentionally NOT read here — those rows are
     # stamped source='legacy_migrated' and surfaced only in the Cash Book
     # timeline as read-only "Migration" entries.
+    # P3: Transfers (both `db.transfers` and any cash_book_entries[kind=transfer]
+    # not yet migrated) are ALSO excluded — transfers are profit-neutral.
     cust_pays = await db.customer_payments.find({}, {"_id": 0}).to_list(20000)
     purchase_pays = await db.purchase_payments.find({}, {"_id": 0}).to_list(20000)
     cb_entries = await db.cash_book_entries.find(
-        {"source": {"$ne": "legacy_shim"}, "reversed": {"$ne": True}}, {"_id": 0}
+        {"source": {"$ne": "legacy_shim"},
+         "reversed": {"$ne": True},
+         "kind": {"$ne": "transfer"}}, {"_id": 0}
     ).to_list(20000)
 
     received = sum(float(p.get("amount") or 0) for p in cust_pays)
@@ -1550,10 +1571,13 @@ async def dashboard_breakdown():
     # ---- Payable (money paid out — grouped by party / mode) ----
     # P0: sourced from canonical modules (customer_payments, purchase_payments,
     # cash_book_entries) — never from legacy db.payments.
+    # P3: transfers are profit-neutral — excluded here.
     cust_pays = await db.customer_payments.find({}, {"_id": 0}).to_list(20000)
     purchase_pays = await db.purchase_payments.find({}, {"_id": 0}).to_list(20000)
     cb_entries = await db.cash_book_entries.find(
-        {"source": {"$ne": "legacy_shim"}, "reversed": {"$ne": True}}, {"_id": 0}
+        {"source": {"$ne": "legacy_shim"},
+         "reversed": {"$ne": True},
+         "kind": {"$ne": "transfer"}}, {"_id": 0}
     ).to_list(20000)
 
     payable_by_party = defaultdict(lambda: {"paid": 0, "received": 0, "net": 0})
@@ -2584,6 +2608,87 @@ async def party_rename(pid: str, payload: PartyRenameIn):
 
 
 # ================================================================
+# PHASE 3 — First-Class Transfers (canonical source of truth)
+# ================================================================
+@api_router.post("/transfers", response_model=Transfer)
+async def api_create_transfer(payload: TransferIn):
+    return await create_transfer(db, payload)
+
+
+@api_router.get("/transfers", response_model=List[Transfer])
+async def api_list_transfers(
+    kind: Optional[str] = None,
+    account_id: Optional[str] = None,
+    party_id: Optional[str] = None,
+    include_reversed: bool = True,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 500,
+):
+    q: dict = {}
+    if not include_reversed:
+        q["status"] = "active"
+    if kind:
+        q["kind"] = kind
+    if account_id:
+        q["$or"] = [{"from_side.account_id": account_id},
+                    {"to_side.account_id": account_id}]
+    if party_id:
+        q.setdefault("$or", [])
+        q["$or"] += [{"from_side.party_id": party_id},
+                     {"to_side.party_id": party_id}]
+    if start_date or end_date:
+        d: dict = {}
+        if start_date: d["$gte"] = start_date
+        if end_date: d["$lte"] = end_date
+        q["date"] = d
+    docs = await db.transfers.find(q, {"_id": 0}).sort("date", -1).to_list(limit)
+    return [Transfer(**d) for d in docs]
+
+
+@api_router.get("/transfers/{tid}", response_model=Transfer)
+async def api_get_transfer(tid: str):
+    d = await db.transfers.find_one({"id": tid}, {"_id": 0})
+    if not d:
+        raise HTTPException(404, "Transfer not found")
+    return Transfer(**d)
+
+
+@api_router.put("/transfers/{tid}", response_model=Transfer)
+async def api_edit_transfer(tid: str, payload: TransferIn):
+    return await edit_transfer(db, tid, payload)
+
+
+@api_router.post("/transfers/{tid}/reverse", response_model=Transfer)
+async def api_reverse_transfer(tid: str):
+    return await reverse_transfer(db, tid)
+
+
+@api_router.delete("/transfers/{tid}", response_model=Transfer)
+async def api_delete_transfer(tid: str):
+    """Alias for /reverse — deletion is reversal, never a hard delete."""
+    return await reverse_transfer(db, tid)
+
+
+@api_router.get("/accounts/{aid}/balance")
+async def api_account_balance(aid: str):
+    return await derive_account_balance(db, aid)
+
+
+@api_router.post("/transfer-migration/run")
+async def api_run_transfer_migration():
+    """Idempotent re-run — safe to call at any time. Reports counts."""
+    report = await run_transfer_migration(db)
+    report["ran_at"] = datetime.now(timezone.utc).isoformat()
+    await db.admin_migration_reports.insert_one({
+        "id": str(uuid.uuid4()),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        **report,
+    })
+    return report
+
+
+# ================================================================
 # CASH BOOK — canonical write path for general income/expense/transfer
 # and unified timeline read view.
 # ================================================================
@@ -2612,6 +2717,30 @@ async def create_cash_book_entry(payload: CashBookEntryBase):
     cbe = CashBookEntry(**payload.model_dump()).model_dump()
     cbe["source"] = "cash_book"
     _validate_cbe(cbe)
+    # Phase 3: transfers must be recorded in `db.transfers` (sole source of
+    # truth). Auto-forward here for UI back-compat and return a synthetic
+    # CashBookEntry shape pointing at the new canonical transfer.
+    if cbe.get("kind") == "transfer":
+        payload = TransferIn(
+            date=cbe.get("date") or datetime.now(timezone.utc).isoformat()[:10],
+            from_side=TransferSide(type="account",
+                                   account_id=cbe.get("from_account_id"),
+                                   account_name=cbe.get("from_account_name") or ""),
+            to_side=TransferSide(type="account",
+                                 account_id=cbe.get("to_account_id"),
+                                 account_name=cbe.get("to_account_name") or ""),
+            amount=float(cbe.get("amount") or 0),
+            mode=cbe.get("mode") or "Bank Transfer",
+            reference=cbe.get("reference") or "",
+            notes=cbe.get("notes") or "",
+        )
+        t = await create_transfer(db, payload)
+        cbe["id"] = t.id
+        cbe["migrated_to_transfer_id"] = t.id
+        # Do NOT insert into db.cash_book_entries — the transfer is the
+        # canonical row; we still return a CashBookEntry shape so old
+        # callers stay working.
+        return CashBookEntry(**cbe)
     await db.cash_book_entries.insert_one(cbe)
     return CashBookEntry(**cbe)
 
@@ -2788,6 +2917,42 @@ def _cb_row_from_cbe(e: dict) -> dict:
     }
 
 
+def _cb_row_from_transfer(t: dict) -> dict:
+    """Phase 3: canonical transfer → one Cash Book timeline row.
+    Never emits two duplicate rows — this is the whole point of moving
+    to `db.transfers` as the single source of truth."""
+    fs = t.get("from_side") or {}
+    ts = t.get("to_side") or {}
+    def _label(side: dict) -> str:
+        if side.get("type") == "party":
+            return side.get("party_name") or "Father's Firm"
+        return side.get("account_name") or ""
+    return {
+        "event_id": t.get("id"),
+        "date": t.get("date"),
+        "kind": "transfer",
+        "source_module": "Transfer",
+        "source_route": "/transfers",
+        "title": {"account_to_account": "Transfer",
+                  "rakshit_to_ff": "Transfer to Father's Firm",
+                  "ff_to_rakshit": "Transfer from Father's Firm"}.get(t.get("kind"), "Transfer"),
+        "party": "",
+        "mode": t.get("mode") or "",
+        "account_name": "",
+        "from_account_name": _label(fs),
+        "to_account_name": _label(ts),
+        "received": 0.0,
+        "paid": 0.0,
+        "amount": float(t.get("amount") or 0),
+        "direction": "transfer",
+        "reference": t.get("reference") or "",
+        "notes": t.get("notes") or "",
+        "source_document": {"collection": "transfers", "id": t.get("id"),
+                            "route": "/transfers"},
+        "editable": True,
+    }
+
+
 def _cb_row_from_legacy(p: dict) -> dict:
     received = float((p.get("received_by_me") or 0) + (p.get("received_by_fac") or 0))
     paid = float((p.get("payment_by_me") or 0) + (p.get("payment_by_fac") or 0))
@@ -2833,10 +2998,20 @@ async def cash_book_timeline(
     """
     cust = await db.customer_payments.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
     purch = await db.purchase_payments.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
-    cbe_q: dict = {}
+    # Cash Book entries — but SUPPRESS any transfer-kind CBE that has been
+    # migrated to db.transfers (Phase 3 deterministic migration marker).
+    cbe_q: dict = {"$or": [
+        {"kind": {"$ne": "transfer"}},
+        {"kind": "transfer", "migrated_to_transfer_id": {"$exists": False}},
+    ]}
     if not include_shim:
         cbe_q["source"] = {"$ne": "legacy_shim"}
     cbe = await db.cash_book_entries.find(cbe_q, {"_id": 0}).sort("date", -1).to_list(5000)
+    # Phase 3: transfers are the canonical timeline row for every transfer.
+    transfers = await db.transfers.find(
+        {"status": "active", "reverses_transfer_id": None},
+        {"_id": 0},
+    ).sort("date", -1).to_list(5000)
     legacy = []
     if include_migration:
         legacy = await db.payments.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
@@ -2844,6 +3019,7 @@ async def cash_book_timeline(
     rows = ([_cb_row_from_customer_payment(p) for p in cust]
             + [_cb_row_from_purchase_payment(p) for p in purch]
             + [_cb_row_from_cbe(e) for e in cbe]
+            + [_cb_row_from_transfer(t) for t in transfers]
             + [_cb_row_from_legacy(p) for p in legacy])
 
     def _pass(r: dict) -> bool:
@@ -3980,12 +4156,6 @@ async def duplicate_quotation(qid: str):
 
 
 # --- Party Ledger v2 (unified) ---
-from party_ledger_v2 import make_router as make_party_ledger_v2_router, ensure_bootstrap as ensure_party_ledger_bootstrap
-from party_sync import (
-    get_or_create_customer_party, get_or_create_vendor_party,
-    sync_vendor_directory, rename_party, resolve_party,
-    run_party_migration, is_ff_alias, SYSTEM_FF_ID,
-)
 app.include_router(make_party_ledger_v2_router(db), prefix="/api")
 
 
@@ -4122,6 +4292,25 @@ async def _startup():
         )
     except Exception as e:
         logger.warning(f"Phase 2 party unique index setup skipped: {e}")
+
+    # Phase 3 (P1): Transfers indexes + one-time migration from legacy
+    # cash_book_entries[kind='transfer'] into db.transfers. Deterministic on
+    # `legacy_cbe_id` so legacy and migrated versions never appear together.
+    try:
+        await ensure_transfer_indexes(db)
+        t_report = await run_transfer_migration(db)
+        logger.info(
+            f"Phase 3 transfer migration OK — created: {t_report['created']}, "
+            f"already_migrated: {t_report['already_migrated']}, "
+            f"skipped_no_account: {t_report['skipped_no_account']}"
+        )
+        await db.admin_migration_reports.insert_one({
+            "id": str(uuid.uuid4()),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            **t_report,
+        })
+    except Exception as e:
+        logger.error(f"Phase 3 transfer migration failed: {e}")
 
     # P0: stamp every pre-existing db.payments row with source='legacy_migrated'
     # so it can be surfaced in the Cash Book timeline as read-only, without

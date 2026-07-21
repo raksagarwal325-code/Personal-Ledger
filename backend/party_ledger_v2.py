@@ -1005,6 +1005,14 @@ def make_router(db):
         # single signed "amount" where +ve = you_receive, -ve = you_pay to match
         # the UI spec (Positive → You Receive).
         bal = float(data.get("net_balance") or 0.0)
+        # Phase 3: fold in derived transfer effects. `db.transfers` is the sole
+        # source of truth for account-level transfers involving FF, so its
+        # signed contribution must be added to the ledger-entry-derived total.
+        try:
+            from transfers import ff_settlement_delta_from_transfers
+            bal += await ff_settlement_delta_from_transfers(db)
+        except Exception:
+            pass
         signed = -bal  # flip sign so +ve = you_receive
         if signed > 0.5:
             status = "you_receive"
