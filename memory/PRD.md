@@ -6,9 +6,9 @@ Repository `raksagarwal325-code/Personal-Ledger` cloned and continued as a full-
 ## Current mission
 Multi-phase refactor to make Cash Book a unified timeline sourced from canonical modules and remove dual sources-of-truth for money movement. Phases:
 1. **P0 — Retire legacy `db.payments`** *(shipped Feb 2026)*
-2. **P1 — Auto-create parties + resolve `vendors` / `parties` duplication**
-3. **P1 — Transfer UI (Rakshit ↔ Father's Firm, bank ↔ cash, account ↔ account)**
-4. **P1 — Partial-shipment revenue + Estimated vs Realized profit**
+2. **P1 — Auto-create parties + resolve `vendors` / `parties` duplication** *(shipped Feb 2026)*
+3. **P1 — Transfer UI (Rakshit ↔ Father's Firm, bank ↔ cash, account ↔ account)** *(shipped Feb 2026)*
+4. **P1 — Partial-shipment revenue + Estimated vs Realized profit** *(shipped Jul 2025)*
 5. **P2 — `/api/reconcile` + invariant tests**
 
 ## Architecture (unchanged)
@@ -24,6 +24,59 @@ Multi-phase refactor to make Cash Book a unified timeline sourced from canonical
 - Every payment lives in exactly one canonical collection.
 - Dashboard reads canonical sources only; legacy `db.payments` never enters KPI computations.
 - Revenue only recognised on shipped quantity.
+
+## What's been implemented (Jul 2025 · Phase 4 · P1 Partial-shipment revenue + Estimated vs Realized)
+### Backend
+- `backend/server.py::compute_order_aggregates` extended: on every order it now
+  computes BOTH the realized (shipped-qty-proportioned) and the estimated
+  (full-order) revenue / cost / profit. `ratio = shipped_qty / ordered_qty` is
+  applied to `product_sales` + each item's `factory_*` and `outside_*` costs.
+  Freight, packing, and other adjustments are event-recorded and included
+  as-is in both realized and estimated (they are not proportioned).
+- New fields on the `Order` model (defaults 0, backfilled idempotently on
+  startup by `_refresh_stored_aggregates`):
+  `estimated_factory_cost_total`, `estimated_outside_cost_total`,
+  `estimated_operating_revenue`, `estimated_total_cost`,
+  `estimated_net_profit`, `estimated_margin_percent`,
+  `realized_revenue` (alias of `operating_revenue`),
+  `realized_net_profit` (alias of `net_profit`),
+  `revenue_recognized` (PRD-mandated name = `operating_revenue`),
+  `unrealized_revenue`, `unrealized_net_profit`.
+- `product_sales_total` is now declared on the `Order` model too (previously it
+  was written to Mongo but stripped from `response_model=Order` responses).
+- `/api/dashboard` KPIs additionally expose `estimated_revenue`,
+  `estimated_total_cost`, `estimated_net_profit`, `estimated_margin_percent`,
+  `realized_revenue`, `realized_net_profit`, `revenue_recognized`,
+  `unrealized_revenue`, `unrealized_net_profit`. `operating_revenue` and
+  `net_profit` remain unchanged (they are realized values).
+
+### Frontend
+- `frontend/src/pages/Dashboard.jsx` — renamed "Net Profit" card to
+  "Realized Profit" and added a new second KPI row: Estimated Revenue,
+  Estimated Profit (with margin + unrealized delta), and Unrealized (in transit).
+- `frontend/src/pages/Orders.jsx` — table now has `Realized Rev`, `Est. Rev`,
+  `Realized Profit`, `Est. Profit` columns. Est. Profit cell also shows the
+  `+X unrealized` delta in terracotta. Summary tiles show both realized and
+  estimated totals. Each expanded row has a "Revenue recognition" card with
+  realized/estimated revenue + profit + margin + shipment progress, and an
+  unrealized-profit warning line.
+
+### Tests
+- New `backend/tests/test_p4_partial_shipment_revenue.py` — **6/6 pass**:
+  - no shipment → realized=0, estimated>0, unrealized == estimated.
+  - full shipment → realized == estimated, unrealized == 0.
+  - 60% shipment → product sales + factory + outside costs proportioned by
+    ratio; freight and packing NOT proportioned.
+  - Adding a shipment reduces unrealized_net_profit.
+  - Dashboard exposes all Phase 4 KPI fields and honours the alias identities
+    (`realized_revenue == operating_revenue`, `revenue_recognized ==
+    operating_revenue`, `unrealized_net_profit == estimated_net_profit -
+    net_profit`).
+- testing_agent_v3 independent verification (Jul 2025): 17/17 assertions
+  passed across three synthetic orders (no shipment, 40% partial, full) with
+  exact expected numbers; every existing endpoint (dashboard, orders,
+  customer-payments, purchase-payments, dashboard/breakdown, auth/status)
+  still returns 200; no regression.
 
 ## What's been implemented (Feb 2026 · Phase 3 · P1 First-Class Transfers)
 ### Backend
@@ -92,8 +145,11 @@ Multi-phase refactor to make Cash Book a unified timeline sourced from canonical
 | **Full suite (xdist parallel)** | 137 pass / 36 fail | 158/24 | **170/26** | +33 pass overall; the 26 remaining are all pre-existing tech debt or xdist-order flakes |
 
 ## Prioritized backlog
-- **P1 — Phase 4** *(next)*: Partial-shipment proportional revenue recognition + Estimated vs Realized profit split. Order model already stores `shipped_qty_total`/`ordered_qty_total`; UI needs `revenue_recognized` + `realized_profit`.
-- **P2 — Phase 5**: `/api/reconcile` invariant endpoint + pytest suite. Should assert all Phase 1-3 invariants (canonical Cash Book KPI derivation, party unique index, transfer-cash conservation for account_to_account, FF settlement sign convention, no orphan references).
+- **P2 — Phase 5** *(next)*: `/api/reconcile` invariant endpoint + pytest suite.
+  Should assert all Phase 1-4 invariants (canonical Cash Book KPI derivation,
+  party unique index, transfer-cash conservation for account_to_account, FF
+  settlement sign convention, no orphan references, `unrealized_net_profit ==
+  estimated_net_profit - net_profit` on the dashboard).
 - **P2 — Phase 5**: `/api/reconcile` invariant endpoint + pytest suite.
 - **P2 — Phase 6 (Admin Data Management + Auth)** — ships **last**, after Phase 5. Approved architecture:
   - **Auth**: JWT-based custom (email + password + bcrypt + role field). First admin created via one-time `POST /api/admin/bootstrap` (rejects once ≥1 admin exists). All admin endpoints re-verify the JWT + `role='admin'` server-side; frontend hiding is not sufficient.
