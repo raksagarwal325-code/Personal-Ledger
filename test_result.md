@@ -766,6 +766,118 @@ backend:
     status_history:
       - working: true
         agent: "main"
+        comment: "Slice 1 landed 2026-07-21. Additive only. 65/65 domain tests pass. See task ‘Slice 2’ below for continuation."
+
+  - task: "Phase 6 · Slice 2 — Dashboard consolidation (dashboard + dashboard/breakdown → domain layer)"
+    implemented: true
+    working: true
+    file: "backend/server.py, backend/tests/test_p6_slice2_dashboard.py, backend/tests/fixtures/*.json"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: |
+          Slice 2 of Phase 6 landed 2026-07-21 per the approved plan and
+          user's 12 adjustments.
+          
+          Endpoints changed:
+            * server.py::dashboard() — payment fetching now returns full
+              lists; active-record filtering delegated to
+              is_customer_payment_active / is_purchase_payment_active /
+              is_cash_book_entry_canonical. `received`, `paid`,
+              `customer_advances`, `purchase_paid`, and the `modes` list
+              are all now derived from the shared domain helpers
+              (sum_received_kpi, sum_paid_kpi, compute_party_metrics,
+              sum_mode_totals). Order-level KPIs (operating_revenue,
+              net_profit, total_cost, tax_amount, invoice_total, boxes,
+              freight, packing_cost) still read denormalised fields off
+              order docs — those are the source-of-truth on the order
+              document; Slice 3 will fold them through
+              order_realized_amounts / order_estimated_amounts.
+            * server.py::dashboard_breakdown() — same treatment applied
+              to the `payable` block. Also the two float(...get("amount"))
+              sums in other_revenue_by_description and
+              other_expense_by_description grouping are now paise-safe
+              via to_paise/from_paise.
+
+          Preservation guarantees:
+            * `/api/dashboard` and `/api/dashboard/breakdown` return
+              byte-equivalent paise integers to the pre-Slice-2 snapshot
+              (0 diffs across all 30 KPI keys, all breakdown sub-blocks).
+            * The mode-series still exposes an explicit "Other" bucket
+              for blank/None modes — no transaction is silently dropped
+              (property-tested in test_no_transaction_silently_dropped_by_mode_bucketing).
+            * All frontend-visible field names, aliases, orderings,
+              null-handling preserved.
+          
+          Intentional cosmetic difference (reported to reviewer):
+            * Zero-valued monetary KPIs (received, paid, purchase_paid,
+              customer_advances, outstanding_payable) now serialise as
+              Python floats (0.0) instead of ints (0). Numerical
+              equivalence in paise is preserved. Per Slice-2 spec
+              ("Compare monetary values in paise, not raw floating-point
+              values"), this is not a semantic change.
+          
+          CI guard baselines DECREMENTED by the exact number of
+          duplicated patterns removed in this slice (verified via grep):
+            * float_amount_get:     70 → 56 (−14)
+            * reversed_ne_true:      3 → 1  (−2)
+            * source_ne_legacy_shim: 5 → 3  (−2)
+            * round_calls:          67 → 67 (unchanged; not touched by Slice 2)
+          
+          Regression verification (2026-07-21):
+            * test_p4_partial_shipment_revenue.py: 6/6 pass (unchanged).
+            * test_p5_reconcile.py:                20/20 pass (unchanged).
+            * test_p6_domain.py:                   65/65 pass
+              (includes updated CI-guard baseline).
+            * test_p6_slice2_dashboard.py: NEW — 13/13 pass:
+              - 3 synthetic golden-master + property + mode-bucket-coverage
+              - 4 live-seed snapshot comparisons (dashboard, breakdown,
+                mode-total invariant, reconcile healthy=true)
+              - 6 endpoint-thinness tests (no inline reversed/source
+                filters, no manual mode bucketing, domain imports present)
+            * Live GET /api/reconcile: healthy=true, engine_version=P5,
+              21/21 invariants pass — UNCHANGED.
+            * Live GET /api/dashboard: KPIs byte-identical
+              (op_rev ₹46,98,786; realized profit ₹19,74,465;
+              total_cost ₹27,24,321).
+            * server.py net LOC delta: +62 / −44 = −18 lines (real
+              consolidation, not shuffling).
+          
+          Awaiting reviewer sign-off before starting Slice 3
+          (compute_order_aggregates → order_realized_amounts +
+          order_estimated_amounts; will decrement round_calls baseline
+          for the first time).
+
+    status_history_archived_slice1:
+      - working: true
+        agent: "main"
+        comment: |
+          [ARCHIVED — Slice 1 detail; kept for audit trail]
+          Slice 1 of the Phase 6 refactor landed per approved plan +
+          user adjustments (2026-07-21). PURELY ADDITIVE. Added constant
+          SETTLED_THRESHOLD_PAISE=50, order/purchase/party/transfer
+          helpers, and composable dashboard metric builders. 65-test
+          suite (unit + property + mutation-protection + determinism +
+          CI-guard baseline) all pass in 0.09s. Reconcile stayed healthy
+          21/21. Dashboard KPIs byte-identical to pre-Slice-1 snapshot.
+    status_history_archived_phase5_signoff:
+      - working: true
+        agent: "user"
+        completed_at: "2026-07-21T19:20:00+00:00"
+        comment: |
+          APPROVED by user on 2026-07-21. Phase 5 (P2 — /api/reconcile
+          invariant engine + Admin UI) marked COMPLETE. Backend
+          integration tests (20/20), independent verification (81/81),
+          and the live reconciliation run were judged sufficient. A full
+          frontend regression sweep of the ReconciliationCard is
+          optional and does NOT block the P0–P5 programme from closing.
+
+    status_history:
+      - working: true
+        agent: "main"
         comment: |
           Slice 1 of the Phase 6 refactor landed per approved plan +
           user adjustments (2026-07-21). PURELY ADDITIVE — no caller in

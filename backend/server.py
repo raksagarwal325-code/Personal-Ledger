@@ -17,6 +17,17 @@ from collections import defaultdict
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
+# Phase 6 · Slice 2 — dashboard endpoints now derive all payment / mode /
+# active-record filtering through the shared domain layer. See
+# /app/memory/phase6_shared_domain_preimpl_report.md.
+from domain import (
+    from_paise, to_paise,
+    is_customer_payment_active, is_purchase_payment_active,
+    is_cash_book_entry_canonical,
+    sum_received_kpi, sum_paid_kpi, sum_mode_totals,
+    compute_party_metrics,
+)
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -1288,20 +1299,17 @@ async def dashboard():
     # timeline as read-only "Migration" entries.
     # P3: Transfers (both `db.transfers` and any cash_book_entries[kind=transfer]
     # not yet migrated) are ALSO excluded — transfers are profit-neutral.
+    #
+    # Phase 6 · Slice 2: active-record filtering is now the responsibility
+    # of the domain layer. This endpoint fetches EVERYTHING (no inline
+    # Mongo filter) and lets `is_*_active` / `is_cash_book_entry_canonical`
+    # decide what's canonical. Guarantees the same rule reconcile applies.
     cust_pays = await db.customer_payments.find({}, {"_id": 0}).to_list(20000)
     purchase_pays = await db.purchase_payments.find({}, {"_id": 0}).to_list(20000)
-    cb_entries = await db.cash_book_entries.find(
-        {"source": {"$ne": "legacy_shim"},
-         "reversed": {"$ne": True},
-         "kind": {"$ne": "transfer"}}, {"_id": 0}
-    ).to_list(20000)
+    cb_entries_all = await db.cash_book_entries.find({}, {"_id": 0}).to_list(20000)
 
-    received = sum(float(p.get("amount") or 0) for p in cust_pays)
-    received += sum(float(e.get("amount") or 0) for e in cb_entries
-                    if e.get("kind") == "general_income")
-    paid = sum(float(p.get("amount") or 0) for p in purchase_pays)
-    paid += sum(float(e.get("amount") or 0) for e in cb_entries
-                if e.get("kind") == "general_expense")
+    received = from_paise(sum_received_kpi(cust_pays, cb_entries_all))
+    paid = from_paise(sum_paid_kpi(purchase_pays, cb_entries_all))
 
     # Outstanding by payment_status on orders (simple proxy)
     outstanding_receivable = sum(
@@ -1317,15 +1325,21 @@ async def dashboard():
     freight_paid = sum(o.get("freight_paid") or 0 for o in orders)
     packing_cost = sum(o.get("packing_cost") or 0 for o in orders)
 
-    # Customer advances (unallocated portion of customer payments)
-    customer_advances = sum(float(p.get("unallocated") or 0) for p in cust_pays)
+    # Customer advances (unallocated portion of active customer payments)
+    customer_advances = from_paise(
+        compute_party_metrics(cust_pays, purchase_pays)["customer_advances_paise"]
+    )
 
-    # Purchase KPIs (vendor bills & payments)
+    # Purchase KPIs (vendor bills & payments). The `purchase_paid` KPI must
+    # equal Σ(active purchase_payments.amount) — routed via domain.
     purchases = await db.purchases.find({}, {"_id": 0}).to_list(20000)
-    purchase_value = sum(float(p.get("invoice_total") or 0) for p in purchases)
-    purchase_paid = sum(float(p.get("amount") or 0) for p in purchase_pays)
+    purchase_value = sum((p.get("invoice_total") or 0) for p in purchases)
+    purchase_paid = from_paise(sum(
+        to_paise(p.get("amount")) for p in purchase_pays
+        if is_purchase_payment_active(p)
+    ))
     purchase_outstanding = sum(
-        float(p.get("outstanding_balance") or 0) for p in purchases
+        (p.get("outstanding_balance") or 0) for p in purchases
         if p.get("payment_status") in ("Unpaid", "Partial")
     )
 
@@ -1409,21 +1423,19 @@ async def dashboard():
         key=lambda x: -x["sales"],
     )[:10]
 
-    # Payments by mode — sourced from canonical modules only (transfers excluded)
-    mode_map = defaultdict(lambda: {"received": 0, "paid": 0})
-    for p in cust_pays:
-        m = p.get("mode") or "Other"
-        mode_map[m]["received"] += float(p.get("amount") or 0)
-    for p in purchase_pays:
-        m = p.get("mode") or "Other"
-        mode_map[m]["paid"] += float(p.get("amount") or 0)
-    for e in cb_entries:
-        m = e.get("mode") or "Other"
-        if e.get("kind") == "general_income":
-            mode_map[m]["received"] += float(e.get("amount") or 0)
-        elif e.get("kind") == "general_expense":
-            mode_map[m]["paid"] += float(e.get("amount") or 0)
-    mode_series = [{"mode": k, **v} for k, v in mode_map.items()]
+    # Payments by mode — sourced from canonical modules only (transfers excluded).
+    # Phase 6 · Slice 2: bucketing is now the domain layer's job. The
+    # sentinel key "" (blank/None mode) is preserved as an explicit
+    # "Other" bucket per the Slice 2 spec — no transaction is silently dropped.
+    mode_totals = sum_mode_totals(cust_pays, purchase_pays, cb_entries_all)
+    mode_series = [
+        {
+            "mode": (mode_key if mode_key else "Other"),
+            "received": from_paise(vals["received_paise"]),
+            "paid": from_paise(vals["paid_paise"]),
+        }
+        for mode_key, vals in mode_totals.items()
+    ]
 
     return {
         "kpis": {
@@ -1486,7 +1498,7 @@ async def dashboard_breakdown():
     for o in orders:
         for e in (o.get("other_revenue") or []):
             k = (e.get("description") or "Unlabelled").strip() or "Unlabelled"
-            other_rev_by_desc[k]["amount"] += float(e.get("amount") or 0)
+            other_rev_by_desc[k]["amount"] += from_paise(to_paise(e.get("amount")))
             other_rev_by_desc[k]["count"] += 1
 
     rev_by_main = defaultdict(float)
@@ -1562,7 +1574,7 @@ async def dashboard_breakdown():
     for o in orders:
         for e in (o.get("other_expense") or []):
             k = (e.get("description") or "Unlabelled").strip() or "Unlabelled"
-            other_exp_by_desc[k]["amount"] += float(e.get("amount") or 0)
+            other_exp_by_desc[k]["amount"] += from_paise(to_paise(e.get("amount")))
             other_exp_by_desc[k]["count"] += 1
 
     cost = {
@@ -1668,13 +1680,13 @@ async def dashboard_breakdown():
     # P0: sourced from canonical modules (customer_payments, purchase_payments,
     # cash_book_entries) — never from legacy db.payments.
     # P3: transfers are profit-neutral — excluded here.
+    #
+    # Phase 6 · Slice 2: active-record filtering is now delegated to the
+    # domain layer. Fetch all rows, then filter with `is_*_active` /
+    # `is_cash_book_entry_canonical`.
     cust_pays = await db.customer_payments.find({}, {"_id": 0}).to_list(20000)
     purchase_pays = await db.purchase_payments.find({}, {"_id": 0}).to_list(20000)
-    cb_entries = await db.cash_book_entries.find(
-        {"source": {"$ne": "legacy_shim"},
-         "reversed": {"$ne": True},
-         "kind": {"$ne": "transfer"}}, {"_id": 0}
-    ).to_list(20000)
+    cb_entries_all = await db.cash_book_entries.find({}, {"_id": 0}).to_list(20000)
 
     payable_by_party = defaultdict(lambda: {"paid": 0, "received": 0, "net": 0})
     payable_by_mode = defaultdict(lambda: {"paid": 0, "received": 0})
@@ -1695,13 +1707,19 @@ async def dashboard_breakdown():
         payable_by_mode[m]["received"] += r
 
     for p in cust_pays:
-        amt = float(p.get("amount") or 0)
+        if not is_customer_payment_active(p):
+            continue
+        amt = from_paise(to_paise(p.get("amount")))
         _bump(p.get("customer_name") or "Customer", p.get("mode") or "", amt, 0.0)
     for p in purchase_pays:
-        amt = float(p.get("amount") or 0)
+        if not is_purchase_payment_active(p):
+            continue
+        amt = from_paise(to_paise(p.get("amount")))
         _bump(p.get("vendor_name") or "Vendor", p.get("mode") or "", 0.0, amt)
-    for e in cb_entries:
-        amt = float(e.get("amount") or 0)
+    for e in cb_entries_all:
+        if not is_cash_book_entry_canonical(e):
+            continue
+        amt = from_paise(to_paise(e.get("amount")))
         party = e.get("party_name") or ("Transfer" if e.get("kind") == "transfer" else "Cash Book")
         mode = e.get("mode") or ""
         if e.get("kind") == "general_income":

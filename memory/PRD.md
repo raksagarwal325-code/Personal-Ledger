@@ -10,7 +10,10 @@ Multi-phase refactor to make Cash Book a unified timeline sourced from canonical
 3. **P1 — Transfer UI (Rakshit ↔ Father's Firm, bank ↔ cash, account ↔ account)** *(shipped Feb 2026)*
 4. **P1 — Partial-shipment revenue + Estimated vs Realized profit** *(shipped Jul 2025)*
 5. **P2 — `/api/reconcile` + invariant tests** *(shipped Jul 2025 · APPROVED and CLOSED Jul 2025)*
-6. **P2 — Shared Domain Calculation Consolidation** — *in progress (Jul 2026)*. Slice 1 landed: additive helpers in `backend/domain.py` + 65-test unit/property/mutation-protection suite in `backend/tests/test_p6_domain.py` + CI-guard baseline (float(x.get('amount')…)=70, round=67, reversed:$ne=3, source:$ne legacy_shim=5) that shrinks per slice. Zero callers switched. All existing test suites unchanged, live reconcile still healthy (21/21), dashboard KPIs byte-identical. Awaiting sign-off before Slice 2 (dashboard() ← build_dashboard_kpis + golden-master snapshot).
+6. **P2 — Shared Domain Calculation Consolidation** — *in progress (Jul 2026)*.
+   - **Slice 1** *(2026-07-21)*: additive helpers in `backend/domain.py` + 65-test unit/property/mutation-protection suite + CI-guard baseline (float=70, round=67, reversed_ne=3, source_ne=5). Zero callers switched.
+   - **Slice 2** *(2026-07-21)*: `dashboard()` + `dashboard_breakdown()` in `server.py` now derive `received`, `paid`, `customer_advances`, `purchase_paid`, `modes`, and `payable` through `sum_received_kpi`/`sum_paid_kpi`/`sum_mode_totals`/`compute_party_metrics`. Active-record filtering delegated to `is_customer_payment_active`/`is_purchase_payment_active`/`is_cash_book_entry_canonical`. Byte-equivalent (paise) response preserved; frontend unaffected. CI baselines decremented: float 70→56, reversed_ne 3→1, source_ne 5→3. 13 new Slice-2 tests (synthetic golden-master + property + live-seed snapshot + endpoint-thinness). Reconcile still healthy 21/21, engine_version=P5.
+   - **Awaiting sign-off** before Slice 3 (`compute_order_aggregates` → `order_realized_amounts` + `order_estimated_amounts`; will decrement `round_calls` for the first time).
 
 ## Architecture (unchanged)
 - FastAPI (`backend/server.py`, `backend/party_ledger_v2.py`) + MongoDB.

@@ -616,14 +616,17 @@ class TestOrderInsensitive:
 # CI GUARD (adjustment §10) — grep-baseline that must decrease per slice.
 # ═════════════════════════════════════════════════════════════════════════
 
-# Snapshot baseline taken at start of Slice 1 (2026-07-21). Every subsequent
-# slice must NOT increase any of these numbers; ideally each decrements
-# them toward zero. Any PR that increases these counts is rejected here.
+# Snapshot baseline shrinks per slice. Any PR that INCREASES these counts
+# is rejected here. History:
+#   Slice 1 (initial):  70 / 67 / 3 / 5
+#   Slice 2 (dashboard + dashboard/breakdown consolidation):
+#                       56 / 67 / 1 / 3  — removed 14 float(x.get(*amount*)),
+#                       2 reversed:$ne, 2 source:$ne_legacy_shim.
 CI_GUARD_BASELINE = {
-    "float_amount_get":        70,   # float(x.get('...amount...'))
-    "round_calls":             67,   # round(...)
-    "reversed_ne_true":         3,   # {"reversed":{"$ne":True}}
-    "source_ne_legacy_shim":    5,   # {"source":{"$ne":"legacy_shim"}}
+    "float_amount_get":        56,
+    "round_calls":             67,
+    "reversed_ne_true":         1,
+    "source_ne_legacy_shim":    3,
 }
 
 _BACKEND_DIR = Path(__file__).resolve().parents[1]
