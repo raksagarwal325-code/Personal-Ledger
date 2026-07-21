@@ -45,23 +45,23 @@ Multi-phase refactor to make Cash Book a unified timeline sourced from canonical
 - Old free-form `components/PaymentDialog.jsx` is no longer imported anywhere (kept on disk for git history).
 - "Include pre-refactor migration rows" toggle to hide/show historic legacy rows.
 
-## Test status (Feb 2026 · post-Phase 1)
-| File | Before P0 | After P0 | Notes |
-|---|---|---|---|
-| `test_p0_canonical_cashbook.py` (**new**) | — | **9/9 pass** | KPI derivation, transfer neutrality, shim non-counting, business events, export column |
-| `test_party_ledger_v2.py` | 7 fail | 0 fail | ✅ all pass |
-| `test_party_ledger_reconciliation.py` | 8 fail | 2 fail | 6 fixed |
-| `test_review_workflow.py` | 1 fail | 0 fail | ✅ dashboard consistency restored |
-| `test_purchase_sources.py` | 0 fail | 0 fail | unchanged |
-| `backend_test.py` | 20 fail | 19 fail | legacy tech-debt (asserts on old db.payments Cash Book behaviour) |
-| `test_erp_refactor.py::test_47_orders_fully_shipped` | fail | fail | unrelated legacy migration |
-| `test_erp_refactor.py::test_dashboard_kpis_preserved` | fail | fail | asserts on old legacy-based dashboard KPIs (design change) |
-| `test_purchases_and_bugs.py::test_dashboard_legacy_kpis_intact` | fail | fail | same |
-| **Full suite** | 137 pass / 36 fail | **158 pass / 24 fail** | +21 pass |
+## Test status (Feb 2026 · post-Phase 2)
+| File | Before P0 | After P0 | After P1 | Notes |
+|---|---|---|---|---|
+| `test_p0_canonical_cashbook.py` | — | **9/9** | **9/9** | KPI derivation, transfer neutrality, shim non-counting, business events, export column |
+| `test_p1_party_auto_create.py` (**new**) | — | — | **14/14** | Stamps, normalization, Factory→FF, rename, migration idempotency, conflict reporting, concurrency |
+| Testing-agent supplementary `test_p1_party_review_extras.py` | — | — | **6/6** | System-party rename block + GET system party |
+| `test_party_ledger_v2.py` | 7 fail | 0 fail | 0 fail | ✅ all pass |
+| `test_party_ledger_reconciliation.py` (isolation) | 8 fail | 2 fail | 0 fail | ✅ all pass in isolation; xdist ordering can still flake 2 |
+| `test_review_workflow.py` (isolation) | 1 fail | 0 fail | 0 fail | ✅ dashboard consistency stable in isolation |
+| `test_purchase_sources.py` | 0 fail | 0 fail | 0 fail | unchanged |
+| `backend_test.py` (legacy tech debt per audit §6 P2) | 20 fail | 19 fail | 19 fail | asserts on pre-refactor db.payments Cash Book KPIs — out of scope |
+| `test_erp_refactor.py::TestLegacyMigration` | 2 fail | 2 fail | 2 fail | asserts on old legacy-based dashboard KPIs (design change) |
+| `test_purchases_and_bugs.py::test_dashboard_legacy_kpis_intact` | fail | fail | fail | same |
+| **Full suite (xdist parallel)** | 137 pass / 36 fail | 158/24 | **170/26** | +33 pass overall; the 26 remaining are all pre-existing tech debt or xdist-order flakes |
 
 ## Prioritized backlog
-- **P1 — Phase 2**: Auto-create parties in every canonical write path (`customer_payments`, `purchase_payments`, `purchases`, `orders`). Resolve `db.vendors` vs `parties.type='vendor'` duplication. Should retire the 2 remaining `test_party_ledger_reconciliation.py` failures + many `backend_test.py` legacy assertions.
-- **P1 — Phase 3**: Enrich Cash Book's Transfer flow to include a first-class `Rakshit ↔ Father's Firm` route that posts through Party Ledger v2 `POST /party-transactions category=transfer`.
+- **P1 — Phase 3** *(next)*: Enrich Cash Book's Transfer flow to include a first-class `Rakshit ↔ Father's Firm` route posting through Party Ledger v2 `POST /party-transactions category=transfer`. Also expose bank↔cash, cash↔bank, account↔account transfers with account balance updates.
 - **P1 — Phase 4**: Partial-shipment proportional revenue recognition + Estimated vs Realized profit split.
 - **P2 — Phase 5**: `/api/reconcile` invariant endpoint + pytest suite.
 - **P2 — Phase 6 (Admin Data Management + Auth)** — ships **last**, after Phase 5. Approved architecture:
