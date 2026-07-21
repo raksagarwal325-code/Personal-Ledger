@@ -119,13 +119,13 @@ user_problem_statement: |
   If those end-to-end tests pass, Admin Data Management v1 is complete.
 
 frontend:
-  - task: "Login/Bootstrap — Toaster now global so failed login shows feedback"
+  - task: "Login/Bootstrap — Toaster now global + CORS credentials fix"
     implemented: true
-    working: true
-    file: "frontend/src/App.js, frontend/src/components/Layout.jsx, frontend/src/pages/Login.jsx"
-    stuck_count: 0
+    working: "NA"
+    file: "frontend/src/App.js, frontend/src/components/Layout.jsx, frontend/src/pages/Login.jsx, backend/server.py, backend/.env"
+    stuck_count: 1
     priority: "high"
-    needs_retesting: false
+    needs_retesting: true
     status_history:
       - working: "NA"
         agent: "main"
@@ -157,6 +157,41 @@ frontend:
               /login.
             - Correct password → success toast + redirect to /.
             - Toaster works on protected pages too (no regression).
+      - working: true
+        agent: "testing"
+        comment: |
+          Initial round (before user re-tested): all 4 UI scenarios PASSED.
+      - working: "NA"
+        agent: "user"
+        comment: |
+          User then saw "Network Error" toast + inline banner on the
+          login page when clicking Sign in. Screenshot shared shows
+          axios-style "Network Error" — the request didn't reach the API.
+      - working: "NA"
+        agent: "main"
+        comment: |
+          Root cause: CORS bug — the backend was configured with
+          CORS_ORIGINS=* AND allow_credentials=True. The browser MUST
+          reject a response that carries both `Access-Control-Allow-Origin:
+          *` and `Access-Control-Allow-Credentials: true` — this manifests
+          in axios as "Network Error" (no HTTP status, request blocked at
+          the network layer).
+          
+          Additional fixes now applied:
+            6) backend/.env: CORS_ORIGINS changed from "*" to "" (empty).
+            7) backend/server.py CORSMiddleware: no longer falls back to
+               "*" when CORS_ORIGINS is empty; instead relies on the
+               allow_origin_regex whitelist which now covers
+               *.preview.emergentagent.com + localhost + 127.0.0.1.
+            8) Backend restarted.
+          
+          Verified via curl directly at localhost:8001 with an Origin
+          header: response now carries the specific origin, not "*", and
+          `Access-Control-Allow-Credentials: true`. Verified via playwright
+          against the public preview URL: login succeeds, success toast
+          appears, dashboard renders.
+          
+          Please re-run the same 4 UI scenarios end-to-end.
       - working: true
         agent: "testing"
         comment: |

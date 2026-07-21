@@ -3555,10 +3555,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
     # Phase 6: httpOnly auth cookies require an EXPLICIT origin (browsers reject
-    # wildcard '*' with credentials). Falls back to the wildcard when CORS_ORIGINS
-    # is unset, which is fine for unauthenticated API access.
-    allow_origins=[o.strip() for o in (os.environ.get("CORS_ORIGINS") or "*").split(",") if o.strip()],
-    allow_origin_regex=r"https?://.*\.preview\.emergentagent\.com|https?://localhost(:\d+)?",
+    # wildcard '*' with credentials). CORS_ORIGINS may hold an explicit
+    # comma-separated allow-list; when unset we rely purely on the regex below,
+    # which whitelists every preview.emergentagent.com subdomain + localhost.
+    allow_origins=[o.strip() for o in (os.environ.get("CORS_ORIGINS") or "").split(",") if o.strip() and o.strip() != "*"],
+    allow_origin_regex=r"https?://.*\.preview\.emergentagent\.com|https?://localhost(:\d+)?|https?://127\.0\.0\.1(:\d+)?",
     allow_methods=["*"],
     allow_headers=["*"],
 )
