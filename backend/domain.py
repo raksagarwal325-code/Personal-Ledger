@@ -226,8 +226,12 @@ def _order_shipped_qty_by_item(order: dict) -> dict:
 
 
 def order_shipped_ratio_per_item(order: dict) -> dict:
-    """Return {order_item_id: Decimal(shipped/ordered)} clamped to [0, 1].
-    Missing / zero ordered qty yields Decimal('0'). Pure."""
+    """Return {order_item_id: Decimal(shipped/ordered)}.
+
+    Non-negative. Not clamped to ≤ 1 — over-shipment (shipped > ordered)
+    yields a ratio > 1 to match pre-Phase-6 behaviour: any revenue and cost
+    proportioned by this ratio scales linearly. Missing / zero ordered qty
+    yields Decimal('0'). Pure."""
     shipped = _order_shipped_qty_by_item(order)
     ratios: dict = {}
     for it in (order.get("items") or []):
@@ -242,8 +246,6 @@ def order_shipped_ratio_per_item(order: dict) -> dict:
             r = shipped_qty / ordered_qty
             if r < 0:
                 r = Decimal("0")
-            elif r > 1:
-                r = Decimal("1")
             ratios[iid] = r
     return ratios
 

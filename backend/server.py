@@ -26,6 +26,8 @@ from domain import (
     is_cash_book_entry_canonical,
     sum_received_kpi, sum_paid_kpi, sum_mode_totals,
     compute_party_metrics,
+    order_realized_amounts, order_estimated_amounts, order_unrealized,
+    _order_shipped_qty_by_item,
 )
 
 ROOT_DIR = Path(__file__).parent
@@ -391,96 +393,67 @@ def _item_outside(it: dict) -> float:
 def compute_order_aggregates(order: dict) -> dict:
     """Recalculate stored aggregates. Revenue & profit are recognized ONLY on shipped qty.
 
-    Ordered totals are informational (potential); shipped totals drive P&L.
+    Phase 6 · Slice 3: this function is now a THIN ADAPTER over the pure
+    domain helpers `order_realized_amounts`, `order_estimated_amounts`,
+    `order_unrealized`. Every money value is computed once, in paise, by
+    the domain layer; this adapter converts back to display floats and
+    stamps every denormalised field on the `order` dict — preserving the
+    exact response contract every caller / test / snapshot relies on.
+
+    Only these responsibilities remain in server.py:
+      * Item mutation: stamping `qty_shipped` back onto each item (order
+        lifecycle bookkeeping — not pure calculation).
+      * `status` auto-update based on shipment progress.
+      * `last_shipped_date` extraction.
+      * Field aliasing (realized_*, revenue_recognized).
+
+    Freight, packing, and event-recorded adjustments (`other_revenue`,
+    `other_expense`) are included AS-IS — never proportioned by shipment
+    ratio — matching the pre-refactor rule.
     """
     items = order.get("items") or []
     shipments = order.get("shipments") or []
 
-    # Build ordered lookup by id
-    item_by_id = {i.get("id"): i for i in items if i.get("id")}
+    # ── Domain layer — pure paise-integer calculations ───────────────────
+    real = order_realized_amounts(order)
+    est = order_estimated_amounts(order)
+    unreal = order_unrealized(order)
 
-    # Shipped qty per order-item
-    shipped_qty_by_item: dict = {}
-    for sh in shipments:
-        for si in (sh.get("items") or []):
-            iid = si.get("order_item_id")
-            if not iid:
-                continue
-            shipped_qty_by_item[iid] = shipped_qty_by_item.get(iid, 0) + float(si.get("qty") or 0)
-
-    # Aggregate per item, allocate costs proportionally (shipped_qty / ordered_qty)
+    # ── Item-level bookkeeping (stamp qty_shipped on each item) ──────────
+    shipped_qty_by_item = _order_shipped_qty_by_item(order)
     ordered_qty_total = 0.0
     shipped_qty_total = 0.0
-    ordered_product_sales = 0.0
-    shipped_product_sales = 0.0
-    factory_cost_total = 0.0
-    outside_cost_total = 0.0
-    # Phase 4 — estimated (full-order) factory & outside costs, i.e. what these
-    # would total if every ordered unit were shipped.
-    estimated_factory_cost_total = 0.0
-    estimated_outside_cost_total = 0.0
-
     for it in items:
-        ordered_qty = float(it.get("qty") or 0)
-        rate = float(it.get("rate") or 0)
-        # Ordered product_sales prefers stored product_sales, else qty*rate
-        item_ordered_sales = float(it.get("product_sales") or 0) or ordered_qty * rate
-        shipped_qty = shipped_qty_by_item.get(it.get("id"), 0)
-        ratio = (shipped_qty / ordered_qty) if ordered_qty else 0
-        # Also stamp shipped_qty back onto the item (denormalised)
-        it["qty_shipped"] = shipped_qty
+        iid = it.get("id")
+        ordered_qty_total += float(it.get("qty") or 0)
+        sq = shipped_qty_by_item.get(iid, 0.0)
+        shipped_qty_total += sq
+        it["qty_shipped"] = sq
 
-        ordered_qty_total += ordered_qty
-        shipped_qty_total += shipped_qty
-        ordered_product_sales += item_ordered_sales
-        shipped_product_sales += item_ordered_sales * ratio
+    # Ordered vs shipped product sales — informational totals derived from
+    # domain estimates; ordered = full projection, shipped = realized slice.
+    ordered_product_sales = from_paise(est["estimated_product_sales_paise"])
+    shipped_product_sales = from_paise(real["shipped_product_sales_paise"])
 
-        for k in ("factory_complete", "factory_glass", "factory_fitting"):
-            v = float(it.get(k) or 0)
-            factory_cost_total += v * ratio
-            estimated_factory_cost_total += v
-        for k in ("outside_complete", "outside_glass", "outside_fitting"):
-            v = float(it.get(k) or 0)
-            outside_cost_total += v * ratio
-            estimated_outside_cost_total += v
-
-    other_revenue_total = sum(float((e or {}).get("amount") or 0) for e in (order.get("other_revenue") or []))
-    other_expense_total = sum(float((e or {}).get("amount") or 0) for e in (order.get("other_expense") or []))
-    packing_cost = float(order.get("packing_cost") or 0)
-    packing_recovery = float(order.get("packing_recovery") or 0)
-
-    # Freight & boxes now sourced from shipments only. Legacy migration on startup
-    # backfills a synthetic shipment for every pre-existing order, so no order in
-    # production should have an empty shipments array. If it is empty here, treat
-    # everything as zero — do NOT fall back to (potentially stale) order-level fields.
-    ship_freight_charged = sum(float((s or {}).get("freight_charged") or 0) for s in shipments)
-    ship_freight_paid = sum(float((s or {}).get("freight_paid") or 0) for s in shipments)
+    # ── Convert every paise integer back to display float ────────────────
+    factory_cost_total = from_paise(real["factory_cost_realized_paise"])
+    outside_cost_total = from_paise(real["outside_cost_realized_paise"])
+    other_revenue_total = from_paise(real["other_revenue_total_paise"])
+    other_expense_total = from_paise(real["other_expense_total_paise"])
+    ship_freight_charged = from_paise(real["ship_freight_charged_paise"])
+    ship_freight_paid = from_paise(real["ship_freight_paid_paise"])
     ship_boxes = sum(float((s or {}).get("boxes_shipped") or 0) for s in shipments)
 
-    operating_revenue = shipped_product_sales + ship_freight_charged + packing_recovery + other_revenue_total
-    total_cost = factory_cost_total + outside_cost_total + packing_cost + ship_freight_paid + other_expense_total
+    operating_revenue = from_paise(real["operating_revenue_paise"])
+    total_cost = from_paise(real["total_cost_paise"])
+    tax_amount = from_paise(real["tax_amount_paise"])
+    invoice_total = from_paise(real["invoice_total_paise"])
+    net_profit = from_paise(real["net_profit_paise"])
 
-    tax_applicable = bool(order.get("tax_applicable"))
-    tax_percent = float(order.get("tax_percent") or 0) if tax_applicable else 0
-    tax_manual = bool(order.get("tax_amount_manual"))
-    # Tax base factors in Other Revenue (already in operating_revenue) and
-    # Other Expense (subtracted here) so the taxable amount reflects the true
-    # net revenue after these adjustments.
-    tax_base = max(0.0, operating_revenue - other_expense_total)
-    if tax_applicable:
-        if tax_manual:
-            tax_amount = float(order.get("tax_amount") or 0)
-        else:
-            tax_amount = round(tax_base * tax_percent / 100.0, 2)
-    else:
-        tax_amount = 0
-
-    invoice_total = operating_revenue + tax_amount
-    net_profit = operating_revenue - total_cost
     margin = (net_profit / operating_revenue * 100.0) if operating_revenue else 0
     progress = (shipped_qty_total / ordered_qty_total * 100.0) if ordered_qty_total else 0
 
-    # Auto-update status based on shipment progress (only if not Cancelled/Draft manual overrides)
+    # ── Status auto-update (unchanged from pre-refactor behaviour) ───────
     manual_states = {"Draft", "Confirmed", "Cancelled", "Delivered"}
     cur = order.get("status") or "Confirmed"
     if cur not in manual_states or cur == "Confirmed":
@@ -495,6 +468,7 @@ def compute_order_aggregates(order: dict) -> dict:
     last = max([(s.get("date") or "") for s in shipments], default="") if shipments else ""
     order["last_shipped_date"] = last or order.get("shipped_date")
 
+    # ── Stamp every denormalised field (preserving contract) ─────────────
     order["ordered_qty_total"] = ordered_qty_total
     order["shipped_qty_total"] = shipped_qty_total
     order["ordered_product_sales"] = ordered_product_sales
@@ -526,20 +500,13 @@ def compute_order_aggregates(order: dict) -> dict:
     # packing / other adjustments. `realized_*` = same as the shipped-qty
     # values already on the order — kept as explicit fields so the frontend
     # never has to guess which aggregate is "recognized".
-    estimated_operating_revenue = (ordered_product_sales
-                                   + ship_freight_charged
-                                   + packing_recovery
-                                   + other_revenue_total)
-    estimated_total_cost = (estimated_factory_cost_total
-                            + estimated_outside_cost_total
-                            + packing_cost
-                            + ship_freight_paid
-                            + other_expense_total)
-    estimated_net_profit = estimated_operating_revenue - estimated_total_cost
+    estimated_operating_revenue = from_paise(est["estimated_operating_revenue_paise"])
+    estimated_total_cost = from_paise(est["estimated_total_cost_paise"])
+    estimated_net_profit = from_paise(est["estimated_net_profit_paise"])
     estimated_margin = (estimated_net_profit / estimated_operating_revenue * 100.0
                         if estimated_operating_revenue else 0)
-    order["estimated_factory_cost_total"] = estimated_factory_cost_total
-    order["estimated_outside_cost_total"] = estimated_outside_cost_total
+    order["estimated_factory_cost_total"] = from_paise(est["estimated_factory_cost_paise"])
+    order["estimated_outside_cost_total"] = from_paise(est["estimated_outside_cost_paise"])
     order["estimated_operating_revenue"] = estimated_operating_revenue
     order["estimated_total_cost"] = estimated_total_cost
     order["estimated_net_profit"] = estimated_net_profit
@@ -548,8 +515,8 @@ def compute_order_aggregates(order: dict) -> dict:
     order["realized_revenue"] = operating_revenue
     order["realized_net_profit"] = net_profit
     order["revenue_recognized"] = operating_revenue
-    order["unrealized_revenue"] = max(0.0, estimated_operating_revenue - operating_revenue)
-    order["unrealized_net_profit"] = estimated_net_profit - net_profit
+    order["unrealized_revenue"] = max(0.0, from_paise(unreal["unrealized_revenue_paise"]))
+    order["unrealized_net_profit"] = from_paise(unreal["unrealized_net_profit_paise"])
     return order
 
 

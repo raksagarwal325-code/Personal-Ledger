@@ -622,9 +622,13 @@ class TestOrderInsensitive:
 #   Slice 2 (dashboard + dashboard/breakdown consolidation):
 #                       56 / 67 / 1 / 3  — removed 14 float(x.get(*amount*)),
 #                       2 reversed:$ne, 2 source:$ne_legacy_shim.
+#   Slice 3 (compute_order_aggregates → thin adapter):
+#                       53 / 66 / 1 / 3  — removed 3 float(x.get(*amount*))
+#                       (other_revenue sum, other_expense sum, manual tax) and
+#                       1 round() (tax computation now paise HALF_UP in domain).
 CI_GUARD_BASELINE = {
-    "float_amount_get":        56,
-    "round_calls":             67,
+    "float_amount_get":        53,
+    "round_calls":             66,
     "reversed_ne_true":         1,
     "source_ne_legacy_shim":    3,
 }

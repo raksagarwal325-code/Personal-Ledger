@@ -768,6 +768,97 @@ backend:
         agent: "main"
         comment: "Slice 1 landed 2026-07-21. Additive only. 65/65 domain tests pass. See task ‘Slice 2’ below for continuation."
 
+  - task: "Phase 6 · Slice 3 — compute_order_aggregates → thin adapter over domain helpers"
+    implemented: true
+    working: true
+    file: "backend/server.py, backend/domain.py, backend/tests/test_p6_slice3_order_aggregates.py, backend/tests/fixtures/slice3_order_aggregates_snapshot.json"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: |
+          Slice 3 of Phase 6 landed 2026-07-21 per approved spec.
+          
+          Refactor summary:
+            * server.py::compute_order_aggregates is now a THIN ADAPTER.
+              Body calls order_realized_amounts + order_estimated_amounts
+              + order_unrealized from domain.py; every stamped field
+              (25+) is populated by converting paise ints back to floats.
+              Item-level `qty_shipped` stamping, status auto-update, and
+              `last_shipped_date` extraction stay in server.py (order
+              lifecycle bookkeeping, not pure calc).
+            * domain.py::order_shipped_ratio_per_item — REMOVED the upper
+              clamp (was Slice-1 defensive; now matches pre-refactor
+              linear-scaling behaviour for over-shipment, as required by
+              Slice-3 §Preserve behaviour for: over-shipment).
+          
+          Preservation verified:
+            * Live 47-order seed: 0 field-level differences across ALL
+              orders after compute_order_aggregates rewrite (verified in
+              paise integers, not floats).
+            * Reconcile still healthy 21/21, engine_version=P5.
+            * Dashboard endpoint response byte-identical.
+            * Freight, packing, other_revenue, other_expense continue to
+              be included as-is (never proportioned by shipment ratio) —
+              matches pre-refactor rule.
+            * Idempotency verified: 3× re-runs of
+              compute_order_aggregates on all 47 orders produce zero
+              paise drift on any field.
+          
+          Regression net (33 new tests, all pass):
+            * 9 edge-case fixtures — zero shipment, full, partial (40%),
+              OVER-shipment (12/10), zero ordered qty, missing optional
+              values, cancelled, tax auto-computed, tax manual override.
+            * 14 property tests — parametrised over 9 fixtures asserting
+              estimated_revenue == realized_revenue + unrealized_revenue
+              and estimated_profit == net_profit + unrealized_net_profit
+              (in paise, exact). Includes explicit over-shipment carve-out
+              (unrealized clamped to 0 when realized > estimated).
+            * 6 idempotency tests — 3× re-run stability across 6 fixtures.
+            * 3 input-mutation-contract tests — only ALLOWED_STAMPS keys
+              (35 documented denormalised fields + status +
+              last_shipped_date) may be modified; items get only
+              qty_shipped stamped; shipments untouched.
+            * 1 live-seed golden-master (all 47 orders, every field in
+              paise).
+          
+          CI-guard baselines DECREMENTED by exact removal count (grep-verified):
+            * float_amount_get:      56 → 53 (−3)
+              [removed: 2× float((e or {}).get("amount")) for
+              other_revenue/other_expense sums; 1× float(order.get("tax_amount"))
+              for manual-tax branch — all now via to_paise()]
+            * round_calls:           67 → 66 (−1)  [FIRST decrement]
+              [removed: round(tax_base * tax_percent / 100.0, 2) — tax
+              math now paise HALF_UP quantize inside order_realized_amounts]
+            * reversed_ne_true:       1 → 1  (unchanged)
+            * source_ne_legacy_shim:  3 → 3  (unchanged)
+          
+          Zero-output-difference report:
+            * No behavioural differences to accept — the Slice-3 refactor
+              is BYTE-EQUIVALENT to the pre-refactor output on every seed
+              order and every synthetic edge case (comparison in paise).
+            * The domain over-shipment ratio was un-clamped to preserve
+              linear scaling (matches pre-refactor). No user-visible
+              change since the live seed has no over-shipment.
+          
+          Full-suite verification:
+            * test_p4_partial_shipment_revenue.py: 6/6 (unchanged).
+            * test_p5_reconcile.py:                20/20 (unchanged).
+            * test_p6_domain.py:                   65/65 (unchanged;
+              CI-guard baselines updated by exact removed count).
+            * test_p6_slice2_dashboard.py:         13/13 (unchanged).
+            * test_p6_slice3_order_aggregates.py:  33/33 NEW.
+            * Grand total: 137/137 pass in 1.94s.
+            * Live GET /api/reconcile: healthy=true, engine=P5, 21/21.
+            * Live GET /api/dashboard: KPIs byte-identical
+              (op_rev ₹46,98,786; realized profit ₹19,74,465;
+              total_cost ₹27,24,321).
+          
+          Awaiting reviewer sign-off before Slice 4 (payment-aggregate
+          recompute + purchase twin).
+
   - task: "Phase 6 · Slice 2 — Dashboard consolidation (dashboard + dashboard/breakdown → domain layer)"
     implemented: true
     working: true
