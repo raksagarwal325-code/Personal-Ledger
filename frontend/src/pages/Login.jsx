@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../lib/auth";
-import { api } from "../lib/api";
+import { api, setAccessToken } from "../lib/api";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
@@ -31,7 +31,8 @@ export default function Login() {
     setErrorMsg("");
     try {
       if (mode === "bootstrap") {
-        await api.post("/admin/bootstrap", { email, password, name });
+        const r = await api.post("/admin/bootstrap", { email, password, name });
+        if (r?.data?.access_token) setAccessToken(r.data.access_token);
         toast.success("First admin created — welcome.");
       } else {
         await login(email, password);

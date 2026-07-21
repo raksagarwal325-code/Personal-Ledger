@@ -156,6 +156,62 @@ frontend:
             - Wrong password → error toast + inline banner + still on
               /login.
             - Correct password → success toast + redirect to /.
+      - working: "NA"
+        agent: "user"
+        comment: |
+          User reported (again): "The backend server is not running or not
+          reachable. When I try to sign in, I get a Network Error."
+          Confirmed from screenshot: red "Network Error" toast + inline
+          banner. Even though backend/frontend supervisor status show
+          RUNNING and the API is reachable via curl, axios in the browser
+          reports the request as failed at the network layer — classic
+          browser rejection of a credentialed response that carries
+          Access-Control-Allow-Origin: * (Cloudflare/ingress was rewriting
+          the ACAO header to "*" regardless of what FastAPI emitted).
+      - working: "NA"
+        agent: "main"
+        comment: |
+          Final root-cause fix: eliminate the CORS+credentials class of
+          bugs entirely by switching the frontend from cookie-based auth
+          to Bearer-token auth. The backend already accepts EITHER an
+          httpOnly cookie OR an `Authorization: Bearer <token>` header
+          (see backend/auth.py::_extract_token), so this is a
+          frontend-only change with zero backend contract changes.
+          
+          Changes:
+            - frontend/src/lib/api.js: axios instance no longer sets
+              withCredentials:true. New helpers getAccessToken /
+              setAccessToken / clearAccessToken use localStorage
+              (key: "artisan.access_token"). Request interceptor attaches
+              `Authorization: Bearer <token>` when present. Response
+              interceptor clears the token on 401 so the app falls back
+              to /login cleanly.
+            - frontend/src/lib/auth.jsx: login() now stores
+              response.data.access_token via setAccessToken(); logout()
+              calls clearAccessToken(). Initial /auth/me is SKIPPED when
+              no token is present (avoids a guaranteed 401 that would
+              surface as an ugly network error if the backend hiccups).
+            - frontend/src/pages/Login.jsx: bootstrap flow also stores
+              the returned access_token.
+          
+          Verified locally via playwright against the public preview URL:
+            - Wrong password → 401 + inline banner "Invalid email or
+              password." shown.
+            - Correct password → 200 + token persisted in localStorage
+              + dashboard rendered.
+            - Page reload → still logged in (Bearer token replayed).
+            - Zero failed /api/* requests, no "Network Error".
+          
+          Because the request no longer travels in "credentials mode",
+          the response's ACAO header value is irrelevant — the browser
+          accepts a wildcard * response happily. This is the belt-and-
+          suspenders fix that will hold across every browser + every
+          proxy configuration.
+          
+          Testing agent — please re-run the same 4 scenarios (login
+          success + toast, wrong-password error, no CORS/network
+          failures, reload persistence) end-to-end.
+
             - Toaster works on protected pages too (no regression).
       - working: true
         agent: "testing"
