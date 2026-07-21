@@ -121,9 +121,9 @@ user_problem_statement: |
 frontend:
   - task: "Phase 4 — Dashboard + Orders UI for Estimated vs Realized profit"
     implemented: true
-    working: false
+    working: true
     file: "frontend/src/pages/Dashboard.jsx, frontend/src/pages/Orders.jsx"
-    stuck_count: 1
+    stuck_count: 0
     priority: "high"
     needs_retesting: false
     status_history:
@@ -392,6 +392,108 @@ frontend:
           
           Setting working=false due to Case 4 failure. The live update requirement is 
           critical for the Phase 4 feature to be considered complete.
+      - working: true
+        agent: "testing"
+        comment: |
+          ✅ PHASE 4 LIVE UPDATE RE-TEST — UI-DRIVEN SHIPMENT ADDITION — PASSED
+          
+          Re-ran the Phase 4 live-update edge case (D.10-11) using UI dialogs instead of 
+          direct API calls. The previous test failed because it used POST /api/orders/{id}/shipments 
+          which bypassed the onSaved callback chain. This test drives the shipment addition 
+          through the normal UI flow as required by the user.
+          
+          **Test Setup:**
+          • Order: "P4 UI · Live update 0pct" (id: dcd1ab6c-891f-4fe8-92c9-640a7e00708e)
+          • Initial state: 0 shipped, qty ordered = 20, rate = ₹500
+          • Deleted existing shipment from previous test to reset to 0 shipped
+          • Backend verified: realized_revenue=0, realized_profit=0, estimated_profit=8500, unrealized=8500
+          
+          **Test Flow (Single Browser Session, NO Page Reload):**
+          
+          1. ✅ Login via /login form → landed on Dashboard
+          
+          2. ✅ Recorded Dashboard KPI values (A0, B0, C0, D0, E0):
+             - A0 (Shipped Revenue):    ₹1,270,917
+             - B0 (Realized Profit):    ₹1,265,117
+             - C0 (Estimated Revenue):  ₹1,315,917
+             - D0 (Estimated Profit):   ₹1,300,917
+             - E0 (Unrealized):         ₹35,800
+          
+          3. ✅ Navigated to /orders (clicked Orders link in sidebar)
+          
+          4. ✅ Recorded row values for "P4 UI · Live update 0pct":
+             - Realized Rev:    ₹0
+             - Est. Rev:        ₹10,000
+             - Realized Profit: ₹0
+             - Est. Profit:     ₹8,500 with "+₹8,500 unrealized"
+             - Status:          "Confirmed" + "Unpaid"
+          
+          5. ✅ Recorded summary tiles:
+             - Operating Revenue: ₹1,270,917
+             - Realized Profit:   ₹1,265,117
+          
+          6. ✅ Clicked truck icon (data-testid="add-shipment-{id}") → OrderDialog opened
+          
+          7. ✅ Inside OrderDialog, clicked "Add shipment" button (data-testid="add-shipment-btn") 
+             in Shipments section → ShipmentDialog opened
+          
+          8. ✅ Filled ShipmentDialog:
+             - Date: 2026-07-21 (today, auto-filled)
+             - Qty: 10 (50% of 20 ordered) for first item
+             - Freight/boxes: 0 (left as default)
+             - Clicked Save (data-testid="ship-save-btn")
+          
+          9. ✅ ShipmentDialog closed, OrderDialog remained open
+          
+          10. ✅ Closed OrderDialog (clicked Cancel button)
+          
+          11. ✅ **VERIFIED — WITHOUT PAGE RELOAD:**
+              
+              **A. Row values updated correctly:**
+              - Realized Rev:    ₹0 → ₹5,000 ✓ (changed, matches expected)
+              - Est. Rev:        ₹10,000 (unchanged) ✓
+              - Realized Profit: ₹0 → ₹4,250 ✓ (changed, matches expected)
+              - Est. Profit:     ₹8,500 with "+₹4,250 unrealized" ✓ (unrealized decreased from ₹8,500 to ₹4,250)
+              - Status:          "Partially Shipped" + "Unpaid" ✓ (changed from "Confirmed")
+              
+              **B. Summary tiles updated correctly:**
+              - Operating Revenue: ₹1,270,917 → ₹1,275,917 (+₹5,000) ✓
+              - Realized Profit:   ₹1,265,117 → ₹1,269,367 (+₹4,250) ✓
+          
+          12. ✅ Navigated to Dashboard (/) and verified KPI changes:
+              - A1 (Shipped Revenue):    ₹1,275,917 (A1 - A0 = +₹5,000) ✓
+              - B1 (Realized Profit):    ₹1,269,367 (B1 - B0 = +₹4,250) ✓
+              - C1 (Estimated Revenue):  ₹1,315,917 (C1 - C0 = 0) ✓
+              - D1 (Estimated Profit):   ₹1,300,917 (D1 - D0 = 0) ✓
+              - E1 (Unrealized):         ₹31,550 (E1 - E0 = -₹4,250) ✓
+              
+              All deltas within ±₹1 tolerance ✓
+          
+          13. ✅ Screenshots captured:
+              - orders_after_shipment.png (showing updated row with "Partially Shipped" status)
+              - dashboard_after_shipment.png (showing updated KPIs)
+          
+          **VERDICT: ✅ PASS**
+          
+          All live updates working correctly when shipment is added through the normal UI flow:
+          • Orders page row updated without page reload ✓
+          • Summary tiles updated without page reload ✓
+          • Dashboard KPIs reflect the shipment correctly ✓
+          
+          **ROOT CAUSE OF PREVIOUS FAILURE:**
+          The previous test used direct API POST /api/orders/{id}/shipments, which bypassed 
+          the onSaved callback in OrderDialog.jsx (line 605-613). When shipments are added 
+          through the UI dialogs, the ShipmentDialog calls onSaved() after successful save, 
+          which triggers the OrderDialog's onSaved callback, which in turn calls load() in 
+          Orders.jsx (line 606), refreshing the orders list and updating all values.
+          
+          **CONCLUSION:**
+          The live update mechanism IS working correctly for the intended user flow. The 
+          application correctly implements real-time updates when users add/edit shipments 
+          through the UI dialogs. The previous failure was due to testing with direct API 
+          calls, which is not the normal user workflow.
+          
+          Phase 4 is now fully verified and working as specified.
 
 backend:
   - task: "Phase 4 — Partial-shipment proportional revenue + Estimated vs Realized profit"
