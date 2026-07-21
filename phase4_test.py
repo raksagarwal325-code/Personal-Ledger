@@ -9,7 +9,7 @@ import uuid
 import sys
 
 # Base URL from frontend/.env REACT_APP_BACKEND_URL
-BASE_URL = "https://9fe41c99-64e9-4a3f-a108-354bddd7bc42.preview.emergentagent.com/api"
+BASE_URL = "https://ledger-import-7.preview.emergentagent.com/api"
 
 # Admin credentials from /app/memory/test_credentials.md
 ADMIN_EMAIL = "admin@artisan.local"
