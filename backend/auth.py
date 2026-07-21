@@ -106,13 +106,19 @@ def user_public(doc: dict) -> dict:
 # ─── Cookie helpers ─────────────────────────────────────────────────────────
 
 def set_auth_cookies(response, access_token: str, refresh_token: str) -> None:
+    # For HTTPS-served deployments (like the emergent preview URL), some
+    # browsers (Safari ITP, third-party contexts) may not persist non-Secure
+    # cookies. Setting COOKIE_SECURE=true in the environment flips these
+    # cookies to Secure. Defaults to False so local `http://` dev still works.
+    secure = (os.environ.get("COOKIE_SECURE") or "").lower() in ("1", "true", "yes")
+    samesite = os.environ.get("COOKIE_SAMESITE") or "lax"
     response.set_cookie(
         key="access_token", value=access_token, httponly=True,
-        secure=False, samesite="lax", max_age=ACCESS_TOKEN_MINUTES * 60, path="/",
+        secure=secure, samesite=samesite, max_age=ACCESS_TOKEN_MINUTES * 60, path="/",
     )
     response.set_cookie(
         key="refresh_token", value=refresh_token, httponly=True,
-        secure=False, samesite="lax", max_age=REFRESH_TOKEN_DAYS * 86400, path="/",
+        secure=secure, samesite=samesite, max_age=REFRESH_TOKEN_DAYS * 86400, path="/",
     )
 
 

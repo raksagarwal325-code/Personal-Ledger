@@ -119,6 +119,166 @@ user_problem_statement: |
   If those end-to-end tests pass, Admin Data Management v1 is complete.
 
 frontend:
+  - task: "Login/Bootstrap — Toaster now global so failed login shows feedback"
+    implemented: true
+    working: true
+    file: "frontend/src/App.js, frontend/src/components/Layout.jsx, frontend/src/pages/Login.jsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          User bug: "why am I unable to login". Root cause: <Toaster/>
+          from sonner was mounted inside Layout, which is only rendered
+          for authenticated users. The /login route rendered <Login/>
+          outside the Layout, so toast.error() calls on wrong-password
+          silently failed to render — the user saw no feedback at all
+          on invalid credentials.
+          
+          Fixes:
+            1) App.js: mounted <Toaster position="top-right" richColors />
+               at the app root, inside AuthProvider, above <AppRoutes/>.
+            2) Layout.jsx: removed duplicate <Toaster/> + import to avoid
+               double-mount.
+            3) Login.jsx: added an inline error banner with
+               data-testid="login-error" showing the exact backend
+               `detail` string (belt-and-suspenders for cases where
+               toasts might still be dismissed too fast).
+            4) server.py::admin_bootstrap: validates JWT_SECRET BEFORE
+               inserting the admin doc (prevents orphan admin row on
+               misconfig).
+            5) auth.py::set_auth_cookies: honours COOKIE_SECURE +
+               COOKIE_SAMESITE env vars for HTTPS deployments.
+          
+          Please verify:
+            - Wrong password → error toast + inline banner + still on
+              /login.
+            - Correct password → success toast + redirect to /.
+            - Toaster works on protected pages too (no regression).
+      - working: true
+        agent: "testing"
+        comment: |
+          ✅ LOGIN/TOAST BUG FIX VERIFICATION COMPLETE — ALL 4 SCENARIOS PASSED
+          
+          Executed comprehensive UI testing covering all requirements from the review request.
+          The login/toast bug fix is working correctly. Users now receive proper visual feedback
+          on both successful and failed login attempts.
+          
+          **SCENARIO A — LOGIN FAILURE FEEDBACK: ✅ PASSED (4/4 checks)**
+          
+          Test flow:
+          1. Navigated to /login
+          2. Verified login page elements (data-testid="login-page", "login-title")
+          3. Filled form with wrong password (admin@artisan.local / WrongPassword99)
+          4. Clicked submit and waited 2.5 seconds
+          
+          Results:
+          ✅ (a) Error toast appeared in top-right corner
+             - Toast text: "Invalid email or password."
+             - Sonner toaster element present with [data-sonner-toaster] attribute
+             - Toast visible and contains expected error message
+          
+          ✅ (b) Inline error banner present
+             - data-testid="login-error" found in DOM
+             - Banner text: "Invalid email or password."
+             - Styled with red background (#fdecec) and border (#f5c1c1)
+          
+          ✅ (c) User remained on /login page
+             - URL: https://dedde4b3-6482-48c5-9052-c73381794eda.preview.emergentagent.com/login
+             - No navigation occurred
+          
+          ✅ (d) Form fields retained values
+             - Email field: "admin@artisan.local"
+             - Password field: "WrongPassword99" (15 chars)
+             - No form reset on error
+          
+          Screenshot: login_failure_feedback.png shows both toast (top-right) and inline banner
+          
+          **SCENARIO B — LOGIN SUCCESS + PROTECTED ROUTE TOASTER: ✅ PASSED (3/3 checks)**
+          
+          Test flow:
+          1. Cleared password field and filled correct password (Admin@12345)
+          2. Clicked submit
+          3. Waited 3 seconds for navigation
+          
+          Results:
+          ✅ (a) Success toast appeared
+             - Toast text: "Signed in."
+             - Toast visible before auto-dismiss
+          
+          ✅ (b) Redirected to dashboard
+             - URL changed to: https://dedde4b3-6482-48c5-9052-c73381794eda.preview.emergentagent.com/
+             - Navigation successful
+          
+          ✅ (c) Dashboard content visible
+             - data-testid="kpi-revenue" element present
+             - Dashboard heading: "Workshop at a glance"
+             - All KPI cards rendered correctly
+          
+          Screenshot: login_success_dashboard.png shows successful dashboard load
+          
+          **SCENARIO C — TOASTER GLOBALLY MOUNTED (NO DOUBLE-MOUNT): ✅ PASSED**
+          
+          Investigation findings:
+          - Toaster count when idle (no toasts): 0
+          - Toaster count when toast is active: 1 ✓
+          - Toaster count after toast dismissed: 0
+          
+          ✅ Exactly 1 toaster element when active (no double-mount)
+          ✅ Toaster is mounted in body (globally accessible)
+          ✅ Toaster parent: SECTION element
+          ✅ Toaster works on both /login and protected routes
+          
+          **Note on toaster behavior:**
+          Sonner dynamically renders the toaster container only when there are active toasts.
+          This is NORMAL and OPTIMAL behavior - the toaster element appears when needed and
+          is removed when idle. This does NOT indicate a mounting issue. The toaster is
+          correctly mounted at the app root in App.js (line 77) and is globally accessible.
+          
+          **SCENARIO D — REGRESSION CHECK (NO CONSOLE ERRORS): ✅ PASSED**
+          
+          Test flow:
+          1. Reloaded dashboard with valid auth cookies
+          2. Monitored console and page errors
+          
+          Results:
+          ✅ No unexpected console errors
+             - Only expected 401 errors from /api/auth/me (pre-login auth check)
+             - Total console errors: 3 (all 401 from auth endpoint)
+          
+          ✅ No page errors
+             - Zero JavaScript exceptions
+             - No React errors
+          
+          **CODE VERIFICATION:**
+          
+          ✅ App.js (line 77): <Toaster position="top-right" richColors /> mounted at app root
+             inside AuthProvider, wrapping all routes including /login
+          
+          ✅ Layout.jsx: No Toaster import or component (duplicate removed)
+          
+          ✅ Login.jsx (lines 75-88): Inline error banner with data-testid="login-error"
+             displays errorMsg when present
+          
+          **ADMIN CREDENTIALS USED:**
+          - Email: admin@artisan.local
+          - Password: Admin@12345
+          - Source: /app/memory/test_credentials.md
+          
+          **CONCLUSION:**
+          The login/toast bug fix is WORKING CORRECTLY. All 4 test scenarios passed:
+          • Login failure now shows both toast and inline error banner ✓
+          • Login success shows toast and redirects to dashboard ✓
+          • Toaster is globally mounted (no double-mount, no missing-mount) ✓
+          • No console errors or regressions ✓
+          
+          The user-reported issue ("why am I unable to login") is fully resolved. Users now
+          receive clear visual feedback when entering wrong credentials, eliminating the
+          confusion that occurred when the toaster was only mounted inside the Layout component.
+
+
   - task: "Phase 4 — Dashboard + Orders UI for Estimated vs Realized profit"
     implemented: true
     working: true
@@ -990,27 +1150,77 @@ backend:
 metadata:
   created_by: "main_agent"
   version: "1.0"
-  test_sequence: 1
-  run_ui: false
+  test_sequence: 2
+  run_ui: true
 
 test_plan:
-  current_focus:
-    - "Phase 5 — /api/reconcile invariant engine + Admin UI"
+  current_focus: []
   stuck_tasks: []
   test_all: false
-  test_priority: "high_first"
+  test_priority: "stuck_first"
 
 agent_communication:
   - agent: "main"
     message: |
-      GitHub repo raksagarwal325-code/Personal-Ledger imported into /app.
-      Missing .env files were re-created (backend MONGO_URL=mongodb://localhost:27017,
-      DB_NAME=personal_ledger, JWT_SECRET set; frontend REACT_APP_BACKEND_URL set).
-      Missing python dep et_xmlfile installed and added to requirements.txt.
-      Admin bootstrapped (admin@artisan.local / Admin@12345).
-      ALLOW_ADMIN_DATA_RESET flipped to true. Please run the Admin Data
-      Management v1 end-to-end verification exactly as described in
-      user_problem_statement, using the admin credentials above.
+      BUG REPORT (user, Jul 2026): "Why am I unable to login in admin".
+      
+      ROOT CAUSE IDENTIFIED:
+      The <Toaster /> component from `sonner` was mounted INSIDE
+      `components/Layout.jsx`. But the `/login` route (defined in App.js)
+      renders <Login /> OUTSIDE the Layout wrapper. So when a user typed
+      the wrong password (or credentials had a typo), the backend correctly
+      returned 401 → the Login page called `toast.error("Invalid email or
+      password.")` → but with NO Toaster mounted in the DOM, the toast was
+      never displayed. User saw zero visual feedback → thought "the button
+      does nothing" / "I cannot log in".
+      
+      FIXES APPLIED (frontend):
+        - /app/frontend/src/App.js: Toaster is now mounted at the app
+          root (inside AuthProvider, wraps all routes including /login).
+        - /app/frontend/src/components/Layout.jsx: removed the duplicate
+          Toaster + its import.
+        - /app/frontend/src/pages/Login.jsx: added an INLINE error banner
+          (data-testid="login-error") as belt-and-suspenders — it will
+          show the exact backend detail string even if the toast fails to
+          render for any reason.
+      
+      FIXES APPLIED (backend, hardening):
+        - /app/backend/server.py::admin_bootstrap now validates
+          JWT_SECRET BEFORE inserting the admin row — prevents the
+          previously-possible orphan admin (user was created but the
+          request errored on token creation, leaving no way to sign in).
+        - /app/backend/auth.py::set_auth_cookies now honours
+          COOKIE_SECURE and COOKIE_SAMESITE env vars for HTTPS
+          deployments (Safari ITP / third-party cookie safety).
+      
+      CURRENT ADMIN: admin@artisan.local / Admin@12345 (see
+      /app/memory/test_credentials.md).
+      
+      Testing agent — please FIRST verify the login BUG FIX at the URL
+      level (frontend UI):
+        1. GET /login and confirm data-testid="login-page" renders.
+        2. Enter valid credentials (admin@artisan.local / Admin@12345),
+           click data-testid="login-submit" → expect redirect to "/"
+           dashboard AND a success toast ("Signed in.") is visible.
+        3. Go back to /login (after signing out), enter WRONG password
+           (e.g. "bogus1234"), click submit → expect:
+              a) An error toast in the top-right (from the newly-mounted
+                 Toaster) containing "Invalid email or password."
+              b) An inline error banner with
+                 data-testid="login-error" containing the same string.
+              c) User remains on /login (no navigation).
+        4. Verify the Toaster is now globally reachable (also renders on
+           the dashboard after login).
+      
+      Backend-only checks (deep_testing_backend_v2):
+        - POST /api/auth/login with wrong password → 401 + JSON body
+          {"detail":"Invalid email or password."}.
+        - POST /api/auth/login with correct password → 200 + cookies
+          access_token / refresh_token set.
+        - GET /api/auth/me with those cookies → 200 with the admin
+          user object.
+        - POST /api/admin/bootstrap → 400 "An admin already exists".
+        - No regression on /api/dashboard, /api/reconcile, /api/orders.
 
       Key backend endpoints to exercise:
         POST   /api/auth/login                         (email/password)
@@ -1334,3 +1544,63 @@ agent_communication:
       working, auth gating working, and idempotency verified.
       
       RECOMMENDATION: Main agent can summarize and finish.
+
+  - agent: "testing"
+    message: |
+      ✅ LOGIN/TOAST BUG FIX VERIFICATION COMPLETE — ALL 4 SCENARIOS PASSED
+      
+      Executed comprehensive UI testing for the login/toast bug fix as specified in the 
+      review request. The fix is working correctly and users now receive proper visual 
+      feedback on both successful and failed login attempts.
+      
+      **Test Results Summary:**
+      • Scenario A (Login failure feedback): ✅ PASSED (4/4 checks)
+      • Scenario B (Login success + protected route toaster): ✅ PASSED (3/3 checks)
+      • Scenario C (Toaster globally mounted, no double-mount): ✅ PASSED
+      • Scenario D (No console errors on reload): ✅ PASSED
+      
+      **Detailed Findings:**
+      
+      **Scenario A — Login Failure Feedback:**
+      ✅ Error toast appeared in top-right with text "Invalid email or password."
+      ✅ Inline error banner (data-testid="login-error") displayed same message
+      ✅ User remained on /login page (no navigation)
+      ✅ Form fields retained values (email: admin@artisan.local, password: WrongPassword99)
+      ✅ Screenshot captured showing both toast and inline banner
+      
+      **Scenario B — Login Success:**
+      ✅ Success toast "Signed in." appeared
+      ✅ Redirected to dashboard (/)
+      ✅ Dashboard content loaded (KPI cards, "Workshop at a glance" heading)
+      ✅ Screenshot captured showing successful dashboard load
+      
+      **Scenario C — Toaster Mounting:**
+      ✅ Exactly 1 toaster element when toast is active (no double-mount)
+      ✅ Toaster is mounted in body (globally accessible)
+      ✅ Toaster works on both /login and protected routes
+      
+      **Note on toaster behavior:**
+      Sonner dynamically renders the toaster container only when there are active toasts.
+      When idle (no toasts), the toaster count is 0. When a toast is shown, count is 1.
+      After toast dismisses, count returns to 0. This is NORMAL and OPTIMAL behavior for
+      sonner - it only renders when needed. The toaster is correctly mounted at app root
+      in App.js (line 77) inside AuthProvider.
+      
+      **Scenario D — Regression Check:**
+      ✅ No unexpected console errors on dashboard reload
+      ✅ Only expected 401 errors from /api/auth/me (pre-login auth check)
+      ✅ Zero page errors or JavaScript exceptions
+      
+      **Code Verification:**
+      ✅ App.js (line 77): <Toaster position="top-right" richColors /> at app root
+      ✅ Layout.jsx: Duplicate Toaster removed (no import, no component)
+      ✅ Login.jsx (lines 75-88): Inline error banner with data-testid="login-error"
+      
+      **Conclusion:**
+      The user-reported bug ("why am I unable to login") is FULLY RESOLVED. The toaster
+      is now globally mounted and provides feedback on both the login page and protected
+      routes. Users receive clear visual feedback (both toast and inline banner) when
+      entering wrong credentials, eliminating the confusion that occurred when the toaster
+      was only mounted inside the Layout component.
+      
+      All 4 test scenarios passed. No issues found. The fix is production-ready.

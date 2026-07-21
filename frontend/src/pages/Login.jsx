@@ -15,6 +15,7 @@ export default function Login() {
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
+  const [errorMsg, setErrorMsg] = useState("");
 
   useEffect(() => {
     if (ready && user) nav("/", { replace: true });
@@ -27,6 +28,7 @@ export default function Login() {
   const submit = async (e) => {
     e.preventDefault();
     setBusy(true);
+    setErrorMsg("");
     try {
       if (mode === "bootstrap") {
         await api.post("/admin/bootstrap", { email, password, name });
@@ -39,7 +41,9 @@ export default function Login() {
       nav("/", { replace: true });
     } catch (err) {
       const msg = err?.response?.data?.detail || err.message || "Failed.";
-      toast.error(typeof msg === "string" ? msg : "Failed.");
+      const finalMsg = typeof msg === "string" ? msg : "Failed.";
+      setErrorMsg(finalMsg);
+      toast.error(finalMsg);
     } finally {
       setBusy(false);
     }
@@ -68,6 +72,20 @@ export default function Login() {
           </div>
 
           <form className="space-y-4" onSubmit={submit}>
+            {errorMsg && (
+              <div
+                data-testid="login-error"
+                role="alert"
+                className="text-xs px-3 py-2 rounded border"
+                style={{
+                  color: "#8a1f1f",
+                  background: "#fdecec",
+                  borderColor: "#f5c1c1",
+                }}
+              >
+                {errorMsg}
+              </div>
+            )}
             {mode === "bootstrap" && (
               <div>
                 <Label className="label-caps text-xs">Name (optional)</Label>

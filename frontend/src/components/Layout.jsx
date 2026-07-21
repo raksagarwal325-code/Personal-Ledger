@@ -1,6 +1,5 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { LayoutDashboard, ClipboardList, Wallet, FileDown, BookUser, Banknote, Landmark, ShoppingBag, Truck, HandCoins, FileText, ArrowLeftRight, ShieldAlert, LogOut } from "lucide-react";
-import { Toaster } from "sonner";
 import InstallPrompt from "./InstallPrompt";
 import { useAuth } from "../lib/auth";
 
@@ -148,7 +147,6 @@ export default function Layout() {
           </div>
         </main>
       </div>
-      <Toaster position="top-right" richColors />
     </div>
   );
 }

@@ -2709,6 +2709,10 @@ async def admin_bootstrap(payload: BootstrapIn, response: Response):
         raise HTTPException(400, "Valid email required.")
     if not payload.password or len(payload.password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters.")
+    # Validate JWT_SECRET FIRST — otherwise we'd create an orphan admin
+    # row that the client can never receive a token for.
+    from auth import get_jwt_secret
+    get_jwt_secret()
     doc = new_user_doc(payload.email, payload.password, payload.name or "", role="admin")
     await db.users.insert_one(doc)
     access = create_access_token(doc["id"], doc["email"], doc["role"])
