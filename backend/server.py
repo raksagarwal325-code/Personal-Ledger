@@ -246,6 +246,55 @@ class Payment(PaymentBase):
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+# ─── Cash Book (P0 canonical layer) ─────────────────────────────────────────
+# Cash Book is a UNIFIED TIMELINE view of every money movement, sourced from
+# canonical modules. It NEVER creates customer or vendor payments — those must
+# originate from their natural module (Sales Payments / Purchase Payments).
+# The `cash_book_entries` collection stores only the transactions that legitimately
+# originate from the Cash Book itself: general income, general expense, and
+# inter-account transfers.
+#
+# `source` values:
+#   - "cash_book"       — created by user via new Cash Book UI (canonical)
+#   - "legacy_shim"     — created via deprecated POST /api/payments; excluded
+#                          from all financial KPIs.
+#   - "legacy_migrated" — auto-stamped on pre-existing db.payments rows for the
+#                          Migration surface in Cash Book timeline (read-only,
+#                          excluded from KPIs).
+
+CashBookKind = Literal["general_income", "general_expense", "transfer"]
+
+
+class CashBookEntryBase(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    date: Optional[str] = None
+    kind: CashBookKind = "general_expense"
+    amount: float = 0
+    mode: str = "Cash"
+
+    # For general_income / general_expense
+    account_id: Optional[str] = ""
+    account_name: Optional[str] = ""
+    party_name: Optional[str] = ""   # optional counterparty label (e.g. "Airtel")
+
+    # For transfers
+    from_account_id: Optional[str] = ""
+    from_account_name: Optional[str] = ""
+    to_account_id: Optional[str] = ""
+    to_account_name: Optional[str] = ""
+
+    reference: Optional[str] = ""
+    notes: Optional[str] = ""
+
+
+class CashBookEntry(CashBookEntryBase):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    source: str = "cash_book"    # "cash_book" | "legacy_shim" | "legacy_migrated"
+    reversed: bool = False
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
 class Customer(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str
@@ -774,11 +823,54 @@ async def delete_order(oid: str):
 # ================================================================
 # PAYMENTS (unchanged from before)
 # ================================================================
-@api_router.post("/payments", response_model=Payment)
+# ================================================================
+# LEGACY /payments endpoints — DEPRECATED SHIM
+# ================================================================
+# These endpoints once wrote directly to `db.payments` (the pre-refactor Cash
+# Book). Cash Book is now a READ-ONLY unified timeline; genuine income /
+# expense / transfer must flow through POST /api/cash-book-entries.
+#
+# For strict back-compat with any external caller still hitting these routes,
+# we accept the write, coerce the shape into a CashBookEntry stamped
+# source='legacy_shim', and return the classic Payment payload. Shim rows are
+# EXCLUDED from every canonical KPI so a stale integration cannot double-count.
+
+def _legacy_payment_to_cbe(p: dict) -> dict:
+    received = float((p.get("received_by_me") or 0) + (p.get("received_by_fac") or 0))
+    paid = float((p.get("payment_by_me") or 0) + (p.get("payment_by_fac") or 0))
+    if received >= paid:
+        kind = "general_income"
+        amount = received - paid
+    else:
+        kind = "general_expense"
+        amount = paid - received
+    return CashBookEntry(
+        date=p.get("date"),
+        kind=kind if amount > 0 else "general_expense",
+        amount=amount,
+        mode=p.get("mode") or "Cash",
+        party_name=p.get("party") or "",
+        notes=p.get("note") or "",
+        source="legacy_shim",
+    ).model_dump()
+
+
+@api_router.post("/payments", response_model=Payment, deprecated=True)
 async def create_payment(payload: PaymentBase):
-    p = Payment(**payload.model_dump())
-    await db.payments.insert_one(p.model_dump())
-    return p
+    """DEPRECATED: use POST /api/cash-book-entries. Kept for API back-compat only.
+
+    Rows created here are stamped `source='legacy_shim'` and NEVER counted in
+    dashboard KPIs / exports."""
+    p = Payment(**payload.model_dump()).model_dump()
+    # Store in legacy collection (unchanged) so GET /payments continues to work.
+    await db.payments.insert_one({**p, "source": "legacy_shim"})
+    # Also mirror to cash_book_entries as a legacy_shim entry for the unified
+    # timeline (still excluded from KPIs).
+    cbe = _legacy_payment_to_cbe(p)
+    cbe["notes"] = (cbe.get("notes") or "") + f" [shim of legacy payment {p['id'][:8]}]"
+    cbe["reference"] = f"legacy:{p['id']}"
+    await db.cash_book_entries.insert_one(cbe)
+    return Payment(**p)
 
 
 @api_router.get("/payments", response_model=List[Payment])
@@ -788,6 +880,8 @@ async def list_payments(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ):
+    """Read-only legacy view. Returns pre-existing db.payments rows (stamped
+    `source='legacy_migrated'`) plus any shim rows. Excluded from KPIs."""
     q: dict = {}
     if party:
         q["party"] = {"$regex": party, "$options": "i"}
@@ -801,24 +895,30 @@ async def list_payments(
             d["$lte"] = end_date
         q["date"] = d
     docs = await db.payments.find(q, {"_id": 0}).sort("date", 1).to_list(5000)
-    return [Payment(**d) for d in docs]
+    return [Payment(**{k: v for k, v in d.items() if k in Payment.model_fields})
+            for d in docs]
 
 
-@api_router.put("/payments/{pid}", response_model=Payment)
+@api_router.put("/payments/{pid}", response_model=Payment, deprecated=True)
 async def update_payment(pid: str, payload: PaymentBase):
+    """DEPRECATED: legacy Cash Book rows can no longer be created; they can
+    only be edited in place. Prefer editing the origin document."""
     existing = await db.payments.find_one({"id": pid}, {"_id": 0})
     if not existing:
         raise HTTPException(404, "Payment not found")
     await db.payments.update_one({"id": pid}, {"$set": payload.model_dump()})
     updated = await db.payments.find_one({"id": pid}, {"_id": 0})
-    return Payment(**updated)
+    return Payment(**{k: v for k, v in updated.items() if k in Payment.model_fields})
 
 
-@api_router.delete("/payments/{pid}")
+@api_router.delete("/payments/{pid}", deprecated=True)
 async def delete_payment(pid: str):
+    """DEPRECATED. Legacy row removal — no side effects on canonical modules."""
     res = await db.payments.delete_one({"id": pid})
     if res.deleted_count == 0:
         raise HTTPException(404, "Payment not found")
+    # Also purge any shim mirror
+    await db.cash_book_entries.delete_many({"reference": f"legacy:{pid}"})
     return {"deleted": True}
 
 
@@ -1056,7 +1156,6 @@ async def list_customers():
 @api_router.get("/dashboard")
 async def dashboard():
     orders = await db.orders.find({}, {"_id": 0}).to_list(10000)
-    pays = await db.payments.find({}, {"_id": 0}).to_list(10000)
 
     operating_revenue = sum(o.get("operating_revenue") or 0 for o in orders)
     invoice_value = sum(o.get("invoice_total") or 0 for o in orders)
@@ -1065,18 +1164,29 @@ async def dashboard():
     gst_collected = sum(o.get("tax_amount") or 0 for o in orders)
     margin = (net_profit / operating_revenue * 100.0) if operating_revenue else 0
 
-    received = sum((p.get("received_by_me") or 0) + (p.get("received_by_fac") or 0) for p in pays)
-    paid = sum((p.get("payment_by_me") or 0) + (p.get("payment_by_fac") or 0) for p in pays)
+    # ─── P0: KPIs `received` / `paid` / `modes` come from CANONICAL sources.
+    # Legacy db.payments is intentionally NOT read here — those rows are
+    # stamped source='legacy_migrated' and surfaced only in the Cash Book
+    # timeline as read-only "Migration" entries.
+    cust_pays = await db.customer_payments.find({}, {"_id": 0}).to_list(20000)
+    purchase_pays = await db.purchase_payments.find({}, {"_id": 0}).to_list(20000)
+    cb_entries = await db.cash_book_entries.find(
+        {"source": {"$ne": "legacy_shim"}, "reversed": {"$ne": True}}, {"_id": 0}
+    ).to_list(20000)
+
+    received = sum(float(p.get("amount") or 0) for p in cust_pays)
+    received += sum(float(e.get("amount") or 0) for e in cb_entries
+                    if e.get("kind") == "general_income")
+    paid = sum(float(p.get("amount") or 0) for p in purchase_pays)
+    paid += sum(float(e.get("amount") or 0) for e in cb_entries
+                if e.get("kind") == "general_expense")
 
     # Outstanding by payment_status on orders (simple proxy)
     outstanding_receivable = sum(
         (o.get("invoice_total") or 0) for o in orders
         if o.get("payment_status") in ("Unpaid", "Partial")
     )
-    # Payables here = negative net across payments (money we owe suppliers). Simple:
-    outstanding_payable = max(0.0, paid - received) if False else 0
-    # More useful: total payments made TO factory (payment_by_me + payment_by_fac) as running expense.
-    outstanding_payable = paid  # we owe = we paid out (kept simple)
+    outstanding_payable = paid  # kept simple — historical shape
 
     # Boxes and freight
     boxes_used = sum(o.get("boxes_used") or 0 for o in orders)
@@ -1086,12 +1196,10 @@ async def dashboard():
     packing_cost = sum(o.get("packing_cost") or 0 for o in orders)
 
     # Customer advances (unallocated portion of customer payments)
-    cust_pays = await db.customer_payments.find({}, {"_id": 0}).to_list(20000)
     customer_advances = sum(float(p.get("unallocated") or 0) for p in cust_pays)
 
     # Purchase KPIs (vendor bills & payments)
     purchases = await db.purchases.find({}, {"_id": 0}).to_list(20000)
-    purchase_pays = await db.purchase_payments.find({}, {"_id": 0}).to_list(20000)
     purchase_value = sum(float(p.get("invoice_total") or 0) for p in purchases)
     purchase_paid = sum(float(p.get("amount") or 0) for p in purchase_pays)
     purchase_outstanding = sum(
@@ -1179,12 +1287,20 @@ async def dashboard():
         key=lambda x: -x["sales"],
     )[:10]
 
-    # Payments by mode
+    # Payments by mode — sourced from canonical modules only (transfers excluded)
     mode_map = defaultdict(lambda: {"received": 0, "paid": 0})
-    for p in pays:
+    for p in cust_pays:
         m = p.get("mode") or "Other"
-        mode_map[m]["received"] += (p.get("received_by_me") or 0) + (p.get("received_by_fac") or 0)
-        mode_map[m]["paid"] += (p.get("payment_by_me") or 0) + (p.get("payment_by_fac") or 0)
+        mode_map[m]["received"] += float(p.get("amount") or 0)
+    for p in purchase_pays:
+        m = p.get("mode") or "Other"
+        mode_map[m]["paid"] += float(p.get("amount") or 0)
+    for e in cb_entries:
+        m = e.get("mode") or "Other"
+        if e.get("kind") == "general_income":
+            mode_map[m]["received"] += float(e.get("amount") or 0)
+        elif e.get("kind") == "general_expense":
+            mode_map[m]["paid"] += float(e.get("amount") or 0)
     mode_series = [{"mode": k, **v} for k, v in mode_map.items()]
 
     return {
@@ -1226,7 +1342,6 @@ async def dashboard():
 @api_router.get("/dashboard/breakdown")
 async def dashboard_breakdown():
     orders = await db.orders.find({}, {"_id": 0}).to_list(10000)
-    pays = await db.payments.find({}, {"_id": 0}).to_list(10000)
 
     # ---- Revenue ----
     product_sales_total = sum(o.get("product_sales_total") or 0 for o in orders)
@@ -1418,22 +1533,47 @@ async def dashboard_breakdown():
     }
 
     # ---- Payable (money paid out — grouped by party / mode) ----
+    # P0: sourced from canonical modules (customer_payments, purchase_payments,
+    # cash_book_entries) — never from legacy db.payments.
+    cust_pays = await db.customer_payments.find({}, {"_id": 0}).to_list(20000)
+    purchase_pays = await db.purchase_payments.find({}, {"_id": 0}).to_list(20000)
+    cb_entries = await db.cash_book_entries.find(
+        {"source": {"$ne": "legacy_shim"}, "reversed": {"$ne": True}}, {"_id": 0}
+    ).to_list(20000)
+
     payable_by_party = defaultdict(lambda: {"paid": 0, "received": 0, "net": 0})
     payable_by_mode = defaultdict(lambda: {"paid": 0, "received": 0})
-    total_paid = 0
-    total_received = 0
-    for p in pays:
-        r = (p.get("received_by_me") or 0) + (p.get("received_by_fac") or 0)
-        pd = (p.get("payment_by_me") or 0) + (p.get("payment_by_fac") or 0)
+    total_paid = 0.0
+    total_received = 0.0
+
+    def _bump(party: str, mode: str, r: float, pd: float):
+        nonlocal total_paid, total_received
         total_paid += pd
         total_received += r
-        party = p.get("party") or "Unknown"
+        party = party or "Unknown"
         payable_by_party[party]["paid"] += pd
         payable_by_party[party]["received"] += r
-        payable_by_party[party]["net"] = payable_by_party[party]["received"] - payable_by_party[party]["paid"]
-        mode = p.get("mode") or "Other"
-        payable_by_mode[mode]["paid"] += pd
-        payable_by_mode[mode]["received"] += r
+        payable_by_party[party]["net"] = (payable_by_party[party]["received"]
+                                          - payable_by_party[party]["paid"])
+        m = mode or "Other"
+        payable_by_mode[m]["paid"] += pd
+        payable_by_mode[m]["received"] += r
+
+    for p in cust_pays:
+        amt = float(p.get("amount") or 0)
+        _bump(p.get("customer_name") or "Customer", p.get("mode") or "", amt, 0.0)
+    for p in purchase_pays:
+        amt = float(p.get("amount") or 0)
+        _bump(p.get("vendor_name") or "Vendor", p.get("mode") or "", 0.0, amt)
+    for e in cb_entries:
+        amt = float(e.get("amount") or 0)
+        party = e.get("party_name") or ("Transfer" if e.get("kind") == "transfer" else "Cash Book")
+        mode = e.get("mode") or ""
+        if e.get("kind") == "general_income":
+            _bump(party, mode, amt, 0.0)
+        elif e.get("kind") == "general_expense":
+            _bump(party, mode, 0.0, amt)
+        # transfers are profit-neutral — excluded from payable roll-ups
 
     payable = {
         "total_paid": total_paid,
@@ -1517,7 +1657,6 @@ PAYMENT_STATUSES = ["Unpaid", "Partial", "Paid"]
 @api_router.get("/meta")
 async def meta():
     orders = await db.orders.find({}, {"_id": 0}).to_list(10000)
-    pays = await db.payments.find({}, {"_id": 0}).to_list(10000)
 
     main_cats = set(DEFAULT_MAIN_CATEGORIES)
     sub_by_main = defaultdict(set)
@@ -1541,8 +1680,24 @@ async def meta():
                     if pn:
                         products_by_sub[f"{mc}/{sc}"].add(pn)
 
-    parties = sorted({p.get("party") for p in pays if p.get("party")})
-    modes = sorted(set(DEFAULT_MODES) | {p.get("mode") for p in pays if p.get("mode")})
+    # Parties / modes list — derived from canonical sources plus legacy for continuity
+    cust_names = await db.customer_payments.distinct("customer_name")
+    vend_names_from_pp = await db.purchase_payments.distinct("vendor_name")
+    cb_parties = await db.cash_book_entries.distinct("party_name")
+    legacy_parties = await db.payments.distinct("party")
+    parties = sorted({p for p in
+                      (list(cust_names) + list(vend_names_from_pp)
+                       + list(cb_parties) + list(legacy_parties))
+                      if p})
+
+    cust_modes = await db.customer_payments.distinct("mode")
+    purch_modes = await db.purchase_payments.distinct("mode")
+    cb_modes = await db.cash_book_entries.distinct("mode")
+    legacy_modes = await db.payments.distinct("mode")
+    modes = sorted(set(DEFAULT_MODES) | {m for m in
+                                          (list(cust_modes) + list(purch_modes)
+                                           + list(cb_modes) + list(legacy_modes))
+                                          if m})
 
     accounts = await db.accounts.find({"archived": {"$ne": True}}, {"_id": 0}).sort("name", 1).to_list(500)
 
@@ -1778,48 +1933,157 @@ async def export_orders_csv():
     return _csv_response(rows, fields, "orders.csv")
 
 
+async def _build_cashbook_export_rows() -> List[dict]:
+    """Union of Cash Book timeline sources — used by CSV/XLSX exports.
+    Adds a `source_module` column so audits can trace every rupee back to
+    its originating module.
+    """
+    cust_pays = await db.customer_payments.find({}, {"_id": 0}).to_list(20000)
+    purchase_pays = await db.purchase_payments.find({}, {"_id": 0}).to_list(20000)
+    cb_entries = await db.cash_book_entries.find({}, {"_id": 0}).to_list(20000)
+    legacy = await db.payments.find({}, {"_id": 0}).to_list(20000)
+
+    rows: List[dict] = []
+    for p in cust_pays:
+        rows.append({
+            "date": p.get("date"),
+            "source_module": "Sales Payment",
+            "kind": "customer_payment",
+            "party": p.get("customer_name") or "",
+            "mode": p.get("mode") or "",
+            "account_name": p.get("account_name") or "",
+            "received": float(p.get("amount") or 0),
+            "paid": 0.0,
+            "reference": p.get("reference") or "",
+            "note": p.get("remarks") or "",
+            "source_id": p.get("id"),
+        })
+    for p in purchase_pays:
+        rows.append({
+            "date": p.get("date"),
+            "source_module": "Purchase Payment",
+            "kind": "vendor_payment",
+            "party": p.get("vendor_name") or "",
+            "mode": p.get("mode") or "",
+            "account_name": p.get("account_name") or "",
+            "received": 0.0,
+            "paid": float(p.get("amount") or 0),
+            "reference": p.get("reference") or "",
+            "note": p.get("remarks") or "",
+            "source_id": p.get("id"),
+        })
+    for e in cb_entries:
+        kind = e.get("kind") or ""
+        received = float(e.get("amount") or 0) if kind == "general_income" else 0.0
+        paid = float(e.get("amount") or 0) if kind == "general_expense" else 0.0
+        if kind == "transfer":
+            # emit two rows so both ledgers can be traced (net-zero on P&L)
+            rows.append({
+                "date": e.get("date"),
+                "source_module": "Transfer",
+                "kind": "transfer_out",
+                "party": e.get("to_account_name") or "",
+                "mode": e.get("mode") or "",
+                "account_name": e.get("from_account_name") or "",
+                "received": 0.0,
+                "paid": float(e.get("amount") or 0),
+                "reference": e.get("reference") or "",
+                "note": e.get("notes") or "",
+                "source_id": e.get("id"),
+            })
+            rows.append({
+                "date": e.get("date"),
+                "source_module": "Transfer",
+                "kind": "transfer_in",
+                "party": e.get("from_account_name") or "",
+                "mode": e.get("mode") or "",
+                "account_name": e.get("to_account_name") or "",
+                "received": float(e.get("amount") or 0),
+                "paid": 0.0,
+                "reference": e.get("reference") or "",
+                "note": e.get("notes") or "",
+                "source_id": e.get("id"),
+            })
+            continue
+        source = "Cash Book" if e.get("source") in (None, "cash_book") else "Cash Book (Legacy Shim)"
+        rows.append({
+            "date": e.get("date"),
+            "source_module": source,
+            "kind": kind or "general",
+            "party": e.get("party_name") or "",
+            "mode": e.get("mode") or "",
+            "account_name": e.get("account_name") or "",
+            "received": received,
+            "paid": paid,
+            "reference": e.get("reference") or "",
+            "note": e.get("notes") or "",
+            "source_id": e.get("id"),
+        })
+    for d in legacy:
+        received = float((d.get("received_by_me") or 0) + (d.get("received_by_fac") or 0))
+        paid = float((d.get("payment_by_me") or 0) + (d.get("payment_by_fac") or 0))
+        rows.append({
+            "date": d.get("date"),
+            "source_module": "Migration",
+            "kind": "legacy",
+            "party": d.get("party") or "",
+            "mode": d.get("mode") or "",
+            "account_name": "",
+            "received": received,
+            "paid": paid,
+            "reference": "",
+            "note": d.get("note") or "",
+            "source_id": d.get("id"),
+        })
+    rows.sort(key=lambda r: (r.get("date") or ""))
+    return rows
+
+
 @api_router.get("/export/payments.csv")
 async def export_payments_csv():
-    docs = await db.payments.find({}, {"_id": 0}).sort("date", 1).to_list(10000)
-    fields = ["date", "party", "mode", "received_by_me", "received_by_fac",
-              "payment_by_me", "payment_by_fac", "note"]
-    return _csv_response(docs, fields, "payments.csv")
+    rows = await _build_cashbook_export_rows()
+    fields = ["date", "source_module", "kind", "party", "mode", "account_name",
+              "received", "paid", "reference", "note", "source_id"]
+    return _csv_response(rows, fields, "cash-book.csv")
 
 
 @api_router.get("/export/payments.xlsx")
 async def export_payments_xlsx():
-    docs = await db.payments.find({}, {"_id": 0}).sort("date", 1).to_list(10000)
+    rows = await _build_cashbook_export_rows()
 
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Payments"
+    ws.title = "Cash Book"
 
-    headers = ["Date", "Party", "Mode", "Received by Me", "Received by Factory",
-               "Payment by Me", "Payment by Factory", "Net", "Note"]
+    headers = ["Date", "Source Module", "Kind", "Party", "Mode", "Account",
+               "Received", "Paid", "Net", "Reference", "Note", "Source ID"]
     ws.append(headers)
     _style_header(ws, len(headers))
 
-    for d in docs:
-        received = (d.get("received_by_me") or 0) + (d.get("received_by_fac") or 0)
-        paid = (d.get("payment_by_me") or 0) + (d.get("payment_by_fac") or 0)
+    for r in rows:
+        received = float(r.get("received") or 0)
+        paid = float(r.get("paid") or 0)
         ws.append([
-            _parse_date(d.get("date")),
-            d.get("party"),
-            d.get("mode"),
-            d.get("received_by_me") or 0,
-            d.get("received_by_fac") or 0,
-            d.get("payment_by_me") or 0,
-            d.get("payment_by_fac") or 0,
+            _parse_date(r.get("date")),
+            r.get("source_module") or "",
+            r.get("kind") or "",
+            r.get("party") or "",
+            r.get("mode") or "",
+            r.get("account_name") or "",
+            received,
+            paid,
             received - paid,
-            d.get("note") or "",
+            r.get("reference") or "",
+            r.get("note") or "",
+            r.get("source_id") or "",
         ])
 
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
         row[0].number_format = DATE_FMT
-        for i in range(4, 9):
+        for i in (7, 8, 9):
             row[i - 1].number_format = INR_FMT
     _autofit(ws)
-    return _xlsx_response(wb, "payments.xlsx")
+    return _xlsx_response(wb, "cash-book.xlsx")
 
 
 # ================================================================
@@ -2222,7 +2486,7 @@ async def seed(force: bool = False, confirm_wipe: Optional[str] = None):
     for r in data.get("cash_flow", []):
         if not r.get("party") and not r.get("date"):
             continue
-        pay_docs.append(Payment(
+        p = Payment(
             date=r.get("date"),
             received_by_me=float(r.get("received_by_me") or 0),
             received_by_fac=float(r.get("received_by_fac") or 0),
@@ -2230,7 +2494,12 @@ async def seed(force: bool = False, confirm_wipe: Optional[str] = None):
             payment_by_fac=float(r.get("payment_by_fac") or 0),
             party=r.get("party") or "Unknown",
             mode=r.get("mode") or "Cash",
-        ).model_dump())
+        ).model_dump()
+        # P0: seeded legacy rows are stamped so the Cash Book timeline can
+        # surface them as read-only "Migration" entries without counting them
+        # in dashboard KPIs.
+        p["source"] = "legacy_migrated"
+        pay_docs.append(p)
     if pay_docs:
         await db.payments.insert_many(pay_docs)
 
@@ -2242,6 +2511,444 @@ async def seed(force: bool = False, confirm_wipe: Optional[str] = None):
 @api_router.get("/")
 async def root():
     return {"message": "Artisan Ledger API — order-based"}
+
+
+# ================================================================
+# CASH BOOK — canonical write path for general income/expense/transfer
+# and unified timeline read view.
+# ================================================================
+
+def _validate_cbe(cbe: dict) -> None:
+    kind = cbe.get("kind")
+    amt = float(cbe.get("amount") or 0)
+    if amt <= 0:
+        raise HTTPException(400, "Amount must be greater than zero.")
+    if kind == "transfer":
+        f = (cbe.get("from_account_id") or cbe.get("from_account_name") or "").strip()
+        t = (cbe.get("to_account_id") or cbe.get("to_account_name") or "").strip()
+        if not f or not t:
+            raise HTTPException(400, "Transfer requires both from- and to-accounts.")
+        if f == t and cbe.get("from_account_name", "") == cbe.get("to_account_name", ""):
+            raise HTTPException(400, "Transfer source and destination must differ.")
+    elif kind in ("general_income", "general_expense"):
+        # party_name is optional; account is not strictly required but recommended.
+        pass
+    else:
+        raise HTTPException(400, f"Unsupported Cash Book kind: {kind!r}")
+
+
+@api_router.post("/cash-book-entries", response_model=CashBookEntry)
+async def create_cash_book_entry(payload: CashBookEntryBase):
+    cbe = CashBookEntry(**payload.model_dump()).model_dump()
+    cbe["source"] = "cash_book"
+    _validate_cbe(cbe)
+    await db.cash_book_entries.insert_one(cbe)
+    return CashBookEntry(**cbe)
+
+
+@api_router.get("/cash-book-entries", response_model=List[CashBookEntry])
+async def list_cash_book_entries(
+    kind: Optional[str] = None,
+    include_shim: bool = False,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    q: dict = {}
+    if not include_shim:
+        q["source"] = {"$ne": "legacy_shim"}
+    if kind and kind != "all":
+        q["kind"] = kind
+    if start_date or end_date:
+        d: dict = {}
+        if start_date:
+            d["$gte"] = start_date
+        if end_date:
+            d["$lte"] = end_date
+        q["date"] = d
+    docs = await db.cash_book_entries.find(q, {"_id": 0}).sort("date", -1).to_list(5000)
+    return [CashBookEntry(**d) for d in docs]
+
+
+@api_router.get("/cash-book-entries/{eid}", response_model=CashBookEntry)
+async def get_cash_book_entry(eid: str):
+    d = await db.cash_book_entries.find_one({"id": eid}, {"_id": 0})
+    if not d:
+        raise HTTPException(404, "Cash Book entry not found")
+    return CashBookEntry(**d)
+
+
+@api_router.put("/cash-book-entries/{eid}", response_model=CashBookEntry)
+async def update_cash_book_entry(eid: str, payload: CashBookEntryBase):
+    existing = await db.cash_book_entries.find_one({"id": eid}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Cash Book entry not found")
+    if existing.get("source") == "legacy_shim":
+        raise HTTPException(400, "Legacy shim rows cannot be edited via Cash Book.")
+    cbe = {**existing, **payload.model_dump()}
+    cbe["source"] = existing.get("source") or "cash_book"
+    cbe["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _validate_cbe(cbe)
+    await db.cash_book_entries.update_one({"id": eid}, {"$set": cbe})
+    return CashBookEntry(**cbe)
+
+
+@api_router.delete("/cash-book-entries/{eid}")
+async def delete_cash_book_entry(eid: str):
+    existing = await db.cash_book_entries.find_one({"id": eid}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Cash Book entry not found")
+    if existing.get("source") == "legacy_shim":
+        raise HTTPException(400, "Legacy shim rows cannot be deleted via Cash Book.")
+    await db.cash_book_entries.delete_one({"id": eid})
+    return {"deleted": True}
+
+
+# ─── Unified timeline (Cash Book UI feed) ──────────────────────────────────
+# Every money-move in the ERP, projected into a common shape so the Cash Book
+# page can render it as a chronological feed with source-linked navigation.
+
+def _cb_row_from_customer_payment(p: dict) -> dict:
+    amt = float(p.get("amount") or 0)
+    return {
+        "event_id": p.get("id"),
+        "date": p.get("date"),
+        "kind": "customer_payment",
+        "source_module": "Sales Payments",
+        "source_route": "/sales-payments",
+        "title": "Customer Payment",
+        "party": p.get("customer_name") or "",
+        "mode": p.get("mode") or "",
+        "account_name": p.get("account_name") or "",
+        "received": amt,
+        "paid": 0.0,
+        "amount": amt,
+        "direction": "in",
+        "reference": p.get("reference") or "",
+        "notes": p.get("remarks") or "",
+        "source_document": {
+            "collection": "customer_payments",
+            "id": p.get("id"),
+            "route": "/sales-payments",
+            "linked_order_ids": [a.get("order_id") for a in (p.get("allocations") or [])
+                                 if a.get("order_id")],
+        },
+        "editable": True,
+    }
+
+
+def _cb_row_from_purchase_payment(p: dict) -> dict:
+    amt = float(p.get("amount") or 0)
+    return {
+        "event_id": p.get("id"),
+        "date": p.get("date"),
+        "kind": "vendor_payment",
+        "source_module": "Purchase Payments",
+        "source_route": "/purchase-payments",
+        "title": "Vendor Payment",
+        "party": p.get("vendor_name") or "",
+        "mode": p.get("mode") or "",
+        "account_name": p.get("account_name") or "",
+        "received": 0.0,
+        "paid": amt,
+        "amount": amt,
+        "direction": "out",
+        "reference": p.get("reference") or "",
+        "notes": p.get("remarks") or "",
+        "source_document": {
+            "collection": "purchase_payments",
+            "id": p.get("id"),
+            "route": "/purchase-payments",
+            "linked_purchase_ids": [a.get("purchase_id") for a in (p.get("allocations") or [])
+                                    if a.get("purchase_id")],
+        },
+        "editable": True,
+    }
+
+
+def _cb_row_from_cbe(e: dict) -> dict:
+    amt = float(e.get("amount") or 0)
+    kind = e.get("kind") or "general_expense"
+    source_map = {
+        "cash_book": "Cash Book",
+        "legacy_shim": "Cash Book (Legacy Shim)",
+        "legacy_migrated": "Migration",
+    }
+    source_module = source_map.get(e.get("source") or "cash_book", "Cash Book")
+    title_map = {
+        "general_income": "General Income",
+        "general_expense": "General Expense",
+        "transfer": "Transfer",
+    }
+    if kind == "transfer":
+        received = amt
+        paid = amt
+        direction = "transfer"
+    elif kind == "general_income":
+        received = amt
+        paid = 0.0
+        direction = "in"
+    else:
+        received = 0.0
+        paid = amt
+        direction = "out"
+    return {
+        "event_id": e.get("id"),
+        "date": e.get("date"),
+        "kind": kind,
+        "source_module": source_module,
+        "source_route": "/payments",
+        "title": title_map.get(kind, "Cash Book"),
+        "party": e.get("party_name") or "",
+        "mode": e.get("mode") or "",
+        "account_name": e.get("account_name") or "",
+        "from_account_name": e.get("from_account_name") or "",
+        "to_account_name": e.get("to_account_name") or "",
+        "received": received,
+        "paid": paid,
+        "amount": amt,
+        "direction": direction,
+        "reference": e.get("reference") or "",
+        "notes": e.get("notes") or "",
+        "source_document": {
+            "collection": "cash_book_entries",
+            "id": e.get("id"),
+            "route": "/payments",
+        },
+        "editable": e.get("source") == "cash_book",
+    }
+
+
+def _cb_row_from_legacy(p: dict) -> dict:
+    received = float((p.get("received_by_me") or 0) + (p.get("received_by_fac") or 0))
+    paid = float((p.get("payment_by_me") or 0) + (p.get("payment_by_fac") or 0))
+    return {
+        "event_id": p.get("id"),
+        "date": p.get("date"),
+        "kind": "legacy",
+        "source_module": "Migration",
+        "source_route": "/payments",
+        "title": "Legacy Cash Book",
+        "party": p.get("party") or "",
+        "mode": p.get("mode") or "",
+        "account_name": "",
+        "received": received,
+        "paid": paid,
+        "amount": received if received >= paid else paid,
+        "direction": "in" if received > paid else ("out" if paid > 0 else "flat"),
+        "reference": "",
+        "notes": p.get("note") or "",
+        "source_document": {
+            "collection": "payments",
+            "id": p.get("id"),
+            "route": "/payments",
+        },
+        "editable": False,
+    }
+
+
+@api_router.get("/cash-book")
+async def cash_book_timeline(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    source_module: Optional[str] = None,
+    kind: Optional[str] = None,
+    party: Optional[str] = None,
+    include_shim: bool = False,
+    include_migration: bool = True,
+    limit: int = 500,
+):
+    """Unified Cash Book timeline — one chronological feed sourced from every
+    canonical financial module. Rows are read-only projections; edits must be
+    performed on the origin document (see `source_document`).
+    """
+    cust = await db.customer_payments.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
+    purch = await db.purchase_payments.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
+    cbe_q: dict = {}
+    if not include_shim:
+        cbe_q["source"] = {"$ne": "legacy_shim"}
+    cbe = await db.cash_book_entries.find(cbe_q, {"_id": 0}).sort("date", -1).to_list(5000)
+    legacy = []
+    if include_migration:
+        legacy = await db.payments.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
+
+    rows = ([_cb_row_from_customer_payment(p) for p in cust]
+            + [_cb_row_from_purchase_payment(p) for p in purch]
+            + [_cb_row_from_cbe(e) for e in cbe]
+            + [_cb_row_from_legacy(p) for p in legacy])
+
+    def _pass(r: dict) -> bool:
+        if start_date and (r.get("date") or "") < start_date:
+            return False
+        if end_date and (r.get("date") or "") > end_date:
+            return False
+        if source_module and (r.get("source_module") or "") != source_module:
+            return False
+        if kind and (r.get("kind") or "") != kind:
+            return False
+        if party and party.lower() not in (r.get("party") or "").lower():
+            return False
+        return True
+
+    rows = [r for r in rows if _pass(r)]
+    rows.sort(key=lambda r: (r.get("date") or ""), reverse=True)
+
+    total_received = sum(float(r.get("received") or 0) for r in rows
+                         if r.get("kind") in ("customer_payment", "general_income"))
+    total_paid = sum(float(r.get("paid") or 0) for r in rows
+                     if r.get("kind") in ("vendor_payment", "general_expense"))
+
+    return {
+        "count": len(rows),
+        "total_received": round(total_received, 2),
+        "total_paid": round(total_paid, 2),
+        "net": round(total_received - total_paid, 2),
+        "rows": rows[:limit],
+    }
+
+
+# ─── Business Events (unified ERP activity feed) ────────────────────────────
+
+@api_router.get("/business-events")
+async def business_events(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    event_type: Optional[str] = None,
+    source_module: Optional[str] = None,
+    limit: int = 500,
+):
+    """Firehose of every domain event across the ERP — Orders, Shipments,
+    Purchases, Sales/Purchase Payments, Cash Book. Consumed by dashboards,
+    activity feeds, notifications, audit trails. Every row conforms to a
+    common Business Event envelope."""
+    events: List[dict] = []
+
+    async for o in db.orders.find({}, {"_id": 0}):
+        events.append({
+            "event_id": f"order_created:{o.get('id')}",
+            "event_type": "order_created",
+            "source_module": "Orders",
+            "source_document": {"collection": "orders", "id": o.get("id"),
+                                "route": f"/orders"},
+            "date": o.get("order_date") or (o.get("created_at") or "")[:10],
+            "created_at": o.get("created_at"),
+            "updated_at": o.get("updated_at"),
+            "party": o.get("client_name") or "",
+            "amount": float(o.get("invoice_total") or 0),
+            "title": "Order Created",
+            "notes": o.get("notes") or "",
+            "reversed": False,
+            "created_by": "user",
+        })
+        for i, sh in enumerate(sorted((o.get("shipments") or []),
+                                      key=lambda s: s.get("date") or "")):
+            qty = sum(float((si or {}).get("qty") or 0) for si in (sh.get("items") or []))
+            events.append({
+                "event_id": f"shipment:{sh.get('id')}",
+                "event_type": "shipment",
+                "source_module": "Orders",
+                "source_document": {"collection": "orders", "id": o.get("id"),
+                                    "shipment_id": sh.get("id"), "route": "/orders"},
+                "date": sh.get("date"),
+                "created_at": sh.get("date"),
+                "updated_at": sh.get("date"),
+                "party": o.get("client_name") or "",
+                "amount": float(sh.get("freight_paid") or 0),
+                "title": f"Shipment {i + 1}",
+                "notes": f"{qty:.0f} pcs · {sh.get('transporter') or ''}",
+                "reversed": False,
+                "created_by": "user",
+            })
+
+    async for p in db.customer_payments.find({}, {"_id": 0}):
+        events.append({
+            "event_id": f"customer_payment:{p.get('id')}",
+            "event_type": "customer_payment",
+            "source_module": "Sales Payments",
+            "source_document": {"collection": "customer_payments", "id": p.get("id"),
+                                "route": "/sales-payments"},
+            "date": p.get("date"),
+            "created_at": p.get("created_at"),
+            "updated_at": p.get("created_at"),
+            "party": p.get("customer_name") or "",
+            "amount": float(p.get("amount") or 0),
+            "title": "Customer Payment",
+            "notes": p.get("remarks") or "",
+            "reversed": False,
+            "created_by": "user",
+        })
+
+    async for p in db.purchase_payments.find({}, {"_id": 0}):
+        events.append({
+            "event_id": f"vendor_payment:{p.get('id')}",
+            "event_type": "vendor_payment",
+            "source_module": "Purchase Payments",
+            "source_document": {"collection": "purchase_payments", "id": p.get("id"),
+                                "route": "/purchase-payments"},
+            "date": p.get("date"),
+            "created_at": p.get("created_at"),
+            "updated_at": p.get("created_at"),
+            "party": p.get("vendor_name") or "",
+            "amount": float(p.get("amount") or 0),
+            "title": "Vendor Payment",
+            "notes": p.get("remarks") or "",
+            "reversed": False,
+            "created_by": "user",
+        })
+
+    async for pu in db.purchases.find({}, {"_id": 0}):
+        events.append({
+            "event_id": f"purchase_created:{pu.get('id')}",
+            "event_type": "purchase_created",
+            "source_module": "Purchases",
+            "source_document": {"collection": "purchases", "id": pu.get("id"),
+                                "route": "/purchases"},
+            "date": pu.get("purchase_date"),
+            "created_at": pu.get("created_at"),
+            "updated_at": pu.get("updated_at"),
+            "party": pu.get("vendor_name") or "",
+            "amount": float(pu.get("invoice_total") or 0),
+            "title": "Purchase Created",
+            "notes": pu.get("notes") or "",
+            "reversed": False,
+            "created_by": "user",
+        })
+
+    async for e in db.cash_book_entries.find({"source": {"$ne": "legacy_shim"}}, {"_id": 0}):
+        et = e.get("kind") or "general_expense"
+        title_map = {"general_income": "General Income",
+                     "general_expense": "General Expense",
+                     "transfer": "Transfer"}
+        events.append({
+            "event_id": f"{et}:{e.get('id')}",
+            "event_type": et,
+            "source_module": "Cash Book",
+            "source_document": {"collection": "cash_book_entries", "id": e.get("id"),
+                                "route": "/payments"},
+            "date": e.get("date"),
+            "created_at": e.get("created_at"),
+            "updated_at": e.get("updated_at"),
+            "party": e.get("party_name") or "",
+            "amount": float(e.get("amount") or 0),
+            "title": title_map.get(et, "Cash Book"),
+            "notes": e.get("notes") or "",
+            "reversed": bool(e.get("reversed")),
+            "created_by": "user",
+        })
+
+    def _pass(ev):
+        if start_date and (ev.get("date") or "") < start_date:
+            return False
+        if end_date and (ev.get("date") or "") > end_date:
+            return False
+        if event_type and ev.get("event_type") != event_type:
+            return False
+        if source_module and ev.get("source_module") != source_module:
+            return False
+        return True
+
+    events = [e for e in events if _pass(e)]
+    events.sort(key=lambda e: (e.get("date") or "", e.get("created_at") or ""), reverse=True)
+    return {"count": len(events), "events": events[:limit]}
 
 
 app.add_middleware(
@@ -3251,6 +3958,21 @@ async def _startup():
         logger.info(f"Party Ledger v2 bootstrap OK — {n_parties} parties active.")
     except Exception as e:
         logger.error(f"Party Ledger v2 bootstrap failed: {e}")
+
+    # P0: stamp every pre-existing db.payments row with source='legacy_migrated'
+    # so it can be surfaced in the Cash Book timeline as read-only, without
+    # ever entering canonical KPI computations. Idempotent.
+    try:
+        res = await db.payments.update_many(
+            {"source": {"$exists": False}},
+            {"$set": {"source": "legacy_migrated"}},
+        )
+        if res.modified_count:
+            logger.info(
+                f"P0: stamped {res.modified_count} legacy Cash Book rows as legacy_migrated."
+            )
+    except Exception as e:
+        logger.error(f"P0 legacy stamp failed: {e}")
 
 
 @app.on_event("shutdown")
