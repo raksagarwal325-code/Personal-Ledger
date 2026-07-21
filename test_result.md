@@ -768,6 +768,108 @@ backend:
         agent: "main"
         comment: "Slice 1 landed 2026-07-21. Additive only. 65/65 domain tests pass. See task ‘Slice 2’ below for continuation."
 
+  - task: "Phase 6 · Slice 4 — Payment + purchase allocation aggregates → domain layer"
+    implemented: true
+    working: true
+    file: "backend/server.py, backend/domain.py, backend/tests/test_p6_slice4_allocations.py, backend/tests/test_p6_domain.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: |
+          Slice 4 of Phase 6 landed 2026-07-21 per approved spec.
+          
+          Functions migrated to the shared domain layer:
+            * server.compute_purchase — now a THIN ADAPTER over
+              purchase_realized_amounts. Item-mutation
+              (stamping `it["amount"]=qty*rate` when missing) stays in
+              server.py (order-lifecycle bookkeeping).
+            * server._recompute_payment_aggregates_for_orders — now
+              routes allocation sums through sum_allocations_to_order.
+              Idempotent, paise-safe. Fetches only the customer_payments
+              that reference the target orders (single round-trip).
+            * server._recompute_purchase_payment_aggregates — routes
+              through sum_allocations_to_purchase +
+              purchase_outstanding_from_alloc.
+            * server.customer_outstanding_orders — paise-safe reads;
+              display outstanding still CLAMPED to zero (never negative
+              in the allocation UI).
+            * server.vendor_outstanding_purchases — paise-safe reads.
+          
+          Domain change (still additive-style):
+            * purchase_realized_amounts rewritten to match the REAL
+              Purchase model: uses `freight` + `other_charges` (not
+              `packing_total`/`freight_total`); includes tax handling
+              (auto HALF_UP or manual). Prior Slice-1 field names
+              (`material_total_paise`) removed — only used by a
+              non-value-checking mutation test, updated accordingly.
+          
+          Behaviour differences REPORTED to reviewer + preserved (not
+          silently changed):
+            * Customer orders: `outstanding_balance` remains UNCLAMPED
+              (can be negative on over-payment). Matches pre-refactor
+              exactly.
+            * Purchases: `outstanding_balance` is CLAMPED to zero on
+              over-payment (via purchase_outstanding_from_alloc). Also
+              matches pre-refactor exactly. This asymmetry between
+              customer and purchase over-payment handling is EXPLICITLY
+              preserved and pinned by
+              test_purchase_over_payment_CLAMPS_outstanding_to_zero
+              (purchase side) and
+              test_over_payment_stores_negative_outstanding
+              (customer side).
+            * 50-paise (₹0.50) close-enough-to-Paid hysteresis
+              preserved on both sides — pinned by
+              test_paid_within_50_paise_hysteresis.
+          
+          CI-guard baselines DECREMENTED by exact removal count
+          (grep-verified):
+            * float_amount_get:      53 → 50 (−3)
+              [removed: 1× float((it.get("amount")) fallback in
+              compute_purchase; 1× float(purchase.get("tax_amount"))
+              for manual tax; 1× float(alloc.get("amount")) in
+              purchase allocation sum]
+            * round_calls:           66 → 63 (−3)
+              [removed: 1× round(base*tax_percent/100, 2) purchase
+              auto-tax; 1× round(total_paid, 2); 1× round(outstanding, 2)]
+            * reversed_ne_true:       1 → 1  (unchanged)
+            * source_ne_legacy_shim:  3 → 3  (unchanged)
+          
+          Regression net (27 new tests, all pass in 1.00s):
+            * TestComputePurchase (8) — no tax / freight+other / tax
+              auto / tax manual / tax_applicable=false / empty purchase
+              / missing optional values / item-amount stored precedence.
+            * TestComputePurchaseIdempotency (3 param) — 3× re-runs
+              zero drift.
+            * TestComputePurchaseNonMutating (1) — only documented
+              fields mutated.
+            * TestOrderPaymentAggregates (7) — real Mongo flow: zero
+              payments, partial, full, 50-paise hysteresis, over-payment
+              (unclamped), multi-order allocation, 3× idempotency.
+            * TestPurchasePaymentAggregates (4) — real Mongo flow with
+              PURCHASE-SIDE clamping preserved.
+            * TestOutstandingEndpoints (3) — customer/vendor list
+              endpoints paise-safe.
+            * TestReconcileHealthyAfterSlice4 (1) — live /api/reconcile
+              still 21/21 healthy.
+          
+          Full-suite verification:
+            * test_p4_partial_shipment_revenue.py: 6/6 (unchanged).
+            * test_p5_reconcile.py:                20/20 (unchanged).
+            * test_p6_domain.py:                   65/65 (Slice-1 fixture
+              updated to real Purchase model; CI baselines refreshed).
+            * test_p6_slice2_dashboard.py:         13/13 (unchanged).
+            * test_p6_slice3_order_aggregates.py:  33/33 (unchanged).
+            * test_p6_slice4_allocations.py:       27/27 NEW.
+            * Grand total: 164/164 pass in 2.28s.
+            * Live GET /api/reconcile: healthy=true, engine=P5, 21/21.
+            * Live GET /api/dashboard: KPIs byte-identical.
+          
+          Awaiting reviewer sign-off before Slice 5 (Party Ledger v2
+          derived rows + _status_from_balance → domain helpers).
+
   - task: "Phase 6 · Slice 3 — compute_order_aggregates → thin adapter over domain helpers"
     implemented: true
     working: true

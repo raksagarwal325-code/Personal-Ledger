@@ -428,28 +428,51 @@ def order_outstanding_from_alloc(order: dict, alloc_sum_paise: int) -> int:
 
 # ─── Purchase-level helpers ────────────────────────────────────────────────
 
-def purchase_realized_amounts(purchase: dict) -> dict:
-    """Realized monetary totals for a purchase (vendor bill).
-    All PAISE. Non-mutating.
+def _purchase_item_amount_paise(it: dict) -> int:
+    """Item amount: stored `amount` when non-zero, else qty*rate. Paise.
+    Matches server.compute_purchase fallback behaviour exactly."""
+    stored = it.get("amount")
+    if stored not in (None, "", 0):
+        return to_paise(stored)
+    q = Decimal(str(it.get("qty") or 0))
+    r = Decimal(str(it.get("rate") or 0))
+    return to_paise(q * r)
 
-    Keys:
-      * material_total_paise, packing_total_paise, freight_total_paise
-      * invoice_total_paise (= sum of the three above)
+
+def purchase_realized_amounts(purchase: dict) -> dict:
+    """Realized monetary totals for a purchase (vendor bill). PAISE. Pure.
+
+    Business rules — mirrors server.compute_purchase pre-Phase-6:
+      * subtotal_paise    = Σ item amounts (stored, else qty*rate)
+      * freight_paise     = purchase.freight (top-level, not per-shipment)
+      * other_charges_paise = purchase.other_charges
+      * tax_amount_paise  = auto (base*tax_percent/100, paise HALF_UP)
+                            OR manual (purchase.tax_amount)
+                            OR 0 when tax_applicable is falsy
+      * invoice_total_paise = subtotal + freight + other + tax
     """
     items = purchase.get("items") or []
-    material_p = sum(
-        int((Decimal(to_paise(it.get("rate"))) * Decimal(str(it.get("qty") or 0)))
-            .quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-        for it in items
-    )
-    packing_p = to_paise(purchase.get("packing_total"))
-    freight_p = to_paise(purchase.get("freight_total"))
-    invoice_p = material_p + packing_p + freight_p
+    subtotal_p = sum(_purchase_item_amount_paise(it) for it in items)
+    freight_p = to_paise(purchase.get("freight"))
+    other_p = to_paise(purchase.get("other_charges"))
+    base_p = subtotal_p + freight_p + other_p
+
+    if purchase.get("tax_applicable"):
+        if purchase.get("tax_amount_manual"):
+            tax_p = to_paise(purchase.get("tax_amount"))
+        else:
+            tax_percent = Decimal(str(purchase.get("tax_percent") or 0))
+            tax_p = int((Decimal(base_p) * tax_percent / Decimal(100))
+                        .quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    else:
+        tax_p = 0
+
     return {
-        "material_total_paise": material_p,
-        "packing_total_paise": packing_p,
-        "freight_total_paise": freight_p,
-        "invoice_total_paise": invoice_p,
+        "subtotal_paise": subtotal_p,
+        "freight_paise": freight_p,
+        "other_charges_paise": other_p,
+        "tax_amount_paise": tax_p,
+        "invoice_total_paise": base_p + tax_p,
     }
 
 

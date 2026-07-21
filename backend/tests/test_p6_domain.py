@@ -155,7 +155,7 @@ def synth_cb_entries():
 def synth_purchases():
     return [
         {"id": "pu1", "invoice_total": 4000,
-         "items": [{"qty": 4, "rate": 900}], "packing_total": 200, "freight_total": 200},
+         "items": [{"qty": 4, "rate": 900}], "other_charges": 200, "freight": 200},
     ]
 
 
@@ -626,9 +626,14 @@ class TestOrderInsensitive:
 #                       53 / 66 / 1 / 3  — removed 3 float(x.get(*amount*))
 #                       (other_revenue sum, other_expense sum, manual tax) and
 #                       1 round() (tax computation now paise HALF_UP in domain).
+#   Slice 4 (payment + purchase allocation aggregates → domain):
+#                       50 / 63 / 1 / 3  — removed 3 float(x.get(*amount*))
+#                       (item amount fallback, manual tax on purchase, alloc
+#                       amount sum) and 3 round() (auto tax on purchase,
+#                       total_paid, outstanding).
 CI_GUARD_BASELINE = {
-    "float_amount_get":        53,
-    "round_calls":             66,
+    "float_amount_get":        50,
+    "round_calls":             63,
     "reversed_ne_true":         1,
     "source_ne_legacy_shim":    3,
 }

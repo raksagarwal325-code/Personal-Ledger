@@ -25,8 +25,11 @@ from domain import (
     is_customer_payment_active, is_purchase_payment_active,
     is_cash_book_entry_canonical,
     sum_received_kpi, sum_paid_kpi, sum_mode_totals,
+    sum_allocations_to_order, sum_allocations_to_purchase,
     compute_party_metrics,
     order_realized_amounts, order_estimated_amounts, order_unrealized,
+    order_outstanding_from_alloc,
+    purchase_realized_amounts, purchase_outstanding_from_alloc,
     _order_shipped_qty_by_item,
 )
 
@@ -522,28 +525,42 @@ def compute_order_aggregates(order: dict) -> dict:
 
 async def _recompute_payment_aggregates_for_orders(order_ids: List[str]):
     """Recompute total_received and outstanding_balance for a set of orders,
-    using the CustomerPayment.allocations table as source of truth."""
+    using the CustomerPayment.allocations table as source of truth.
+
+    Phase 6 · Slice 4: allocation sums and outstanding derivation are now
+    routed through the shared domain helpers `sum_allocations_to_order`
+    and `order_outstanding_from_alloc`. All money math is paise-safe.
+    Idempotent — safe to re-run any number of times.
+    """
     if not order_ids:
         return
-    # Sum allocations per order
-    pipeline = [
-        {"$match": {"allocations.order_id": {"$in": order_ids}}},
-        {"$unwind": "$allocations"},
-        {"$match": {"allocations.order_id": {"$in": order_ids}}},
-        {"$group": {"_id": "$allocations.order_id", "total": {"$sum": "$allocations.amount"}}},
-    ]
-    totals = {r["_id"]: r["total"] async for r in db.customer_payments.aggregate(pipeline)}
+    # Fetch every customer payment that references any of these orders — a
+    # single round trip, then let the pure domain helper sum allocations
+    # per order. Excludes voided/reversed payments via is_customer_payment_active.
+    pays = await db.customer_payments.find(
+        {"allocations.order_id": {"$in": order_ids}}, {"_id": 0}
+    ).to_list(50000)
     for oid in order_ids:
-        total_recv = float(totals.get(oid, 0))
         doc = await db.orders.find_one({"id": oid}, {"_id": 0})
         if not doc:
             continue
-        invoice = float(doc.get("invoice_total") or 0)
-        outstanding = invoice - total_recv
-        # Payment status: only auto if there ARE payments; else preserve user-set
+        alloc_p = sum_allocations_to_order(pays, oid)
+        invoice_p = to_paise(doc.get("invoice_total"))
+        # Pre-refactor rule: `outstanding = invoice - total_received` — could
+        # go negative on over-payment. We preserve THAT exact behaviour
+        # here (the domain's `order_outstanding_from_alloc` clamps to zero,
+        # which is only appropriate for the allocation-UI endpoint, not
+        # for the stored aggregate).
+        outstanding_p = invoice_p - alloc_p
+        total_recv = from_paise(alloc_p)
+        outstanding = from_paise(outstanding_p)
+        # Payment status: only auto if there ARE payments; else preserve user-set.
+        # 50-paise (₹0.50) hysteresis matches the pre-refactor rule
+        # ("close-enough-to-invoice → Paid"); this is an ORDER-lifecycle
+        # rule kept alongside the write, not a domain calculation.
         pstatus = doc.get("payment_status") or "Unpaid"
-        if total_recv > 0:
-            pstatus = "Paid" if total_recv + 0.5 >= invoice else "Partial"
+        if alloc_p > 0:
+            pstatus = "Paid" if alloc_p + 50 >= invoice_p else "Partial"
         elif not doc.get("_had_legacy_payment_status"):
             pstatus = "Unpaid"
         await db.orders.update_one({"id": oid}, {"$set": {
@@ -1203,18 +1220,25 @@ async def order_timeline(oid: str):
 @api_router.get("/customers/{name}/outstanding-orders")
 async def customer_outstanding_orders(name: str):
     """Return this customer's orders with an outstanding balance, oldest first — used
-    to allocate a new payment across invoices."""
+    to allocate a new payment across invoices.
+
+    Phase 6 · Slice 4: money math paise-safe. Behaviour preserved — the
+    display outstanding is CLAMPED to zero (over-payments show as 0 in
+    the allocation UI), while the stored `outstanding_balance` may be
+    negative for over-paid orders.
+    """
     orders = await db.orders.find({"client_name": name}, {"_id": 0}).to_list(5000)
     rows = []
     for o in orders:
-        outstanding = float(o.get("outstanding_balance") or 0)
-        if outstanding > 0.5 or (o.get("payment_status") in ("Unpaid", "Partial")):
+        outstanding_p = to_paise(o.get("outstanding_balance"))
+        # 50-paise hysteresis (matches pre-refactor `> 0.5`).
+        if outstanding_p > 50 or (o.get("payment_status") in ("Unpaid", "Partial")):
             rows.append({
                 "id": o.get("id"),
                 "date": o.get("last_shipped_date") or o.get("shipped_date") or o.get("order_date"),
-                "invoice_total": float(o.get("invoice_total") or 0),
-                "total_received": float(o.get("total_received") or 0),
-                "outstanding": max(0.0, outstanding),
+                "invoice_total": from_paise(to_paise(o.get("invoice_total"))),
+                "total_received": from_paise(to_paise(o.get("total_received"))),
+                "outstanding": from_paise(max(0, outstanding_p)),
                 "status": o.get("status"),
                 "payment_status": o.get("payment_status"),
                 "short_id": (o.get("id") or "")[:8],
@@ -3986,34 +4010,31 @@ class PurchasePayment(PurchasePaymentBase):
 
 
 def compute_purchase(purchase: dict) -> dict:
-    items = purchase.get("items") or []
-    subtotal = 0
-    for it in items:
-        amt = float(it.get("amount") or 0)
-        if amt == 0:
-            amt = float(it.get("qty") or 0) * float(it.get("rate") or 0)
-            it["amount"] = amt
-        subtotal += amt
-    freight = float(purchase.get("freight") or 0)
-    other = float(purchase.get("other_charges") or 0)
-    base = subtotal + freight + other
+    """Recompute stored aggregates on a purchase (vendor bill).
 
-    if purchase.get("tax_applicable"):
-        if purchase.get("tax_amount_manual"):
-            tax = float(purchase.get("tax_amount") or 0)
-        else:
-            tax = round(base * float(purchase.get("tax_percent") or 0) / 100.0, 2)
-    else:
-        tax = 0
-    purchase["subtotal"] = subtotal
-    purchase["tax_amount"] = tax
-    purchase["invoice_total"] = base + tax
+    Phase 6 · Slice 4: this function is now a THIN ADAPTER over the
+    pure domain helper `purchase_realized_amounts`. The item-mutation
+    (stamping `it["amount"] = qty*rate` when amount was missing) stays
+    here — it's a document-write concern, not pure calculation.
+    """
+    items = purchase.get("items") or []
+    for it in items:
+        if not it.get("amount"):
+            it["amount"] = float(it.get("qty") or 0) * float(it.get("rate") or 0)
+    real = purchase_realized_amounts(purchase)
+    purchase["subtotal"] = from_paise(real["subtotal_paise"])
+    purchase["tax_amount"] = from_paise(real["tax_amount_paise"])
+    purchase["invoice_total"] = from_paise(real["invoice_total_paise"])
     purchase["items"] = items
     return purchase
 
 
 async def _recompute_purchase_payment_aggregates(purchase_ids: List[str] = None):
-    """Recompute total_paid, outstanding_balance and payment_status for given purchases."""
+    """Recompute total_paid, outstanding_balance and payment_status for given purchases.
+
+    Phase 6 · Slice 4: allocation sums and outstanding derivation routed
+    through `sum_allocations_to_purchase`. Paise-safe, idempotent.
+    """
     q = {"id": {"$in": purchase_ids}} if purchase_ids else {}
     purchases = await db.purchases.find(q, {"_id": 0}).to_list(20000)
     for p in purchases:
@@ -4021,24 +4042,24 @@ async def _recompute_purchase_payment_aggregates(purchase_ids: List[str] = None)
         pays = await db.purchase_payments.find(
             {"allocations.purchase_id": pid}, {"_id": 0}
         ).to_list(10000)
-        total_paid = 0
-        for pay in pays:
-            for alloc in pay.get("allocations") or []:
-                if alloc.get("purchase_id") == pid:
-                    total_paid += float(alloc.get("amount") or 0)
-        invoice = float(p.get("invoice_total") or 0)
-        outstanding = max(0.0, invoice - total_paid)
-        if total_paid <= 0.5:
+        alloc_p = sum_allocations_to_purchase(pays, pid)
+        invoice_p = to_paise(p.get("invoice_total"))
+        # Pre-refactor rule: PURCHASE outstanding is CLAMPED to zero on
+        # over-payment (unlike customer orders, which store the negative).
+        # Preserve that exact asymmetry — matches `purchase_outstanding_from_alloc`.
+        outstanding_p = purchase_outstanding_from_alloc(p, alloc_p)
+        # 50-paise (₹0.50) hysteresis matches the pre-refactor rule.
+        if alloc_p <= 50:
             status = "Unpaid"
-        elif total_paid + 0.5 >= invoice:
+        elif alloc_p + 50 >= invoice_p:
             status = "Paid"
         else:
             status = "Partial"
         await db.purchases.update_one(
             {"id": pid},
             {"$set": {
-                "total_paid": round(total_paid, 2),
-                "outstanding_balance": round(outstanding, 2),
+                "total_paid": from_paise(alloc_p),
+                "outstanding_balance": from_paise(outstanding_p),
                 "payment_status": status,
             }},
         )
@@ -4221,7 +4242,11 @@ async def delete_purchase(pid: str):
 
 @api_router.get("/vendors/{name}/outstanding-purchases")
 async def vendor_outstanding_purchases(name: str):
-    """Return purchases for vendor that are Unpaid/Partial (for allocation UI)."""
+    """Return purchases for vendor that are Unpaid/Partial (for allocation UI).
+
+    Phase 6 · Slice 4: monetary reads routed through to_paise/from_paise
+    for paise-safe rounding at the response boundary.
+    """
     docs = await db.purchases.find(
         {"vendor_name": name, "payment_status": {"$in": ["Unpaid", "Partial"]}},
         {"_id": 0},
@@ -4230,9 +4255,9 @@ async def vendor_outstanding_purchases(name: str):
         "id": d["id"],
         "invoice_no": d.get("invoice_no") or "—",
         "purchase_date": d.get("purchase_date"),
-        "invoice_total": float(d.get("invoice_total") or 0),
-        "total_paid": float(d.get("total_paid") or 0),
-        "outstanding_balance": float(d.get("outstanding_balance") or 0),
+        "invoice_total": from_paise(to_paise(d.get("invoice_total"))),
+        "total_paid": from_paise(to_paise(d.get("total_paid"))),
+        "outstanding_balance": from_paise(to_paise(d.get("outstanding_balance"))),
     } for d in docs]
 
 
