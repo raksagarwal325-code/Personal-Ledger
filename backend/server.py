@@ -152,6 +152,8 @@ class CustomerPayment(CustomerPaymentBase):
     # computed
     allocated_total: float = 0
     unallocated: float = 0  # advance
+    # Phase 2: stable party id (source-of-truth identity)
+    customer_party_id: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -197,6 +199,8 @@ class OrderBase(BaseModel):
 
 class Order(OrderBase):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    # Phase 2: stable party id (source-of-truth identity)
+    customer_party_id: Optional[str] = None
     # ORDERED aggregates (potential — informational)
     ordered_qty_total: float = 0
     ordered_product_sales: float = 0
@@ -732,6 +736,10 @@ async def create_order(payload: OrderBase):
     order = Order(**data).model_dump()
     compute_order_aggregates(order)
     order["updated_at"] = datetime.now(timezone.utc).isoformat()
+    # Phase 2: stamp stable customer party id onto the order.
+    party = await get_or_create_customer_party(db, data.get("client_name") or "")
+    if party:
+        order["customer_party_id"] = party["id"]
     await db.orders.insert_one(order)
     # Ensure customer exists
     if data.get("client_name"):
@@ -798,6 +806,13 @@ async def update_order(oid: str, payload: OrderBase):
                                   "errors": validation_errors})
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     compute_order_aggregates(data)
+    # Phase 2: preserve customer_party_id when the client name matches or
+    # resolves to the same party; changing to a different customer only
+    # updates the id when the caller has explicitly reassigned via a fresh
+    # client_name (party resolver picks the correct existing/new id).
+    party = await get_or_create_customer_party(db, data.get("client_name") or "")
+    if party:
+        data["customer_party_id"] = party["id"]
     await db.orders.update_one({"id": oid}, {"$set": data})
     updated = await db.orders.find_one({"id": oid}, {"_id": 0})
     await _sync_order_linked_purchases(updated)
@@ -2514,6 +2529,51 @@ async def root():
 
 
 # ================================================================
+# PHASE 2 — Party identity admin endpoints
+# ================================================================
+@api_router.get("/party-migration/last-report")
+async def get_last_party_migration_report():
+    doc = await db.admin_migration_reports.find_one(
+        {"phase": "P1_party_identity"}, {"_id": 0}, sort=[("created_at", -1)]
+    )
+    if not doc:
+        return {"status": "no_report"}
+    return doc
+
+
+@api_router.post("/party-migration/run")
+async def run_party_migration_now():
+    """Idempotent — re-run the canonical party migration. Safe to call
+    any time after Phase 2 shipped."""
+    report = await run_party_migration(db)
+    doc = {
+        "id": str(uuid.uuid4()),
+        "phase": "P1_party_identity",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        **report,
+    }
+    await db.admin_migration_reports.insert_one(doc)
+    return {k: v for k, v in doc.items() if k != "_id"}
+
+
+class PartyRenameIn(BaseModel):
+    display_name: str
+
+
+@api_router.post("/parties/{pid}/rename")
+async def party_rename(pid: str, payload: PartyRenameIn):
+    """Rename a party in place — preserves the party_id, pushes the old
+    normalized name onto `aliases`. This is a RENAME, not a reassignment;
+    historical transactions continue to resolve through the same party_id."""
+    if pid == SYSTEM_FF_ID:
+        raise HTTPException(400, "System Father's Firm party cannot be renamed.")
+    p = await rename_party(db, pid, payload.display_name)
+    if not p:
+        raise HTTPException(404, "Party not found")
+    return p
+
+
+# ================================================================
 # CASH BOOK — canonical write path for general income/expense/transfer
 # and unified timeline read view.
 # ================================================================
@@ -3062,6 +3122,10 @@ def _finalise_customer_payment(cp: dict) -> dict:
 async def create_customer_payment(payload: CustomerPaymentBase):
     cp = CustomerPayment(**payload.model_dump()).model_dump()
     _finalise_customer_payment(cp)
+    # Phase 2: canonical customer party id
+    party = await get_or_create_customer_party(db, cp.get("customer_name") or "")
+    if party:
+        cp["customer_party_id"] = party["id"]
     await db.customer_payments.insert_one(cp)
     order_ids = [a.get("order_id") for a in (cp.get("allocations") or []) if a.get("order_id")]
     await _recompute_payment_aggregates_for_orders(order_ids)
@@ -3111,6 +3175,9 @@ async def update_customer_payment(pid: str, payload: CustomerPaymentBase):
     old_order_ids = [a.get("order_id") for a in (existing.get("allocations") or []) if a.get("order_id")]
     cp = {**existing, **payload.model_dump()}
     _finalise_customer_payment(cp)
+    party = await get_or_create_customer_party(db, cp.get("customer_name") or "")
+    if party:
+        cp["customer_party_id"] = party["id"]
     await db.customer_payments.update_one({"id": pid}, {"$set": cp})
     new_order_ids = [a.get("order_id") for a in (cp.get("allocations") or []) if a.get("order_id")]
     await _recompute_payment_aggregates_for_orders(list(set(old_order_ids + new_order_ids)))
@@ -3282,6 +3349,8 @@ class Vendor(BaseModel):
     address: Optional[str] = ""
     notes: Optional[str] = ""
     archived: bool = False
+    # Phase 2: cross-link to canonical parties row
+    party_id: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -3318,6 +3387,8 @@ class Purchase(PurchaseBase):
     invoice_total: float = 0
     total_paid: float = 0
     outstanding_balance: float = 0
+    # Phase 2: stable vendor party id
+    vendor_party_id: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     # Auto-linked-from-order metadata (present only when source_type =
@@ -3363,6 +3434,8 @@ class PurchasePayment(PurchasePaymentBase):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     allocated_total: float = 0
     unallocated: float = 0  # vendor advance
+    # Phase 2: stable vendor party id
+    vendor_party_id: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -3464,14 +3537,35 @@ async def create_vendor(payload: Vendor):
     if exists:
         raise HTTPException(400, "Vendor with this name already exists")
     v = payload.model_dump()
+    # Phase 2: mirror into canonical parties + cross-link party_id.
+    if is_ff_alias(v.get("name")):
+        raise HTTPException(400, "'Factory' / 'Father's Firm' is a protected system party — cannot be created as a vendor.")
+    party = await sync_vendor_directory(db, v.get("name") or "", vendor_id=v.get("id"),
+                                        phone=v.get("phone") or "", gstin=v.get("gstin") or "")
+    if party:
+        v["party_id"] = party["id"]
     await db.vendors.insert_one(v)
     return Vendor(**v)
 
 
 @api_router.put("/vendors/{vid}", response_model=Vendor)
 async def update_vendor(vid: str, payload: Vendor):
+    existing = await db.vendors.find_one({"id": vid}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Vendor not found")
     data = payload.model_dump()
     data["id"] = vid
+    # Phase 2: rename via stable party_id — never mutate history rows.
+    pid = existing.get("party_id")
+    if pid and data.get("name") and data["name"].strip() != (existing.get("name") or "").strip():
+        await rename_party(db, pid, data["name"])
+    else:
+        # First time we see this vendor — ensure a canonical party exists.
+        party = await sync_vendor_directory(db, data.get("name") or "", vendor_id=vid,
+                                            phone=data.get("phone") or "",
+                                            gstin=data.get("gstin") or "")
+        if party:
+            data["party_id"] = party["id"]
     res = await db.vendors.update_one({"id": vid}, {"$set": data})
     if res.matched_count == 0:
         raise HTTPException(404, "Vendor not found")
@@ -3514,9 +3608,18 @@ async def create_purchase(payload: PurchaseBase):
     purchase = Purchase(**data).model_dump()
     compute_purchase(purchase)
     purchase["updated_at"] = datetime.now(timezone.utc).isoformat()
+    # Phase 2: canonical vendor party id (Factory→system_fathers_firm).
+    vname = data.get("vendor_name") or ""
+    party = None
+    if vname:
+        party = (await resolve_party(db, ptype="vendor", display_name=vname)
+                 if is_ff_alias(vname)
+                 else await get_or_create_vendor_party(db, vname))
+    if party:
+        purchase["vendor_party_id"] = party["id"]
     await db.purchases.insert_one(purchase)
     # Ensure vendor exists in vendors master
-    if data.get("vendor_name"):
+    if data.get("vendor_name") and not is_ff_alias(data["vendor_name"]):
         await db.vendors.update_one(
             {"name": data["vendor_name"]},
             {"$setOnInsert": Vendor(name=data["vendor_name"]).model_dump()},
@@ -3622,9 +3725,18 @@ async def create_purchase_payment(payload: PurchasePaymentBase):
     alloc = sum(float(a.get("amount") or 0) for a in (p.get("allocations") or []))
     p["allocated_total"] = round(alloc, 2)
     p["unallocated"] = round(max(0.0, amt - alloc), 2)
+    # Phase 2: canonical vendor party id (Factory→system_fathers_firm).
+    vname = p.get("vendor_name") or ""
+    party = None
+    if vname:
+        party = (await resolve_party(db, ptype="vendor", display_name=vname)
+                 if is_ff_alias(vname)
+                 else await get_or_create_vendor_party(db, vname))
+    if party:
+        p["vendor_party_id"] = party["id"]
     await db.purchase_payments.insert_one(p)
-    # Ensure vendor exists
-    if p.get("vendor_name"):
+    # Ensure vendor exists (skip Factory / FF alias)
+    if p.get("vendor_name") and not is_ff_alias(p["vendor_name"]):
         await db.vendors.update_one(
             {"name": p["vendor_name"]},
             {"$setOnInsert": Vendor(name=p["vendor_name"]).model_dump()},
@@ -3859,6 +3971,11 @@ async def duplicate_quotation(qid: str):
 
 # --- Party Ledger v2 (unified) ---
 from party_ledger_v2 import make_router as make_party_ledger_v2_router, ensure_bootstrap as ensure_party_ledger_bootstrap
+from party_sync import (
+    get_or_create_customer_party, get_or_create_vendor_party,
+    sync_vendor_directory, rename_party, resolve_party,
+    run_party_migration, is_ff_alias, SYSTEM_FF_ID,
+)
 app.include_router(make_party_ledger_v2_router(db), prefix="/api")
 
 
@@ -3958,6 +4075,43 @@ async def _startup():
         logger.info(f"Party Ledger v2 bootstrap OK — {n_parties} parties active.")
     except Exception as e:
         logger.error(f"Party Ledger v2 bootstrap failed: {e}")
+
+    # Phase 2 (P1): Canonical party identity migration.
+    try:
+        report = await run_party_migration(db)
+        logger.info(
+            f"Phase 2 party migration OK — total parties: {report['parties_created']}, "
+            f"vendors_linked: {report['vendors_linked']}, "
+            f"customers_linked: {report['customers_linked']}, "
+            f"FF aliases resolved: {report['ff_aliases_resolved']}, "
+            f"exact duplicates merged: {report['exact_duplicates_merged']}, "
+            f"probable duplicates flagged: {report['probable_duplicates_flagged']}, "
+            f"unmatched legacy names: {len(report['unmatched_legacy_names'])}"
+        )
+        await db.admin_migration_reports.insert_one({
+            "id": str(uuid.uuid4()),
+            "phase": "P1_party_identity",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            **report,
+        })
+    except Exception as e:
+        logger.error(f"Phase 2 party migration failed: {e}")
+
+    # Compound unique index on (type, normalized_name) — enforces race-safe
+    # canonical resolution for all subsequent writes. Created AFTER migration
+    # so any exact duplicates have already been merged. Partial filter
+    # excludes rows without a normalized_name (legacy compat).
+    try:
+        await db.parties.create_index(
+            [("type", 1), ("normalized_name", 1)],
+            unique=True,
+            name="party_identity_uidx",
+            partialFilterExpression={
+                "normalized_name": {"$exists": True, "$type": "string"},
+            },
+        )
+    except Exception as e:
+        logger.warning(f"Phase 2 party unique index setup skipped: {e}")
 
     # P0: stamp every pre-existing db.payments row with source='legacy_migrated'
     # so it can be surfaced in the Cash Book timeline as read-only, without

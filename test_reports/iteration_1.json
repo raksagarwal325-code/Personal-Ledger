@@ -1,0 +1,38 @@
+{
+  "summary": "Phase 2 (P1) canonical party identity verified end-to-end. Ran the pre-existing spec suite (test_p1_party_auto_create.py, 14 tests) plus a new supplementary suite (test_p1_party_review_extras.py, 6 tests) covering the two extra review items (system party rename block + GET system party). All 20 tests pass serially.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "test_p1_party_auto_create.py::TestMigration::test_migration_is_idempotent",
+        "issue": "Flaky under pytest-xdist parallel execution (default per /app/backend/pytest.ini): TestConcurrency runs in a sibling worker and inserts a party between the two /party-migration/run calls, causing parties_created to differ by 1. Serial run passes cleanly. Recommend marking this test with @pytest.mark.serial or using a filelock, or asserting `abs(second - first) <= <expected concurrent inserts>`. Not a backend regression."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_p1_party_auto_create.py",
+    "/app/backend/tests/test_p1_party_review_extras.py",
+    "/app/test_reports/pytest/p1_results.xml"
+  ],
+  "action_items": [
+    "Optional: mark test_migration_is_idempotent as serial (or add worker-lock) so the default xdist run is deterministic. All functional behavior is correct."
+  ],
+  "critical_code_review_comments": [
+    "Rename endpoint /api/parties/{pid}/rename accepts key `display_name` (Pydantic body). Documenting for future callers — the review request text used `new_name`; endpoint uses `display_name`. Consider accepting both aliases if `new_name` is documented anywhere externally.",
+    "Migration idempotency depends on no concurrent writers between runs. Consider taking a short read-lock or a monotonic 'last_scan_at' watermark so parallel writers do not cause counters to drift across identical migration runs."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_p1_party_review_extras.py (new)"
+  ],
+  "success_rate": {"backend": "100% (20/20 P1 tests pass serially)", "frontend": "N/A - skipped per request"},
+  "seed_data_creation": "Each test creates a UUID-suffixed party row (P2-Cust-*, P2-Vend-*, P2-VendPur-*, P2-CustOrd-*, P2-Idem-*, Zahir-*, P2-Rename-*, P2-Dup-*, P2-Concurrent-*, P1-Ven-*, P1-VenRen-*). These are cheap party rows and are not cleaned up (party-migration idempotency means they will not multiply on rerun).",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Both P1 test files (test_p1_party_auto_create.py + test_p1_party_review_extras.py) must be run with pytest-xdist disabled (e.g. `pytest -o addopts=''`) to avoid the known flake in TestMigration::test_migration_is_idempotent caused by TestConcurrency executing on a sibling worker. Backend is externally reachable at REACT_APP_BACKEND_URL from /app/frontend/.env but tests intentionally hit http://localhost:8001/api because that is the direct backend port (both work).",
+  "rca of the issue": "Under xdist parallel scheduling, TestMigration and TestConcurrency get scheduled on different workers. TestConcurrency issues 6 parallel customer-payment POSTs that create a brand-new party. If those POSTs land between TestMigration's two consecutive /party-migration/run calls, parties_created reflects that extra party on the second call, so `first == second` fails. Repro: `pytest backend/tests/test_p1_party_auto_create.py` (default addopts uses -n auto). Mitigation: run serially with `-o addopts=''`, or add a serial marker, or change the assertion to `assert 0 <= (second - first) <= <expected concurrent-test insertions>`."
+}
