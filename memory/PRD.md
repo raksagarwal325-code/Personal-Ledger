@@ -3,7 +3,15 @@
 ## Origin
 Repository `raksagarwal325-code/Personal-Ledger` cloned and continued as a full-stack ERP (FastAPI + MongoDB + React).
 
-## Latest bug fix (2026-07-22) · Canonical vendor_party_id linkage — Backend + Frontend polish
+## Latest bug fix (2026-07-22) · GST settlement with Father's Firm at invoice time
+- **Business rule**: When a taxable invoice is raised (order has `gst_ff_settle=True`, non-cancelled status, ≥1 shipment, realized tax > 0), the SHIPPED-PORTION `tax_amount` accrues against Father's Firm as a +ve `gst_settlement` derived row (Rakshit owes FF the GST that FF remits to the government).
+- **Customer ledgers, sign conventions, payment flow, and reconciliation UNCHANGED**. Existing `customer_payment received_by_party_id=FF_ID` linked entry preserved.
+- **Only NEW orders opt in** — POST /orders forces `gst_ff_settle=True`; PUT /orders preserves the stored flag. Historical orders stamped `gst_ff_settle=False` by an idempotent startup migration (3 orders in current DB).
+- **Fully DERIVED** — never stored. `tax_amount` edits, cancellation, deletion, and shipment changes auto-adjust FF's ledger on next read (idempotent, same pattern as freight/packing linked purchases).
+- **Files**: `domain.py` (new `gst_settlement` category, sign=+1), `server.py` (new `OrderBase.gst_ff_settle` field, startup migration, POST/PUT preservation), `party_ledger_v2.py` (derived row emission in `_derived_entries_for_party` FF branch).
+- **Tests**: `backend/tests/test_bug_gst_ff_settlement.py` — **9/9 pass** (1.3s). Combined `test_bug_vendor_party_linkage.py` + this suite → **25/25 pass** (2.75s). testing_agent independently verified all 10 API scenarios pass + reconcile 21/21 healthy.
+
+## Previous bug fix (2026-07-22) · Canonical vendor_party_id linkage — Backend + Frontend polish
 - **Backend**: Every Purchase (manual + auto-generated) now carries `vendor_party_id` stamped via the deterministic `get_or_create_vendor_party` helper (Factory/FF aliases → `SYSTEM_FF_ID`).
 - **NEW auto-generated Purchases** from Orders/Shipments:
   - `source_type='order_freight_purchase'` — one per shipment with `(transporter, freight_paid>0)`. Stamped with transporter's canonical party_id. Deterministic linked_source_key `{order_id}::shipment::{shipment_id}::freight` → idempotent, no duplicates.
