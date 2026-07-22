@@ -277,7 +277,7 @@ frontend:
              - Styled with red background (#fdecec) and border (#f5c1c1)
           
           ✅ (c) User remained on /login page
-             - URL: https://dedde4b3-6482-48c5-9052-c73381794eda.preview.emergentagent.com/login
+             - URL: https://github-sync-ledger.preview.emergentagent.com/login
              - No navigation occurred
           
           ✅ (d) Form fields retained values
@@ -300,7 +300,7 @@ frontend:
              - Toast visible before auto-dismiss
           
           ✅ (b) Redirected to dashboard
-             - URL changed to: https://dedde4b3-6482-48c5-9052-c73381794eda.preview.emergentagent.com/
+             - URL changed to: https://github-sync-ledger.preview.emergentagent.com/
              - Navigation successful
           
           ✅ (c) Dashboard content visible
