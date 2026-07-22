@@ -31,6 +31,10 @@ from domain import (
     order_outstanding_from_alloc,
     purchase_realized_amounts, purchase_outstanding_from_alloc,
     _order_shipped_qty_by_item,
+    # Bug fix (2026-07-22) — see domain.py for full context
+    order_dashboard_outstanding_paise,
+    sum_dashboard_outstanding_receivable_paise,
+    derive_completion_shipped_date,
 )
 
 ROOT_DIR = Path(__file__).parent
@@ -470,6 +474,15 @@ def compute_order_aggregates(order: dict) -> dict:
     # Latest shipped date for monthly bucketing
     last = max([(s.get("date") or "") for s in shipments], default="") if shipments else ""
     order["last_shipped_date"] = last or order.get("shipped_date")
+
+    # Bug fix (2026-07-22) — derive order-level `shipped_date` from
+    # shipments (source of truth). None while partially shipped, set to
+    # the date of the shipment that caused cumulative qty to reach ordered
+    # qty when fully shipped. Deterministic + idempotent (repeated calls
+    # produce no drift). See domain.derive_completion_shipped_date for
+    # the exact rule. Auto-backfills historical orders whose stored
+    # `shipped_date` was blank despite full shipments.
+    order["shipped_date"] = derive_completion_shipped_date(order)
 
     # ── Stamp every denormalised field (preserving contract) ─────────────
     order["ordered_qty_total"] = ordered_qty_total
@@ -1302,10 +1315,14 @@ async def dashboard():
     received = from_paise(sum_received_kpi(cust_pays, cb_entries_all))
     paid = from_paise(sum_paid_kpi(purchase_pays, cb_entries_all))
 
-    # Outstanding by payment_status on orders (simple proxy)
-    outstanding_receivable = sum(
-        (o.get("invoice_total") or 0) for o in orders
-        if o.get("payment_status") in ("Unpaid", "Partial")
+    # Outstanding receivable (Bug fix 2026-07-22): must sum the REMAINING
+    # order balance (invoice_total − allocated payments, clamped to zero
+    # per order), NOT the full invoice value of unpaid/partial orders.
+    # A ₹96,300 order with ₹75,000 paid should contribute ₹21,300, not
+    # ₹96,300. Cancelled orders excluded. Single-sourced with
+    # /api/dashboard/breakdown.receivable via the shared domain helper.
+    outstanding_receivable = from_paise(
+        sum_dashboard_outstanding_receivable_paise(orders)
     )
     outstanding_payable = paid  # kept simple — historical shape
 
@@ -1632,30 +1649,49 @@ async def dashboard_breakdown():
     }
 
     # ---- Receivable (unpaid / partial orders) ----
+    # Bug fix (2026-07-22): the receivable KPI must show the REMAINING
+    # order balance (invoice_total − allocated), clamped to zero on
+    # over-payment. Preserves the by_status shape but uses each order's
+    # dashboard-clamped outstanding paise for the amount buckets and the
+    # per-client roll-ups. Single-sourced with /api/dashboard.kpis.
     by_status = {"Unpaid": {"count": 0, "amount": 0}, "Partial": {"count": 0, "amount": 0}, "Paid": {"count": 0, "amount": 0}}
     receivable_orders = []
     for o in orders:
         st = o.get("payment_status") or "Unpaid"
-        amt = o.get("invoice_total") or 0
         by_status.setdefault(st, {"count": 0, "amount": 0})
         by_status[st]["count"] += 1
-        by_status[st]["amount"] += amt
-        if st in ("Unpaid", "Partial"):
-            receivable_orders.append({
-                "id": o.get("id"),
-                "client_name": o.get("client_name"),
-                "shipped_date": o.get("shipped_date"),
-                "invoice_total": amt,
-                "payment_status": st,
-            })
-    receivable_orders.sort(key=lambda x: -(x["invoice_total"] or 0))
+        if st == "Paid":
+            # Paid orders contribute 0 to the receivable KPI by definition.
+            # We still keep the count in the by_status roll-up for context.
+            continue
+        # Cancelled orders would be status='Cancelled' on lifecycle side,
+        # not payment_status — but the domain helper already clamps them
+        # for us, so an "Unpaid Cancelled" order still resolves to 0.
+        out_p = order_dashboard_outstanding_paise(o)
+        if out_p <= 0:
+            # Over-paid or fully-recovered "Unpaid" order → skip from the
+            # order list too (would show as ₹0 which is noise).
+            continue
+        amt_display = from_paise(out_p)
+        by_status[st]["amount"] += amt_display
+        receivable_orders.append({
+            "id": o.get("id"),
+            "client_name": o.get("client_name"),
+            "shipped_date": o.get("shipped_date"),
+            "invoice_total": o.get("invoice_total") or 0,
+            "outstanding_balance": amt_display,   # NEW — see Bug fix note
+            "payment_status": st,
+        })
+    receivable_orders.sort(key=lambda x: -(x["outstanding_balance"] or 0))
 
-    # aggregate receivable by client
+    # aggregate receivable by client — same dashboard-clamped amount as above.
     recv_by_client = defaultdict(lambda: {"amount": 0, "orders": 0})
     for o in orders:
-        if (o.get("payment_status") or "") in ("Unpaid", "Partial"):
-            recv_by_client[o.get("client_name") or "Unknown"]["amount"] += o.get("invoice_total") or 0
-            recv_by_client[o.get("client_name") or "Unknown"]["orders"] += 1
+        out_p = order_dashboard_outstanding_paise(o)
+        if out_p <= 0:
+            continue
+        recv_by_client[o.get("client_name") or "Unknown"]["amount"] += from_paise(out_p)
+        recv_by_client[o.get("client_name") or "Unknown"]["orders"] += 1
 
     receivable = {
         "total": by_status.get("Unpaid", {}).get("amount", 0) + by_status.get("Partial", {}).get("amount", 0),
@@ -3579,17 +3615,25 @@ logger = logging.getLogger(__name__)
 
 async def _refresh_stored_aggregates() -> int:
     """Recompute and $set aggregate fields on every order using current formula.
-    Idempotent — safe to run on startup. Fixes drift when the formula changed."""
+    Idempotent — safe to run on startup. Fixes drift when the formula changed.
+
+    Bug fix (2026-07-22): also refreshes the derived `shipped_date` and
+    `last_shipped_date` on every order so historical fully-shipped orders
+    with blank stored `shipped_date` get backfilled from their shipment
+    records automatically on the next backend restart.
+    """
     n = 0
     async for doc in db.orders.find({}):
         doc.pop("_id", None)
         before = {k: doc.get(k) for k in ("operating_revenue", "total_cost", "net_profit",
                                           "invoice_total", "estimated_operating_revenue",
-                                          "estimated_net_profit")}
+                                          "estimated_net_profit", "shipped_date",
+                                          "last_shipped_date")}
         compute_order_aggregates(doc)
         after = {k: doc.get(k) for k in ("operating_revenue", "total_cost", "net_profit",
                                          "invoice_total", "estimated_operating_revenue",
-                                         "estimated_net_profit")}
+                                         "estimated_net_profit", "shipped_date",
+                                         "last_shipped_date")}
         if before != after or "total_received" not in doc or "estimated_operating_revenue" not in before:
             await db.orders.update_one({"id": doc["id"]}, {"$set": {
                 "product_sales_total": doc["product_sales_total"],
@@ -3617,6 +3661,9 @@ async def _refresh_stored_aggregates() -> int:
                 "revenue_recognized": doc["revenue_recognized"],
                 "unrealized_revenue": doc["unrealized_revenue"],
                 "unrealized_net_profit": doc["unrealized_net_profit"],
+                # Bug fix (2026-07-22): derived completion date
+                "shipped_date": doc.get("shipped_date"),
+                "last_shipped_date": doc.get("last_shipped_date"),
             }})
             n += 1
     return n

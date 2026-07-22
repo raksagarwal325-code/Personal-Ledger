@@ -653,6 +653,104 @@ def derived_row_delta_paise(category: str, amount_paise: int) -> int:
     return abs(amt_p)
 
 
+# ─── Bug fix (2026-07-22) · Dashboard Outstanding Receivable ───────────────
+#
+# The dashboard KPI `outstanding_receivable` previously summed
+# `invoice_total` for every order with payment_status ∈ (Unpaid, Partial).
+# That double-counts money that has already been received: a ₹96,300
+# order with a ₹75,000 allocated payment showed ₹96,300 outstanding on
+# the dashboard even though only ₹21,300 was actually receivable.
+#
+# The stored `outstanding_balance` on each order is the correct number
+# (invoice_total − Σ allocated) and MAY be negative on over-payment (a
+# Phase-6 rule kept on the customer side — vendors clamp to zero). For
+# the dashboard KPI we clamp each order to zero and skip Cancelled ones.
+
+def order_dashboard_outstanding_paise(order: dict) -> int:
+    """Signed contribution of ONE order to the dashboard's Outstanding
+    Receivable KPI. Paise. Pure.
+
+    Rules (matches user-provided spec):
+      • Cancelled orders contribute 0.
+      • Otherwise: max(0, outstanding_balance_paise).
+        The clamp handles over-payment (stored outstanding may be −ve).
+    """
+    if not order:
+        return 0
+    if (order.get("status") or "").lower() == "cancelled":
+        return 0
+    outstanding_p = to_paise(order.get("outstanding_balance"))
+    if outstanding_p < 0:
+        return 0
+    return outstanding_p
+
+
+def sum_dashboard_outstanding_receivable_paise(orders: Iterable[dict]) -> int:
+    """Σ `order_dashboard_outstanding_paise` over `orders`. Paise. Pure.
+
+    This is the canonical helper for BOTH `/api/dashboard.kpis.outstanding_receivable`
+    and `/api/dashboard/breakdown.receivable.total`. Wiring both endpoints
+    through the same helper guarantees they cannot drift.
+    """
+    return sum(order_dashboard_outstanding_paise(o) for o in orders)
+
+
+# ─── Bug fix (2026-07-22) · Order-level completion date ────────────────────
+#
+# `orders.shipped_date` was legacy — the UI required users to key it in
+# manually even after fully shipping the order via multiple shipment
+# records. Post-Phase-6 shipments are the source of truth: the order-level
+# `shipped_date` should be DERIVED as "the shipment date that caused
+# cumulative shipped qty to reach ordered qty".
+
+def _shipment_sort_key(s: dict):
+    """Deterministic ordering — date first, created_at as tiebreaker,
+    id as last resort. All string-comparable ISO timestamps so lexical
+    order matches chronological order."""
+    return (
+        s.get("date") or "",
+        s.get("created_at") or "",
+        s.get("id") or "",
+    )
+
+
+def derive_completion_shipped_date(order: dict) -> str | None:
+    """The order-level completion date. Pure. None if the order is not
+    yet fully shipped.
+
+    Rules (matches user-provided spec):
+      • No shipments OR ordered_qty_total = 0 → None.
+      • Partial shipment (cumulative < ordered) → None.
+      • Fully shipped → the date of the shipment whose ITEMS made
+        cumulative shipped qty first reach ordered qty. Walks shipments
+        in (date, created_at, id) order — deterministic and idempotent.
+      • Zero-qty shipments never make cumulative reach ordered qty, so
+        they never "complete" an order.
+      • Uses 1e-6 tolerance on the qty comparison to avoid float noise.
+    """
+    if not order:
+        return None
+    items = order.get("items") or []
+    ordered_qty = 0.0
+    for it in items:
+        ordered_qty += float(it.get("qty") or 0)
+    if ordered_qty <= 0:
+        return None
+
+    shipments = list(order.get("shipments") or [])
+    if not shipments:
+        return None
+    shipments.sort(key=_shipment_sort_key)
+
+    cum = 0.0
+    for s in shipments:
+        for line in (s.get("items") or []):
+            cum += float(line.get("qty") or 0)
+        if cum + 1e-6 >= ordered_qty:
+            return s.get("date")
+    return None
+
+
 # ─── Party Ledger v2 · Slice 5 · Father's Firm settlement helpers ──────────
 
 # The FF card on the dashboard uses lowercase status labels intentionally

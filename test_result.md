@@ -768,6 +768,249 @@ backend:
         agent: "main"
         comment: "Slice 1 landed 2026-07-21. Additive only. 65/65 domain tests pass. See task ‘Slice 2’ below for continuation."
 
+  - task: "Bug fix — Dashboard Outstanding Receivable + Order Shipped Date derivation"
+    implemented: true
+    working: true
+    file: "backend/domain.py, backend/server.py, backend/tests/test_bug_dashboard_outstanding_and_shipped_date.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: |
+          Two independent ERP bugs fixed together per user report on
+          2026-07-22. Both fixes single-source through shared-domain
+          helpers per the Phase-6 architecture.
+          
+          **Bug 1 — Dashboard Outstanding Receivable was wrong.**
+          The dashboard KPI summed `invoice_total` for every unpaid /
+          partial order — double-counting money already received. The
+          reported regression case: order ₹96,300 with ₹75,000
+          allocated. Correct outstanding = ₹21,300. Buggy KPI showed
+          ₹96,300. Root cause: server.py L1306-1309 (dashboard) and
+          L1634-1668 (breakdown) both used `invoice_total` in the sum.
+          
+          Fix — new pure domain helpers:
+            * `order_dashboard_outstanding_paise(order)` — max(0,
+              outstanding_balance_paise), 0 for Cancelled orders.
+            * `sum_dashboard_outstanding_receivable_paise(orders)` — Σ.
+          
+          `/api/dashboard.kpis.outstanding_receivable` and
+          `/api/dashboard/breakdown.receivable.total` now route through
+          the SAME helper — cannot drift.
+          
+          Additional breakdown-level improvements:
+            * `receivable.orders[i]` now includes a new
+              `outstanding_balance` field (the clamped amount) so the
+              FE can render the actual receivable per row (not the
+              full invoice).
+            * `receivable.by_status.amount` and `by_client.amount` now
+              sum the clamped outstanding, not the invoice_total.
+            * `Paid` orders skipped from the order list (0 contribution).
+          
+          Verified live: dashboard KPI = ₹21,300 (matches regression
+          case), breakdown total = ₹21,300, both agree.
+          
+          **Bug 2 — Order Shipped Date remained blank despite full
+          shipment.** Reported case: Minakshi Jain order, 6 units
+          ordered, 1 shipment on 2026-04-06 for 6 units, but order-
+          level `shipped_date` was `None`. Root cause: `shipped_date`
+          was a legacy user-entered field; `compute_order_aggregates`
+          only computed `last_shipped_date`, never derived the
+          completion-triggering date.
+          
+          Fix — new pure domain helper:
+            * `derive_completion_shipped_date(order)` — walks
+              shipments in (date, created_at, id) order accumulating
+              per-item qty. Returns the date of the shipment whose
+              contribution first pushed cumulative shipped qty ≥
+              ordered qty (with 1e-6 tolerance). None if partially
+              shipped or zero-qty ordered. Deterministic + idempotent
+              (3× recompute produces no drift; pinned by test).
+          
+          `compute_order_aggregates` now sets
+          `order["shipped_date"] = derive_completion_shipped_date(order)`
+          right after computing `last_shipped_date`. Persistence:
+            * All shipment mutation endpoints (POST/PUT/DELETE on
+              /api/orders/{oid}/shipments*) already persist the FULL
+              order dict on every write — they now automatically
+              save the derived date.
+            * `_refresh_stored_aggregates` startup backfill now
+              includes `shipped_date` + `last_shipped_date` in its
+              $set list. This means every historical fully-shipped
+              order with blank `shipped_date` gets backfilled on the
+              next backend restart. Verified: 1 backfill happened
+              on restart post-fix (Minakshi Jain order).
+          
+          Rule matrix vs spec:
+            * No shipment → None ✅
+            * Partial shipment → None ✅
+            * Final shipment sets completion date ✅
+            * Multi-shipment: uses date of shipment that hits ordered qty ✅
+            * Editing final-shipment date → shipped_date follows ✅
+            * Deleting shipment below full → shipped_date cleared ✅
+            * Existing fully-shipped with blank → backfilled ✅
+            * 3× recompute → no drift ✅
+            * Cancelled/reversed orders → excluded via status filter ✅
+          
+          **Behaviour differences REPORTED to reviewer** (per your
+          "do not silently alter snapshots" requirement):
+            1. `/api/dashboard.kpis.outstanding_receivable` — value
+               CHANGES from `sum(invoice_total)` to `sum(max(0,
+               outstanding_balance))`. This IS the fix; all Phase 6
+               tests and snapshots that pinned the buggy value will
+               need refresh (none exist — the value was never
+               snapshotted).
+            2. `/api/dashboard/breakdown.receivable.total` — same
+               semantic change.
+            3. `receivable.orders[i]` — NEW additive field
+               `outstanding_balance`. Existing keys unchanged.
+            4. `receivable.by_status.amount` values change to sum the
+               clamped outstanding, not invoice_total.
+            5. `Paid` orders no longer appear in `receivable.orders[]`
+               (they contributed 0 to the KPI anyway, so their
+               presence was misleading).
+            6. `receivable.by_client` — same semantic tightening.
+            7. Historical fully-shipped orders with blank
+               `shipped_date` will be backfilled once on next backend
+               restart (single-row update per affected order via
+               `_refresh_stored_aggregates`).
+            8. NO change to Party Ledger, Customer Receivables (per-
+               party rollup), payment allocation semantics, or
+               reconcile invariants.
+          
+          **Live verification:**
+            * Dashboard KPI: ₹21,300 (was ₹96,300). ✅
+            * Breakdown total: ₹21,300. ✅
+            * Both endpoints match. ✅
+            * Minakshi Jain shipped_date = 2026-04-06T00:00:00.000Z. ✅
+            * No partially-shipped order has a false shipped_date. ✅
+            * `/api/reconcile`: healthy = true, 21/21 passed. ✅
+          
+          **Test suite:**
+            * 34 new tests in test_bug_dashboard_outstanding_and_shipped_date.py — all pass.
+            * Full Phase 6 regression: 282/282 pass (test_p6_*, test_p5_reconcile, test_p4_partial_shipment_revenue, test_p3_transfers, and the new bug test all pass in the same run).
+          
+          Ready for testing-agent verification.
+      - working: true
+        agent: "testing"
+        comment: |
+          ✅ BUG FIX VERIFICATION COMPLETE — ALL TESTS PASSED
+          
+          Executed comprehensive backend API verification covering both bug fixes
+          and all regression checks from the review request. All tests passed.
+          
+          **BUG 1 — DASHBOARD OUTSTANDING RECEIVABLE: ✅ PASSED (6/6 tests)**
+          
+          Static verification (seeded DB):
+          ✅ 1. Dashboard KPI outstanding_receivable = ₹21,300.00 (exact match)
+          ✅ 2. Breakdown receivable.total = ₹21,300.00 (exact match)
+          ✅ 3. Both endpoints match (cannot drift)
+          ✅ 4. Minakshi Jain order in receivable.orders[] has:
+             - outstanding_balance = ₹21,300.00 (NEW field)
+             - invoice_total = ₹96,300.00
+             - Confirms the specific regression case from user report
+          ✅ 5. receivable.by_status: Unpaid + Partial = receivable.total
+             - Unpaid: ₹0.00, Partial: ₹21,300.00, Sum: ₹21,300.00
+          ✅ 6. No Paid orders in receivable.orders[] (correct exclusion)
+          
+          Live edge case testing (9 steps):
+          ✅ Created test order (₹100,000), fully shipped
+          ✅ Verified outstanding_balance = ₹100,000 on order
+          ✅ Verified dashboard outstanding increased by ₹100,000
+          ✅ Added payment (₹30,000 allocated)
+          ✅ Verified outstanding_balance = ₹70,000 on order
+          ✅ Verified dashboard outstanding = initial + ₹70,000
+          ✅ Added second payment (₹150,000 total, ₹70,000 allocated, ₹80,000 advance)
+          ✅ Verified outstanding_balance = ₹0 on order
+          ✅ Verified dashboard outstanding = initial (order no longer contributes)
+          ✅ Verified customer_advances increased by ₹80,000
+          ✅ Reversed last payment
+          ✅ Verified outstanding_balance restored to ₹70,000
+          ✅ Verified dashboard outstanding restored to initial + ₹70,000
+          ✅ Cleanup successful (order and payments deleted)
+          
+          **BUG 2 — ORDER SHIPPED DATE DERIVATION: ✅ PASSED (3/3 tests)**
+          
+          Static verification (seeded DB):
+          ✅ 1. Minakshi Jain order verified:
+             - status = "Fully Shipped"
+             - shipped_date = "2026-04-06T00:00:00.000Z" (correct)
+             - last_shipped_date = "2026-04-06T00:00:00.000Z" (correct)
+          ✅ 2. All orders sweep:
+             - Fully Shipped orders: 1 (all have non-null shipped_date)
+             - Partially Shipped orders: 0 (all have null shipped_date)
+          
+          Live shipment flow testing (11 steps):
+          ✅ Created test order (qty=5, rate=₹100)
+          ✅ Verified shipped_date = null (no shipments yet)
+          ✅ Added partial shipment (qty=2 of 5)
+          ✅ Verified status = "Partially Shipped", shipped_date = null
+          ✅ Added completing shipment (qty=3, total=5, date=2026-05-10)
+          ✅ Verified status = "Fully Shipped", shipped_date = "2026-05-10"
+          ✅ Edited completing shipment date to 2026-06-15
+          ✅ Verified shipped_date updated to "2026-06-15" (follows edit)
+          ✅ Deleted completing shipment
+          ✅ Verified status = "Partially Shipped", shipped_date = null (cleared)
+          ✅ Added completing shipment back (date=2026-07-20)
+          ✅ Verified status = "Fully Shipped", shipped_date = "2026-07-20"
+          ✅ Idempotency: POST /api/reconcile/run twice
+          ✅ Verified shipped_date unchanged (no drift)
+          ✅ Cleanup successful (order deleted)
+          
+          **REGRESSION CHECKS: ✅ PASSED (5/5 tests)**
+          
+          ✅ 1. GET /api/reconcile:
+             - healthy = true
+             - passed = 21, total = 21
+             - engine_version = "P5"
+          
+          ✅ 2. GET /api/party-ledger-v2/summary:
+             - All 7 keys present and numeric:
+               fathers_firm_you_pay, fathers_firm_you_receive,
+               vendor_you_pay, vendor_advances_you_receive,
+               customer_you_receive, customer_advances_you_pay,
+               net_position
+          
+          ✅ 3. GET /api/party-ledger-v2/fathers-firm-settlement:
+             - All required keys present: party_id, party_name,
+               balance_signed, amount, status, label
+             - status = "you_pay" (lowercase, correct)
+          
+          ✅ 4. GET /api/dashboard:
+             - All expected KPIs present and numeric:
+               received, paid, net_profit, estimated_revenue,
+               estimated_net_profit, customer_advances,
+               outstanding_receivable
+             - customer_advances and outstanding_receivable are non-negative
+          
+          ✅ 5. GET /api/accounts/{id}/balance (10 accounts tested):
+             - Composition identity verified for all 10 accounts:
+               opening_balance + incoming - outgoing + transfer_net == balance
+               (within ±0.01 tolerance)
+          
+          **SUMMARY:**
+          Both bug fixes are WORKING CORRECTLY on the seeded DB:
+          
+          (a) ✅ Dashboard KPI outstanding_receivable = ₹21,300 (exact match)
+          (b) ✅ Breakdown total matches dashboard KPI (₹21,300)
+          (c) ✅ Minakshi Jain shipped_date = "2026-04-06T00:00:00.000Z"
+          (d) ✅ Live shipment flow: partial → blank, complete → set,
+              edit → follows, delete → cleared, idempotent
+          (e) ✅ Reconcile still 21/21 passed, healthy=true
+          
+          **NO REGRESSIONS DETECTED:**
+          - Party Ledger v2 endpoints working correctly
+          - Dashboard KPIs all present and numeric
+          - Account balance composition identity satisfied
+          - Reconcile engine still healthy (21/21)
+          
+          **CONCLUSION:**
+          The two ERP bug fixes are PRODUCTION-READY. All requirements from
+          the review request verified. No regressions detected in existing
+          functionality.
+
   - task: "Phase 6 · Slice 6 — Transfer + Father's Firm settlement + account balance → domain layer"
     implemented: true
     working: true
@@ -2163,12 +2406,12 @@ backend:
 metadata:
   created_by: "main_agent"
   version: "1.0"
-  test_sequence: 4
+  test_sequence: 5
   run_ui: true
 
 test_plan:
   current_focus:
-    - "Phase 6 · Slice 6 — Transfer + Father's Firm settlement + account balance → domain layer"
+    - "Bug fix — Dashboard Outstanding Receivable + Order Shipped Date derivation"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -2919,3 +3162,137 @@ agent_communication:
       **Phase 6 · Shared Domain Consolidation is COMPLETE and PRODUCTION-READY.**
       
       RECOMMENDATION: Main agent can summarize and finish.
+
+  - agent: "main"
+    message: |
+      **BUG FIX 2026-07-22 — Dashboard Outstanding Receivable + Order
+      Shipped Date derivation.**
+      
+      Two ERP bugs fixed together per user report. Both single-sourced
+      through shared-domain helpers per Phase 6 architecture. No
+      changes to Party Ledger, Customer Receivables, payment APIs, or
+      reconcile semantics.
+      
+      **Bug 1 fix: Dashboard Outstanding Receivable**
+        * Root cause: `/api/dashboard` KPI + `/api/dashboard/breakdown`
+          receivable both summed `invoice_total` for unpaid/partial
+          orders — double-counting money already received.
+        * New helpers: `order_dashboard_outstanding_paise` (clamps to
+          0 for over-payment or Cancelled orders) and
+          `sum_dashboard_outstanding_receivable_paise` (Σ).
+        * Both dashboard endpoints now route through the same helper.
+        * Additionally: `receivable.orders[i]` now carries a new
+          `outstanding_balance` field so the FE renders the remaining
+          amount, not the invoice.
+        * Reported case (₹96,300 order, ₹75,000 paid) now correctly
+          shows ₹21,300 on both endpoints. Confirmed live.
+      
+      **Bug 2 fix: Order-level shipped_date derivation**
+        * Root cause: `shipped_date` was a legacy user-entered field;
+          `compute_order_aggregates` never derived it from shipments.
+        * New helper: `derive_completion_shipped_date(order)` walks
+          shipments in (date, created_at, id) order accumulating
+          per-item qty; returns the shipment date that caused
+          cumulative shipped qty to first reach ordered qty. None
+          if partially shipped or zero-qty ordered.
+        * `compute_order_aggregates` now overwrites
+          `order["shipped_date"]` with the derived value on every
+          call. All shipment mutation endpoints already persist the
+          full order dict, so they save it automatically.
+        * `_refresh_stored_aggregates` now includes `shipped_date` +
+          `last_shipped_date` in its startup backfill $set list —
+          historical fully-shipped orders with blank date got
+          backfilled on this restart (verified: 1 backfilled, the
+          reported Minakshi Jain case).
+      
+      **Behaviour differences REPORTED to reviewer** (per your "do
+      not silently alter snapshots" requirement):
+        1. `/api/dashboard.kpis.outstanding_receivable` value CHANGES
+           semantic — this IS the fix. No test/snapshot pinned the
+           buggy value.
+        2. `/api/dashboard/breakdown.receivable.total` — same.
+        3. `receivable.orders[i]` NEW additive field
+           `outstanding_balance`. All existing keys unchanged.
+        4. `receivable.by_status.amount` + `by_client.amount` now sum
+           clamped outstanding, not invoice_total.
+        5. `Paid` orders no longer appear in `receivable.orders[]`
+           (they contributed 0 anyway).
+        6. Historical `orders.shipped_date` values are auto-derived
+           on next backend restart. Any order that previously had a
+           blank stored value AND was fully shipped will now display
+           the completion date. Any partially-shipped order that
+           previously had a stale user-entered date will now be
+           cleared to null.
+        7. NO drift in Party Ledger, Customer Receivables, payment
+           APIs, or reconcile.
+      
+      **Live verification:**
+        * Dashboard KPI: ₹21,300 (was ₹96,300). ✅
+        * Breakdown total: ₹21,300. ✅
+        * Both endpoints match. ✅
+        * Minakshi Jain shipped_date = 2026-04-06T00:00:00.000Z. ✅
+        * No partially-shipped order has a false shipped_date. ✅
+        * `/api/reconcile`: healthy=true, 21/21 passed. ✅
+        * Full Phase 6 regression: 282/282 pass (34 new + 248
+          existing).
+      
+      Requesting deep_testing_backend_v2 verification of:
+        1. `/api/dashboard.kpis.outstanding_receivable` = ₹21,300
+           for the current seeded DB.
+        2. `/api/dashboard/breakdown.receivable.total` matches (1).
+        3. `receivable.orders[i]` includes `outstanding_balance` key.
+        4. All fully-shipped orders in the DB have populated
+           `shipped_date`; the specific "Minakshi Jain" order has
+           shipped_date starting with `2026-04-06`.
+        5. `/api/reconcile`: healthy=true, 21/21.
+        6. `/api/dashboard`, `/api/dashboard/breakdown`,
+           `/api/party-ledger-v2/summary`, and
+           `/api/party-ledger-v2/fathers-firm-settlement` all
+           return 200 with correct shape.
+      
+      Auth: admin@artisan.local / Admin@12345 (in
+      /app/memory/test_credentials.md).
+
+
+  - agent: "testing"
+    message: |
+      ✅ BUG FIX VERIFICATION COMPLETE — ALL TESTS PASSED
+      
+      Executed comprehensive backend API verification for the two ERP bug fixes
+      landed 2026-07-22. All requirements from the review request verified.
+      
+      **Test Coverage:**
+      • Bug 1 — Dashboard Outstanding Receivable: 6/6 tests passed
+        - Static verification on seeded DB (dashboard KPI, breakdown total, 
+          Minakshi Jain order outstanding_balance field)
+        - Live edge case testing (9 steps: order creation, shipment, payments, 
+          advances, reversal, cleanup)
+      
+      • Bug 2 — Order Shipped Date derivation: 3/3 tests passed
+        - Static verification (Minakshi Jain order, all orders sweep)
+        - Live shipment flow (11 steps: partial → complete → edit → delete → 
+          re-add → idempotency)
+      
+      • Regression checks: 5/5 tests passed
+        - Reconcile (21/21 passed, healthy=true, engine=P5)
+        - Party Ledger v2 endpoints
+        - Dashboard KPIs
+        - Account balance composition identity (10 accounts)
+      
+      **Key Findings:**
+      ✅ (a) Dashboard KPI outstanding_receivable = ₹21,300 (exact match)
+      ✅ (b) Breakdown total matches dashboard KPI (₹21,300)
+      ✅ (c) Minakshi Jain shipped_date = "2026-04-06T00:00:00.000Z"
+      ✅ (d) Live shipment flow: partial → blank, complete → set, edit → follows, 
+          delete → cleared, idempotent (no drift after 2x reconcile runs)
+      ✅ (e) Reconcile still 21/21 passed, healthy=true
+      
+      **No Regressions Detected:**
+      - Party Ledger v2 endpoints working correctly
+      - Dashboard KPIs all present and numeric
+      - Account balance composition identity satisfied
+      - Reconcile engine still healthy
+      
+      **Conclusion:**
+      Both ERP bug fixes are PRODUCTION-READY. All requirements verified.
+      No regressions detected. Main agent can summarize and finish.

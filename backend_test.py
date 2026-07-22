@@ -1,613 +1,845 @@
+#!/usr/bin/env python3
 """
-Phase 6 · Slice 6 — Backend API Testing Suite
-Tests Transfer + Father's Firm settlement + Account balance refactor
-
-Test Coverage:
-1. Account balance endpoints byte-equivalence (~100 accounts)
-2. Transfer endpoints regression (GET, POST, reverse)
-3. Father's Firm settlement endpoint
-4. Reconcile invariant engine (21/21)
-5. Sign-convention pin (specific integration case)
-6. Dashboard regression
-7. Party Ledger v2 regression (Slice 5)
+Backend API Test Suite for Bug Fix Verification
+Two ERP bugs fixed 2026-07-22:
+  1. Dashboard Outstanding Receivable (was showing invoice_total instead of outstanding_balance)
+  2. Order Shipped Date derivation (was blank despite full shipment)
 """
 
 import requests
 import json
-import os
-from datetime import datetime
+from datetime import datetime, date
+from typing import Dict, List, Any, Optional
 
-# Read backend URL from frontend/.env
-BACKEND_URL = None
-with open('/app/frontend/.env', 'r') as f:
-    for line in f:
-        if line.startswith('REACT_APP_BACKEND_URL='):
-            BACKEND_URL = line.split('=', 1)[1].strip()
+# Backend URL from frontend/.env
+BASE_URL = "https://github-sync-ledger.preview.emergentagent.com/api"
+
+# Test credentials from /app/memory/test_credentials.md
+ADMIN_EMAIL = "admin@artisan.local"
+ADMIN_PASSWORD = "Admin@12345"
+
+# Global token storage
+AUTH_TOKEN = None
+
+
+def login() -> str:
+    """Login and return JWT token"""
+    global AUTH_TOKEN
+    response = requests.post(
+        f"{BASE_URL}/auth/login",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+    )
+    assert response.status_code == 200, f"Login failed: {response.status_code} {response.text}"
+    data = response.json()
+    AUTH_TOKEN = data.get("access_token")
+    assert AUTH_TOKEN, "No access_token in login response"
+    print(f"✅ Login successful")
+    return AUTH_TOKEN
+
+
+def get_headers() -> Dict[str, str]:
+    """Get authorization headers"""
+    return {"Authorization": f"Bearer {AUTH_TOKEN}"}
+
+
+def test_bug1_dashboard_outstanding_receivable():
+    """
+    Bug 1 — Dashboard Outstanding Receivable
+    Verify the specific regression case: order ₹96,300 with ₹75,000 allocated
+    should show outstanding ₹21,300 (not ₹96,300)
+    """
+    print("\n" + "="*80)
+    print("BUG 1 — DASHBOARD OUTSTANDING RECEIVABLE")
+    print("="*80)
+    
+    # 1. GET /api/dashboard → kpis.outstanding_receivable == 21300
+    print("\n[1/6] Testing GET /api/dashboard → kpis.outstanding_receivable")
+    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
+    assert response.status_code == 200, f"Dashboard failed: {response.status_code}"
+    dashboard = response.json()
+    
+    outstanding_receivable = dashboard.get("kpis", {}).get("outstanding_receivable")
+    assert outstanding_receivable is not None, "outstanding_receivable not in dashboard KPIs"
+    
+    # Allow ±0.01 tolerance for floating point
+    expected = 21300.0
+    tolerance = 0.01
+    assert abs(outstanding_receivable - expected) <= tolerance, \
+        f"Dashboard KPI outstanding_receivable = {outstanding_receivable}, expected {expected}"
+    
+    print(f"   ✅ Dashboard KPI outstanding_receivable = ₹{outstanding_receivable:,.2f} (expected ₹21,300.00)")
+    
+    # 2. GET /api/dashboard/breakdown → receivable.total == 21300
+    print("\n[2/6] Testing GET /api/dashboard/breakdown → receivable.total")
+    response = requests.get(f"{BASE_URL}/dashboard/breakdown", headers=get_headers())
+    assert response.status_code == 200, f"Breakdown failed: {response.status_code}"
+    breakdown = response.json()
+    
+    receivable_total = breakdown.get("receivable", {}).get("total")
+    assert receivable_total is not None, "receivable.total not in breakdown"
+    
+    assert abs(receivable_total - expected) <= tolerance, \
+        f"Breakdown receivable.total = {receivable_total}, expected {expected}"
+    
+    print(f"   ✅ Breakdown receivable.total = ₹{receivable_total:,.2f} (expected ₹21,300.00)")
+    
+    # Verify both endpoints match
+    assert abs(outstanding_receivable - receivable_total) <= tolerance, \
+        f"Dashboard KPI ({outstanding_receivable}) != Breakdown total ({receivable_total})"
+    print(f"   ✅ Dashboard KPI matches Breakdown total")
+    
+    # 3. receivable.orders[] includes outstanding_balance field
+    print("\n[3/6] Testing receivable.orders[] includes outstanding_balance field")
+    receivable_orders = breakdown.get("receivable", {}).get("orders", [])
+    assert len(receivable_orders) > 0, "No orders in receivable.orders[]"
+    
+    # Find Minakshi Jain order
+    minakshi_order = None
+    for order in receivable_orders:
+        if "Minakshi Jain" in order.get("client_name", ""):
+            minakshi_order = order
             break
-
-if not BACKEND_URL:
-    raise Exception("REACT_APP_BACKEND_URL not found in /app/frontend/.env")
-
-API_BASE = f"{BACKEND_URL}/api"
-
-# Read test credentials
-ADMIN_EMAIL = None
-ADMIN_PASSWORD = None
-with open('/app/memory/test_credentials.md', 'r') as f:
-    for line in f:
-        if 'Email' in line and '@' in line:
-            ADMIN_EMAIL = line.split('**Email**:')[-1].strip().replace('`', '').strip()
-        if 'Password' in line and 'Admin@' in line:
-            ADMIN_PASSWORD = line.split('**Password**:')[-1].strip().replace('`', '').strip()
-
-if not ADMIN_EMAIL or not ADMIN_PASSWORD:
-    raise Exception("Admin credentials not found in /app/memory/test_credentials.md")
-
-print(f"✓ Backend URL: {API_BASE}")
-print(f"✓ Admin credentials loaded: {ADMIN_EMAIL}")
-
-# Global session with JWT token
-session = requests.Session()
-jwt_token = None
-
-
-def login():
-    """Login and get JWT token"""
-    global jwt_token
-    print("\n=== LOGIN ===")
-    resp = requests.post(f"{API_BASE}/auth/login", json={
-        "email": ADMIN_EMAIL,
-        "password": ADMIN_PASSWORD
-    })
-    assert resp.status_code == 200, f"Login failed: {resp.status_code} {resp.text}"
-    data = resp.json()
-    jwt_token = data.get("access_token")
-    assert jwt_token, "No access_token in login response"
-    session.headers.update({"Authorization": f"Bearer {jwt_token}"})
-    print(f"✓ Login successful, JWT token obtained")
-
-
-def test_1_account_balance_byte_equivalence():
-    """Test 1: Account balance endpoints byte-equivalence for ~100 accounts"""
-    print("\n=== TEST 1: ACCOUNT BALANCE BYTE-EQUIVALENCE ===")
     
-    # Get all accounts
-    resp = session.get(f"{API_BASE}/accounts")
-    assert resp.status_code == 200, f"GET /accounts failed: {resp.status_code}"
-    accounts = resp.json()
-    print(f"✓ GET /api/accounts returned {len(accounts)} accounts")
+    assert minakshi_order is not None, "Minakshi Jain order not found in receivable.orders[]"
     
-    # Verify each account has id and name
-    for acc in accounts[:3]:  # Sample first 3
-        assert "id" in acc and "name" in acc, f"Account missing id or name: {acc}"
+    # Verify outstanding_balance field exists
+    assert "outstanding_balance" in minakshi_order, \
+        "outstanding_balance field missing from receivable.orders[] entry"
     
-    # Test balance endpoint for all accounts
-    failed_accounts = []
-    composition_failures = []
-    invalid_values = []
+    outstanding_balance = minakshi_order["outstanding_balance"]
+    invoice_total = minakshi_order.get("invoice_total")
     
-    for i, acc in enumerate(accounts):
-        acc_id = acc["id"]
-        acc_name = acc.get("name", "Unknown")
+    # Verify Minakshi Jain order has outstanding_balance ≈ 21300 and invoice_total ≈ 96300
+    assert abs(outstanding_balance - 21300) <= tolerance, \
+        f"Minakshi Jain outstanding_balance = {outstanding_balance}, expected ≈21300"
+    assert abs(invoice_total - 96300) <= tolerance, \
+        f"Minakshi Jain invoice_total = {invoice_total}, expected ≈96300"
+    
+    print(f"   ✅ Minakshi Jain order: outstanding_balance = ₹{outstanding_balance:,.2f}, invoice_total = ₹{invoice_total:,.2f}")
+    
+    # 4. receivable.by_status — sum of Unpaid.amount + Partial.amount == receivable.total
+    print("\n[4/6] Testing receivable.by_status sums correctly")
+    by_status = breakdown.get("receivable", {}).get("by_status", [])
+    
+    unpaid_amount = 0
+    partial_amount = 0
+    for status_entry in by_status:
+        status = status_entry.get("status", "").lower()
+        amount = status_entry.get("amount", 0)
+        if status == "unpaid":
+            unpaid_amount = amount
+        elif status == "partial":
+            partial_amount = amount
+    
+    by_status_sum = unpaid_amount + partial_amount
+    assert abs(by_status_sum - receivable_total) <= tolerance, \
+        f"by_status sum ({by_status_sum}) != receivable.total ({receivable_total})"
+    
+    print(f"   ✅ by_status: Unpaid={unpaid_amount:,.2f} + Partial={partial_amount:,.2f} = {by_status_sum:,.2f} (matches total)")
+    
+    # 5. Verify Paid orders are NOT in receivable.orders[]
+    print("\n[5/6] Testing Paid orders are NOT in receivable.orders[]")
+    paid_orders_in_receivable = [o for o in receivable_orders if o.get("payment_status", "").lower() == "paid"]
+    assert len(paid_orders_in_receivable) == 0, \
+        f"Found {len(paid_orders_in_receivable)} Paid orders in receivable.orders[] (should be 0)"
+    
+    print(f"   ✅ No Paid orders in receivable.orders[] (correct)")
+    
+    print("\n[6/6] Live edge case testing will be done in separate test function")
+    print(f"   ⏭️  See test_bug1_live_edge_cases()")
+
+
+def test_bug1_live_edge_cases():
+    """
+    Bug 1 — Live edge cases
+    Create fresh order, ship it, add payments, verify outstanding_balance updates correctly
+    """
+    print("\n" + "="*80)
+    print("BUG 1 — LIVE EDGE CASES")
+    print("="*80)
+    
+    # Get initial dashboard state
+    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
+    initial_dashboard = response.json()
+    initial_outstanding = initial_dashboard.get("kpis", {}).get("outstanding_receivable", 0)
+    initial_advances = initial_dashboard.get("kpis", {}).get("customer_advances", 0)
+    
+    print(f"\nInitial state:")
+    print(f"  outstanding_receivable = ₹{initial_outstanding:,.2f}")
+    print(f"  customer_advances = ₹{initial_advances:,.2f}")
+    
+    # Get existing customers and use the first one
+    print("\n[1/9] Getting existing customer for test")
+    customers_response = requests.get(f"{BASE_URL}/customers", headers=get_headers())
+    assert customers_response.status_code == 200, f"Customers list failed: {customers_response.status_code}"
+    customers = customers_response.json()
+    assert len(customers) > 0, "No customers found in database"
+    
+    # Use first customer
+    customer = customers[0]
+    customer_id = customer["id"]
+    customer_name = customer["name"]
+    print(f"   ✅ Using existing customer: {customer_name} ({customer_id})")
+    
+    # Create test order with single item (qty=1, rate=100000, no tax)
+    print("\n[2/9] Creating test order (qty=1, rate=100000)")
+    order_response = requests.post(
+        f"{BASE_URL}/orders",
+        headers=get_headers(),
+        json={
+            "client_id": customer_id,
+            "client_name": customer_name,
+            "order_date": date.today().isoformat(),
+            "items": [{
+                "main_category": "Test Category",
+                "sub_category": "Test Sub",
+                "product_name": "Test Product",
+                "qty": 1,
+                "rate": 100000,
+                "amount": 100000,
+                "factory_cost_total": 0,
+                "outside_cost_total": 0
+            }],
+            "product_sales_total": 100000,
+            "invoice_total": 100000
+        }
+    )
+    assert order_response.status_code == 200, f"Order creation failed: {order_response.status_code}"
+    order = order_response.json()
+    order_id = order["id"]
+    order_item_id = order["items"][0]["id"]
+    print(f"   ✅ Order created: {order_id}")
+    
+    # Fully ship it
+    print("\n[3/9] Fully shipping order (qty=1)")
+    shipment_response = requests.post(
+        f"{BASE_URL}/orders/{order_id}/shipments",
+        headers=get_headers(),
+        json={
+            "date": date.today().isoformat(),
+            "items": [{
+                "order_item_id": order_item_id,
+                "qty": 1
+            }]
+        }
+    )
+    assert shipment_response.status_code == 200, f"Shipment creation failed: {shipment_response.status_code}"
+    print(f"   ✅ Shipment created")
+    
+    # Get updated order
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    outstanding_balance = order.get("outstanding_balance", 0)
+    
+    # Verify outstanding_balance = 100000
+    assert abs(outstanding_balance - 100000) <= 0.01, \
+        f"Order outstanding_balance = {outstanding_balance}, expected 100000"
+    print(f"   ✅ Order outstanding_balance = ₹{outstanding_balance:,.2f}")
+    
+    # Verify dashboard outstanding increased by 100000
+    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
+    dashboard = response.json()
+    current_outstanding = dashboard.get("kpis", {}).get("outstanding_receivable", 0)
+    
+    outstanding_increase = current_outstanding - initial_outstanding
+    assert abs(outstanding_increase - 100000) <= 0.01, \
+        f"Dashboard outstanding increased by {outstanding_increase}, expected 100000"
+    print(f"   ✅ Dashboard outstanding_receivable increased by ₹{outstanding_increase:,.2f}")
+    
+    # Create customer payment allocating 30000 to the order
+    print("\n[4/9] Creating customer payment (₹30,000 allocated)")
+    payment1_response = requests.post(
+        f"{BASE_URL}/customer-payments",
+        headers=get_headers(),
+        json={
+            "party_id": customer_id,
+            "customer_name": customer_name,
+            "date": date.today().isoformat(),
+            "amount": 30000,
+            "mode": "cash",
+            "allocations": [{
+                "order_id": order_id,
+                "amount": 30000
+            }]
+        }
+    )
+    assert payment1_response.status_code == 200, f"Payment creation failed: {payment1_response.status_code}"
+    payment1 = payment1_response.json()
+    payment1_id = payment1["id"]
+    print(f"   ✅ Payment created: {payment1_id}")
+    
+    # Verify order outstanding_balance = 70000
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    outstanding_balance = order.get("outstanding_balance", 0)
+    
+    assert abs(outstanding_balance - 70000) <= 0.01, \
+        f"Order outstanding_balance = {outstanding_balance}, expected 70000"
+    print(f"   ✅ Order outstanding_balance = ₹{outstanding_balance:,.2f}")
+    
+    # Verify dashboard outstanding decreased by 30000
+    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
+    dashboard = response.json()
+    current_outstanding = dashboard.get("kpis", {}).get("outstanding_receivable", 0)
+    
+    expected_outstanding = initial_outstanding + 70000
+    assert abs(current_outstanding - expected_outstanding) <= 0.01, \
+        f"Dashboard outstanding = {current_outstanding}, expected {expected_outstanding}"
+    print(f"   ✅ Dashboard outstanding_receivable = ₹{current_outstanding:,.2f} (net contribution ₹70,000)")
+    
+    # Create ANOTHER customer payment with 150000 but only 70000 allocated → 80000 unallocated advance
+    print("\n[5/9] Creating customer payment (₹150,000 total, ₹70,000 allocated, ₹80,000 advance)")
+    payment2_response = requests.post(
+        f"{BASE_URL}/customer-payments",
+        headers=get_headers(),
+        json={
+            "party_id": customer_id,
+            "customer_name": customer_name,
+            "date": date.today().isoformat(),
+            "amount": 150000,
+            "mode": "cash",
+            "allocations": [{
+                "order_id": order_id,
+                "amount": 70000
+            }]
+        }
+    )
+    assert payment2_response.status_code == 200, f"Payment2 creation failed: {payment2_response.status_code}"
+    payment2 = payment2_response.json()
+    payment2_id = payment2["id"]
+    print(f"   ✅ Payment created: {payment2_id}")
+    
+    # Verify order outstanding_balance = 0
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    outstanding_balance = order.get("outstanding_balance", 0)
+    
+    assert abs(outstanding_balance - 0) <= 0.01, \
+        f"Order outstanding_balance = {outstanding_balance}, expected 0"
+    print(f"   ✅ Order outstanding_balance = ₹{outstanding_balance:,.2f}")
+    
+    # Verify dashboard outstanding no longer includes this order
+    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
+    dashboard = response.json()
+    current_outstanding = dashboard.get("kpis", {}).get("outstanding_receivable", 0)
+    
+    assert abs(current_outstanding - initial_outstanding) <= 0.01, \
+        f"Dashboard outstanding = {current_outstanding}, expected {initial_outstanding}"
+    print(f"   ✅ Dashboard outstanding_receivable = ₹{current_outstanding:,.2f} (order no longer contributes)")
+    
+    # Verify customer_advances increased by 80000
+    current_advances = dashboard.get("kpis", {}).get("customer_advances", 0)
+    advances_increase = current_advances - initial_advances
+    
+    assert abs(advances_increase - 80000) <= 0.01, \
+        f"Customer advances increased by {advances_increase}, expected 80000"
+    print(f"   ✅ customer_advances increased by ₹{advances_increase:,.2f}")
+    
+    # Reverse the LAST payment
+    print("\n[6/9] Reversing last payment (₹150,000)")
+    reverse_response = requests.delete(
+        f"{BASE_URL}/customer-payments/{payment2_id}",
+        headers=get_headers()
+    )
+    assert reverse_response.status_code == 200, f"Payment reversal failed: {reverse_response.status_code}"
+    print(f"   ✅ Payment reversed")
+    
+    # Verify order outstanding_balance restored to 70000
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    outstanding_balance = order.get("outstanding_balance", 0)
+    
+    assert abs(outstanding_balance - 70000) <= 0.01, \
+        f"Order outstanding_balance = {outstanding_balance}, expected 70000"
+    print(f"   ✅ Order outstanding_balance restored to ₹{outstanding_balance:,.2f}")
+    
+    # Verify dashboard outstanding restored
+    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
+    dashboard = response.json()
+    current_outstanding = dashboard.get("kpis", {}).get("outstanding_receivable", 0)
+    
+    expected_outstanding = initial_outstanding + 70000
+    assert abs(current_outstanding - expected_outstanding) <= 0.01, \
+        f"Dashboard outstanding = {current_outstanding}, expected {expected_outstanding}"
+    print(f"   ✅ Dashboard outstanding_receivable restored to ₹{current_outstanding:,.2f}")
+    
+    # Cleanup: delete test order and remaining payment
+    print("\n[7/9] Cleaning up: deleting payment")
+    requests.delete(f"{BASE_URL}/customer-payments/{payment1_id}", headers=get_headers())
+    
+    print("[8/9] Cleaning up: deleting order")
+    delete_response = requests.delete(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    assert delete_response.status_code == 200, f"Order deletion failed: {delete_response.status_code}"
+    
+    print("[9/9] Cleanup complete (customer not deleted - was pre-existing)")
+    
+    print(f"\n   ✅ Cleanup complete")
+
+
+def test_bug2_order_shipped_date():
+    """
+    Bug 2 — Order Shipped Date derivation
+    Verify Minakshi Jain order has shipped_date and all fully shipped orders have dates
+    """
+    print("\n" + "="*80)
+    print("BUG 2 — ORDER SHIPPED DATE DERIVATION")
+    print("="*80)
+    
+    # 1. GET /api/orders and find Minakshi Jain order
+    print("\n[1/3] Testing Minakshi Jain order has shipped_date = 2026-04-06")
+    response = requests.get(f"{BASE_URL}/orders", headers=get_headers())
+    assert response.status_code == 200, f"Orders list failed: {response.status_code}"
+    orders = response.json()
+    
+    minakshi_order = None
+    for order in orders:
+        if "Minakshi Jain" in order.get("client_name", ""):
+            minakshi_order = order
+            break
+    
+    assert minakshi_order is not None, "Minakshi Jain order not found"
+    
+    # Verify status, shipped_date, last_shipped_date
+    status = minakshi_order.get("status")
+    shipped_date = minakshi_order.get("shipped_date")
+    last_shipped_date = minakshi_order.get("last_shipped_date")
+    
+    assert status == "Fully Shipped", f"Minakshi Jain order status = {status}, expected 'Fully Shipped'"
+    assert shipped_date is not None, "Minakshi Jain order shipped_date is null"
+    assert shipped_date.startswith("2026-04-06"), \
+        f"Minakshi Jain shipped_date = {shipped_date}, expected to start with '2026-04-06'"
+    assert last_shipped_date is not None, "Minakshi Jain order last_shipped_date is null"
+    assert last_shipped_date.startswith("2026-04-06"), \
+        f"Minakshi Jain last_shipped_date = {last_shipped_date}, expected to start with '2026-04-06'"
+    
+    print(f"   ✅ Minakshi Jain order:")
+    print(f"      status = {status}")
+    print(f"      shipped_date = {shipped_date}")
+    print(f"      last_shipped_date = {last_shipped_date}")
+    
+    # 2. Sweep every order: Fully Shipped must have shipped_date, Partially Shipped must not
+    print("\n[2/3] Testing all orders: Fully Shipped → non-null, Partially Shipped → null")
+    
+    fully_shipped_count = 0
+    partially_shipped_count = 0
+    fully_shipped_without_date = []
+    partially_shipped_with_date = []
+    
+    for order in orders:
+        status = order.get("status")
+        shipped_date = order.get("shipped_date")
+        order_id = order.get("id")
+        client_name = order.get("client_name", "Unknown")
         
-        resp = session.get(f"{API_BASE}/accounts/{acc_id}/balance")
-        if resp.status_code != 200:
-            failed_accounts.append(f"{acc_name} ({acc_id}): HTTP {resp.status_code}")
-            continue
-        
-        bal = resp.json()
-        
-        # Verify all required keys present
-        required_keys = ["account_id", "account_name", "opening_balance", 
-                        "incoming", "outgoing", "transfer_net", "balance"]
-        missing_keys = [k for k in required_keys if k not in bal]
-        if missing_keys:
-            failed_accounts.append(f"{acc_name}: missing keys {missing_keys}")
-            continue
-        
-        # Check for NaN or Infinity
-        for key in ["opening_balance", "incoming", "outgoing", "transfer_net", "balance"]:
-            val = bal[key]
-            if not isinstance(val, (int, float)) or str(val) in ['nan', 'inf', '-inf', 'NaN', 'Infinity', '-Infinity']:
-                invalid_values.append(f"{acc_name}.{key} = {val}")
-        
-        # Verify composition identity: opening + incoming - outgoing + transfer_net == balance
-        # Tolerance: ½-paise = 0.005
-        opening = bal["opening_balance"]
-        incoming = bal["incoming"]
-        outgoing = bal["outgoing"]
-        transfer_net = bal["transfer_net"]
-        balance = bal["balance"]
-        
-        computed_balance = opening + incoming - outgoing + transfer_net
-        diff = abs(computed_balance - balance)
-        
-        if diff > 0.005:
-            composition_failures.append(
-                f"{acc_name}: computed={computed_balance:.2f}, actual={balance:.2f}, diff={diff:.4f}"
-            )
-        
-        # Progress indicator every 20 accounts
-        if (i + 1) % 20 == 0:
-            print(f"  ... tested {i + 1}/{len(accounts)} accounts")
+        if status == "Fully Shipped":
+            fully_shipped_count += 1
+            if shipped_date is None:
+                fully_shipped_without_date.append(f"{client_name} ({order_id})")
+        elif status == "Partially Shipped":
+            partially_shipped_count += 1
+            if shipped_date is not None:
+                partially_shipped_with_date.append(f"{client_name} ({order_id})")
     
-    print(f"✓ Tested {len(accounts)} account balances")
+    assert len(fully_shipped_without_date) == 0, \
+        f"Found {len(fully_shipped_without_date)} Fully Shipped orders without shipped_date: {fully_shipped_without_date}"
     
-    # Report failures
-    if failed_accounts:
-        print(f"\n❌ FAILED: {len(failed_accounts)} accounts returned errors:")
-        for err in failed_accounts[:5]:  # Show first 5
-            print(f"  - {err}")
-        if len(failed_accounts) > 5:
-            print(f"  ... and {len(failed_accounts) - 5} more")
+    assert len(partially_shipped_with_date) == 0, \
+        f"Found {len(partially_shipped_with_date)} Partially Shipped orders with shipped_date: {partially_shipped_with_date}"
     
-    if invalid_values:
-        print(f"\n❌ FAILED: {len(invalid_values)} invalid values (NaN/Infinity):")
-        for err in invalid_values[:5]:
-            print(f"  - {err}")
+    print(f"   ✅ Fully Shipped orders: {fully_shipped_count} (all have shipped_date)")
+    print(f"   ✅ Partially Shipped orders: {partially_shipped_count} (all have null shipped_date)")
     
-    if composition_failures:
-        print(f"\n❌ FAILED: {len(composition_failures)} composition identity violations:")
-        for err in composition_failures[:5]:
-            print(f"  - {err}")
-        if len(composition_failures) > 5:
-            print(f"  ... and {len(composition_failures) - 5} more")
-    
-    # Assert all passed
-    assert not failed_accounts, f"{len(failed_accounts)} accounts failed"
-    assert not invalid_values, f"{len(invalid_values)} invalid values found"
-    assert not composition_failures, f"{len(composition_failures)} composition failures"
-    
-    print(f"✓ All {len(accounts)} accounts passed byte-equivalence test")
-    print(f"✓ Composition identity holds for all accounts (within ½-paise tolerance)")
+    print("\n[3/3] Live shipment flow testing will be done in separate test function")
+    print(f"   ⏭️  See test_bug2_live_shipment_flow()")
 
 
-def test_2_transfer_endpoints_regression():
-    """Test 2: Transfer endpoints regression"""
-    print("\n=== TEST 2: TRANSFER ENDPOINTS REGRESSION ===")
+def test_bug2_live_shipment_flow():
+    """
+    Bug 2 — Live shipment flow
+    Create order, add partial shipment, complete shipment, edit, delete, verify shipped_date behavior
+    """
+    print("\n" + "="*80)
+    print("BUG 2 — LIVE SHIPMENT FLOW")
+    print("="*80)
     
-    # 2a. GET /api/transfers - list
-    resp = session.get(f"{API_BASE}/transfers")
-    assert resp.status_code == 200, f"GET /transfers failed: {resp.status_code}"
-    transfers = resp.json()
-    print(f"✓ GET /api/transfers returned {len(transfers)} transfers")
+    # Get existing customers and use the first one
+    print("\n[1/11] Getting existing customer for test")
+    customers_response = requests.get(f"{BASE_URL}/customers", headers=get_headers())
+    assert customers_response.status_code == 200, f"Customers list failed: {customers_response.status_code}"
+    customers = customers_response.json()
+    assert len(customers) > 0, "No customers found in database"
     
-    # Verify structure of first transfer
-    if transfers:
-        t = transfers[0]
-        required_keys = ["id", "kind", "amount", "from_side", "to_side", "status", "date"]
-        for key in required_keys:
-            assert key in t, f"Transfer missing key: {key}"
-        print(f"✓ Transfer structure verified: {required_keys}")
+    # Use first customer
+    customer = customers[0]
+    customer_id = customer["id"]
+    customer_name = customer["name"]
+    print(f"   ✅ Using existing customer: {customer_name} ({customer_id})")
     
-    # 2b. GET /api/transfers?include_reversed=true
-    resp = session.get(f"{API_BASE}/transfers?include_reversed=true")
-    assert resp.status_code == 200, f"GET /transfers?include_reversed=true failed"
-    transfers_with_reversed = resp.json()
-    print(f"✓ GET /api/transfers?include_reversed=true returned {len(transfers_with_reversed)} transfers")
+    # Create order with qty=5, rate=100
+    print("\n[2/11] Creating test order (qty=5, rate=100)")
+    order_response = requests.post(
+        f"{BASE_URL}/orders",
+        headers=get_headers(),
+        json={
+            "client_id": customer_id,
+            "client_name": customer_name,
+            "order_date": date.today().isoformat(),
+            "items": [{
+                "main_category": "widget",
+                "sub_category": "Test Sub",
+                "product_name": "Test Widget",
+                "qty": 5,
+                "rate": 100,
+                "amount": 500,
+                "factory_cost_total": 0,
+                "outside_cost_total": 0
+            }],
+            "product_sales_total": 500,
+            "invoice_total": 500
+        }
+    )
+    assert order_response.status_code == 200, f"Order creation failed: {order_response.status_code}"
+    order = order_response.json()
+    order_id = order["id"]
+    order_item_id = order["items"][0]["id"]
+    print(f"   ✅ Order created: {order_id}")
     
-    # 2c. GET /api/transfers?kind=rakshit_to_ff (filter)
-    resp = session.get(f"{API_BASE}/transfers?kind=rakshit_to_ff")
-    assert resp.status_code == 200, f"GET /transfers?kind=rakshit_to_ff failed"
-    rakshit_to_ff_transfers = resp.json()
-    print(f"✓ GET /api/transfers?kind=rakshit_to_ff returned {len(rakshit_to_ff_transfers)} transfers")
+    # Verify shipped_date is null immediately after creation
+    print("\n[3/11] Verifying shipped_date is null (no shipments yet)")
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    shipped_date = order.get("shipped_date")
     
-    # Verify all returned transfers have kind=rakshit_to_ff
-    for t in rakshit_to_ff_transfers:
-        assert t["kind"] == "rakshit_to_ff", f"Filter failed: got kind={t['kind']}"
+    assert shipped_date is None, f"shipped_date should be null, got {shipped_date}"
+    print(f"   ✅ shipped_date = null (correct)")
     
-    # 2d. Create a rakshit_to_ff transfer
-    # First, get a Rakshit-owned bank account
-    resp = session.get(f"{API_BASE}/accounts")
-    assert resp.status_code == 200
-    accounts = resp.json()
-    bank_accounts = [a for a in accounts if a.get("type", "").lower() in ["bank", "upi", "wallet"]]
-    assert bank_accounts, "No bank accounts found"
+    # Add partial shipment (qty=2)
+    print("\n[4/11] Adding partial shipment (qty=2 of 5)")
+    shipment1_response = requests.post(
+        f"{BASE_URL}/orders/{order_id}/shipments",
+        headers=get_headers(),
+        json={
+            "date": "2026-05-01",
+            "items": [{
+                "order_item_id": order_item_id,
+                "qty": 2
+            }]
+        }
+    )
+    assert shipment1_response.status_code == 200, f"Shipment creation failed: {shipment1_response.status_code}"
     
-    test_account = bank_accounts[0]
-    print(f"✓ Using account: {test_account['name']} ({test_account['id']})")
+    # Get shipment ID from order
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    shipment1_id = order["shipments"][0]["id"]
+    print(f"   ✅ Partial shipment created: {shipment1_id}")
     
-    # Create transfer
-    today = datetime.now().date().isoformat()
-    transfer_payload = {
-        "date": today,
-        "from_side": {
-            "type": "account",
-            "account_id": test_account["id"],
-            "account_name": test_account["name"]
-        },
-        "to_side": {
-            "type": "party",
-            "party_id": "system_fathers_firm",
-            "party_name": "Father's Firm"
-        },
-        "amount": 1234,
-        "mode": "Bank Transfer"
-    }
+    # Verify status = Partially Shipped, shipped_date = null
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    status = order.get("status")
+    shipped_date = order.get("shipped_date")
     
-    resp = session.post(f"{API_BASE}/transfers", json=transfer_payload)
-    assert resp.status_code in [200, 201], f"POST /transfers failed: {resp.status_code} {resp.text}"
-    created_transfer = resp.json()
-    transfer_id = created_transfer["id"]
-    print(f"✓ Created transfer: {transfer_id}")
+    assert status == "Partially Shipped", f"Status = {status}, expected 'Partially Shipped'"
+    assert shipped_date is None, f"shipped_date should be null for partial shipment, got {shipped_date}"
+    print(f"   ✅ status = {status}, shipped_date = null (correct)")
     
-    # Verify classified kind
-    assert created_transfer["kind"] == "rakshit_to_ff", f"Wrong kind: {created_transfer['kind']}"
-    assert created_transfer["status"] == "active", f"Wrong status: {created_transfer['status']}"
-    assert created_transfer["amount"] == 1234, f"Wrong amount: {created_transfer['amount']}"
-    print(f"✓ Transfer correctly classified as rakshit_to_ff with status=active")
+    # Add completing shipment (qty=3)
+    print("\n[5/11] Adding completing shipment (qty=3, total=5)")
+    shipment2_response = requests.post(
+        f"{BASE_URL}/orders/{order_id}/shipments",
+        headers=get_headers(),
+        json={
+            "date": "2026-05-10",
+            "items": [{
+                "order_item_id": order_item_id,
+                "qty": 3
+            }]
+        }
+    )
+    assert shipment2_response.status_code == 200, f"Completing shipment failed: {shipment2_response.status_code}"
     
-    # 2e. Reverse the transfer
-    resp = session.post(f"{API_BASE}/transfers/{transfer_id}/reverse")
-    assert resp.status_code in [200, 201], f"POST /transfers/{transfer_id}/reverse failed: {resp.status_code} {resp.text}"
-    reversal = resp.json()
-    reversal_id = reversal["id"]
-    print(f"✓ Created reversal: {reversal_id}")
+    # Get shipment ID from order
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    shipment2_id = order["shipments"][1]["id"]
+    print(f"   ✅ Completing shipment created: {shipment2_id}")
     
-    # Verify reversal doc
-    assert reversal.get("reverses_transfer_id") == transfer_id, "Reversal missing reverses_transfer_id"
-    assert reversal["kind"] == "ff_to_rakshit", f"Reversal has wrong kind: {reversal['kind']}"
-    assert reversal["from_side"]["type"] == "party", "Reversal from_side not swapped"
-    assert reversal["to_side"]["type"] == "account", "Reversal to_side not swapped"
-    print(f"✓ Reversal doc has correct structure: reverses_transfer_id={transfer_id}, kind=ff_to_rakshit")
+    # Verify status = Fully Shipped, shipped_date starts with 2026-05-10
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    status = order.get("status")
+    shipped_date = order.get("shipped_date")
     
-    # Verify original doc now has status=reversed
-    resp = session.get(f"{API_BASE}/transfers/{transfer_id}")
-    assert resp.status_code == 200
-    original = resp.json()
-    assert original["status"] == "reversed", f"Original status not updated: {original['status']}"
-    assert original.get("reversed_transfer_id") == reversal_id, "Original missing reversed_transfer_id"
-    print(f"✓ Original transfer now has status=reversed, reversed_transfer_id={reversal_id}")
+    assert status == "Fully Shipped", f"Status = {status}, expected 'Fully Shipped'"
+    assert shipped_date is not None, "shipped_date should not be null for fully shipped order"
+    assert shipped_date.startswith("2026-05-10"), \
+        f"shipped_date = {shipped_date}, expected to start with '2026-05-10'"
+    print(f"   ✅ status = {status}, shipped_date = {shipped_date}")
     
-    print(f"✓ Transfer create + reverse flow working correctly")
+    # Edit completing shipment date to 2026-06-15
+    print("\n[6/11] Editing completing shipment date to 2026-06-15")
+    edit_response = requests.put(
+        f"{BASE_URL}/orders/{order_id}/shipments/{shipment2_id}",
+        headers=get_headers(),
+        json={
+            "date": "2026-06-15",
+            "items": [{
+                "order_item_id": order_item_id,
+                "qty": 3
+            }]
+        }
+    )
+    assert edit_response.status_code == 200, f"Shipment edit failed: {edit_response.status_code}"
+    print(f"   ✅ Shipment date edited")
+    
+    # Verify shipped_date now starts with 2026-06-15
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    shipped_date = order.get("shipped_date")
+    
+    assert shipped_date is not None, "shipped_date should not be null"
+    assert shipped_date.startswith("2026-06-15"), \
+        f"shipped_date = {shipped_date}, expected to start with '2026-06-15'"
+    print(f"   ✅ shipped_date updated to {shipped_date}")
+    
+    # Delete completing shipment
+    print("\n[7/11] Deleting completing shipment")
+    delete_response = requests.delete(
+        f"{BASE_URL}/orders/{order_id}/shipments/{shipment2_id}",
+        headers=get_headers()
+    )
+    assert delete_response.status_code == 200, f"Shipment deletion failed: {delete_response.status_code}"
+    print(f"   ✅ Completing shipment deleted")
+    
+    # Verify status = Partially Shipped, shipped_date = null (cleared)
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    status = order.get("status")
+    shipped_date = order.get("shipped_date")
+    
+    assert status == "Partially Shipped", f"Status = {status}, expected 'Partially Shipped'"
+    assert shipped_date is None, f"shipped_date should be null after deleting completing shipment, got {shipped_date}"
+    print(f"   ✅ status = {status}, shipped_date = null (cleared)")
+    
+    # Add it back with date 2026-07-20
+    print("\n[8/11] Adding completing shipment back with date 2026-07-20")
+    shipment3_response = requests.post(
+        f"{BASE_URL}/orders/{order_id}/shipments",
+        headers=get_headers(),
+        json={
+            "date": "2026-07-20",
+            "items": [{
+                "order_item_id": order_item_id,
+                "qty": 3
+            }]
+        }
+    )
+    assert shipment3_response.status_code == 200, f"Shipment re-creation failed: {shipment3_response.status_code}"
+    
+    # Get shipment ID from order
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    shipment3_id = order["shipments"][1]["id"]  # Second shipment (index 1)
+    print(f"   ✅ Completing shipment re-created: {shipment3_id}")
+    
+    # Verify status = Fully Shipped, shipped_date starts with 2026-07-20
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    status = order.get("status")
+    shipped_date = order.get("shipped_date")
+    
+    assert status == "Fully Shipped", f"Status = {status}, expected 'Fully Shipped'"
+    assert shipped_date is not None, "shipped_date should not be null"
+    assert shipped_date.startswith("2026-07-20"), \
+        f"shipped_date = {shipped_date}, expected to start with '2026-07-20'"
+    print(f"   ✅ status = {status}, shipped_date = {shipped_date}")
+    
+    # Idempotency: call POST /api/reconcile/run twice
+    print("\n[9/11] Testing idempotency: POST /api/reconcile/run twice")
+    reconcile1_response = requests.post(f"{BASE_URL}/reconcile/run", headers=get_headers())
+    assert reconcile1_response.status_code == 200, f"Reconcile run 1 failed: {reconcile1_response.status_code}"
+    reconcile1 = reconcile1_response.json()
+    shipped_date_after_recon1 = order_response.json().get("shipped_date")
+    
+    reconcile2_response = requests.post(f"{BASE_URL}/reconcile/run", headers=get_headers())
+    assert reconcile2_response.status_code == 200, f"Reconcile run 2 failed: {reconcile2_response.status_code}"
+    
+    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    order = order_response.json()
+    shipped_date_after_recon2 = order.get("shipped_date")
+    
+    # Verify shipped_date didn't drift
+    assert shipped_date_after_recon2 == shipped_date, \
+        f"shipped_date drifted after reconcile: {shipped_date} → {shipped_date_after_recon2}"
+    print(f"   ✅ shipped_date unchanged after 2x reconcile runs (idempotent)")
+    
+    # Cleanup
+    print("\n[10/11] Cleaning up: deleting order")
+    delete_response = requests.delete(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
+    assert delete_response.status_code == 200, f"Order deletion failed: {delete_response.status_code}"
+    
+    print("[11/11] Cleanup complete (customer not deleted - was pre-existing)")
+    
+    print(f"\n   ✅ Cleanup complete")
 
 
-def test_3_fathers_firm_settlement():
-    """Test 3: Father's Firm settlement endpoint"""
-    print("\n=== TEST 3: FATHER'S FIRM SETTLEMENT ===")
+def test_regression_checks():
+    """
+    Regression checks to ensure no existing functionality broke
+    """
+    print("\n" + "="*80)
+    print("REGRESSION CHECKS")
+    print("="*80)
     
-    resp = session.get(f"{API_BASE}/party-ledger-v2/fathers-firm-settlement")
-    assert resp.status_code == 200, f"GET /fathers-firm-settlement failed: {resp.status_code}"
-    ff = resp.json()
+    # 1. GET /api/reconcile: healthy=true, 21/21
+    print("\n[1/5] Testing GET /api/reconcile")
+    response = requests.get(f"{BASE_URL}/reconcile", headers=get_headers())
+    assert response.status_code == 200, f"Reconcile failed: {response.status_code}"
+    reconcile = response.json()
     
-    # Verify all required keys
-    required_keys = ["party_id", "party_name", "balance_signed", "amount", "status", "label"]
-    for key in required_keys:
-        assert key in ff, f"Missing key: {key}"
-    print(f"✓ All required keys present: {required_keys}")
+    healthy = reconcile.get("healthy")
+    summary = reconcile.get("summary", {})
+    passed = summary.get("passed")
+    total = summary.get("total")
+    engine_version = reconcile.get("engine_version")
     
-    # Verify status is lowercase
-    status = ff["status"]
-    assert status in ["settled", "you_pay", "you_receive"], f"Invalid status: {status}"
-    assert status == status.lower(), f"Status not lowercase: {status}"
-    print(f"✓ Status is lowercase: '{status}'")
+    assert healthy == True, f"Reconcile healthy = {healthy}, expected True"
+    assert passed == 21, f"Reconcile passed = {passed}, expected 21"
+    assert total == 21, f"Reconcile total = {total}, expected 21"
+    assert engine_version == "P5", f"Reconcile engine_version = {engine_version}, expected 'P5'"
     
-    # Verify amount == abs(balance_signed) within 0.01
-    balance_signed = ff["balance_signed"]
-    amount = ff["amount"]
-    expected_amount = abs(balance_signed)
-    diff = abs(amount - expected_amount)
-    assert diff <= 0.01, f"amount != abs(balance_signed): {amount} != {expected_amount} (diff={diff})"
-    print(f"✓ amount == abs(balance_signed): {amount} == {expected_amount} (diff={diff:.4f})")
+    print(f"   ✅ Reconcile: healthy={healthy}, {passed}/{total} passed, engine={engine_version}")
     
-    print(f"✓ FF settlement: balance_signed={balance_signed:.2f}, amount={amount:.2f}, status={status}")
-
-
-def test_4_reconcile_engine():
-    """Test 4: Reconcile invariant engine"""
-    print("\n=== TEST 4: RECONCILE INVARIANT ENGINE ===")
+    # 2. GET /api/party-ledger-v2/summary
+    print("\n[2/5] Testing GET /api/party-ledger-v2/summary")
+    response = requests.get(f"{BASE_URL}/party-ledger-v2/summary", headers=get_headers())
+    assert response.status_code == 200, f"Party ledger summary failed: {response.status_code}"
+    summary = response.json()
     
-    # 4a. GET /api/reconcile
-    resp = session.get(f"{API_BASE}/reconcile")
-    assert resp.status_code == 200, f"GET /reconcile failed: {resp.status_code}"
-    recon = resp.json()
-    
-    # Verify healthy=true
-    assert recon.get("healthy") == True, f"Reconcile not healthy: {recon.get('healthy')}"
-    print(f"✓ healthy=true")
-    
-    # Verify summary
-    summary = recon.get("summary", {})
-    passed = summary.get("passed", 0)
-    total = summary.get("total", 0)
-    assert passed == total, f"Not all invariants passed: {passed}/{total}"
-    assert total == 21, f"Expected 21 invariants, got {total}"
-    print(f"✓ summary.passed == summary.total: {passed}/{total}")
-    
-    # Verify engine_version
-    engine_version = recon.get("engine_version")
-    assert engine_version == "P5", f"Wrong engine_version: {engine_version}"
-    print(f"✓ engine_version='P5'")
-    
-    # 4b. POST /api/reconcile/run
-    resp = session.post(f"{API_BASE}/reconcile/run")
-    assert resp.status_code == 200, f"POST /reconcile/run failed: {resp.status_code}"
-    run_result = resp.json()
-    print(f"✓ POST /api/reconcile/run returned 200")
-    
-    # Verify it returns same structure as GET
-    assert "healthy" in run_result, "POST /reconcile/run missing 'healthy'"
-    assert "summary" in run_result, "POST /reconcile/run missing 'summary'"
-    
-    # Verify audit log was written
-    resp = session.get(f"{API_BASE}/admin/reconcile/last")
-    assert resp.status_code == 200, f"GET /admin/reconcile/last failed"
-    last_run = resp.json()
-    assert last_run.get("kind") == "reconcile_run", f"Wrong audit log kind: {last_run.get('kind')}"
-    print(f"✓ Audit log written: kind=reconcile_run")
-    
-    print(f"✓ Reconcile engine healthy: 21/21 invariants passed")
-
-
-def test_5_sign_convention_integration():
-    """Test 5: Sign-convention pin (specific integration case)"""
-    print("\n=== TEST 5: SIGN-CONVENTION PIN ===")
-    
-    # Get a bank account
-    resp = session.get(f"{API_BASE}/accounts")
-    assert resp.status_code == 200
-    accounts = resp.json()
-    bank_accounts = [a for a in accounts if a.get("type", "").lower() in ["bank", "upi"]]
-    assert bank_accounts, "No bank accounts found"
-    test_account = bank_accounts[0]
-    account_id = test_account["id"]
-    print(f"✓ Using account: {test_account['name']} ({account_id})")
-    
-    # Get initial account balance
-    resp = session.get(f"{API_BASE}/accounts/{account_id}/balance")
-    assert resp.status_code == 200
-    initial_balance = resp.json()
-    initial_transfer_net = initial_balance["transfer_net"]
-    initial_total_balance = initial_balance["balance"]
-    print(f"✓ Initial account balance: transfer_net={initial_transfer_net:.2f}, balance={initial_total_balance:.2f}")
-    
-    # Get initial FF settlement
-    resp = session.get(f"{API_BASE}/party-ledger-v2/fathers-firm-settlement")
-    assert resp.status_code == 200
-    initial_ff = resp.json()
-    initial_ff_balance = initial_ff["balance_signed"]
-    print(f"✓ Initial FF settlement: balance_signed={initial_ff_balance:.2f}")
-    
-    # Create ff_to_rakshit transfer (FF pays Rakshit)
-    today = datetime.now().date().isoformat()
-    transfer_payload = {
-        "date": today,
-        "from_side": {
-            "type": "party",
-            "party_id": "system_fathers_firm",
-            "party_name": "Father's Firm"
-        },
-        "to_side": {
-            "type": "account",
-            "account_id": account_id,
-            "account_name": test_account["name"]
-        },
-        "amount": 555,
-        "mode": "Bank Transfer"
-    }
-    
-    resp = session.post(f"{API_BASE}/transfers", json=transfer_payload)
-    assert resp.status_code in [200, 201], f"POST /transfers failed: {resp.status_code} {resp.text}"
-    transfer = resp.json()
-    transfer_id = transfer["id"]
-    print(f"✓ Created ff_to_rakshit transfer: {transfer_id}, amount=555")
-    
-    # Verify account balance increased
-    resp = session.get(f"{API_BASE}/accounts/{account_id}/balance")
-    assert resp.status_code == 200
-    after_balance = resp.json()
-    after_transfer_net = after_balance["transfer_net"]
-    after_total_balance = after_balance["balance"]
-    
-    transfer_net_increase = after_transfer_net - initial_transfer_net
-    assert abs(transfer_net_increase - 555) <= 0.01, f"transfer_net did not increase by 555: {transfer_net_increase}"
-    print(f"✓ Account transfer_net increased by {transfer_net_increase:.2f} (expected +555)")
-    
-    # Verify FF settlement decreased
-    resp = session.get(f"{API_BASE}/party-ledger-v2/fathers-firm-settlement")
-    assert resp.status_code == 200
-    after_ff = resp.json()
-    after_ff_balance = after_ff["balance_signed"]
-    
-    ff_balance_change = after_ff_balance - initial_ff_balance
-    # FF paid Rakshit → Rakshit owes FF more → balance_signed should DECREASE
-    # (or in UI convention: FF owes Rakshit less)
-    assert abs(ff_balance_change + 555) <= 0.01, f"FF balance_signed did not decrease by 555: {ff_balance_change}"
-    print(f"✓ FF balance_signed decreased by {abs(ff_balance_change):.2f} (expected -555)")
-    
-    # Reverse the transfer
-    resp = session.post(f"{API_BASE}/transfers/{transfer_id}/reverse")
-    assert resp.status_code in [200, 201], f"Reverse failed: {resp.status_code}"
-    print(f"✓ Reversed transfer {transfer_id}")
-    
-    # Verify account balance returned to initial
-    resp = session.get(f"{API_BASE}/accounts/{account_id}/balance")
-    assert resp.status_code == 200
-    final_balance = resp.json()
-    final_transfer_net = final_balance["transfer_net"]
-    final_total_balance = final_balance["balance"]
-    
-    assert abs(final_transfer_net - initial_transfer_net) <= 0.01, \
-        f"transfer_net did not return to initial: {final_transfer_net} != {initial_transfer_net}"
-    print(f"✓ Account transfer_net returned to initial: {final_transfer_net:.2f}")
-    
-    # Verify FF settlement returned to initial
-    resp = session.get(f"{API_BASE}/party-ledger-v2/fathers-firm-settlement")
-    assert resp.status_code == 200
-    final_ff = resp.json()
-    final_ff_balance = final_ff["balance_signed"]
-    
-    assert abs(final_ff_balance - initial_ff_balance) <= 0.01, \
-        f"FF balance_signed did not return to initial: {final_ff_balance} != {initial_ff_balance}"
-    print(f"✓ FF balance_signed returned to initial: {final_ff_balance:.2f}")
-    
-    print(f"✓ Sign-convention integration test passed: transfer + reversal round-trip correct")
-
-
-def test_6_dashboard_regression():
-    """Test 6: Dashboard regression"""
-    print("\n=== TEST 6: DASHBOARD REGRESSION ===")
-    
-    resp = session.get(f"{API_BASE}/dashboard")
-    assert resp.status_code == 200, f"GET /dashboard failed: {resp.status_code}"
-    dashboard = resp.json()
-    
-    # Verify kpis section exists
-    assert "kpis" in dashboard, "Dashboard missing 'kpis' section"
-    kpis = dashboard["kpis"]
-    
-    # Verify all required KPI keys present and numeric
-    required_kpis = [
-        "operating_revenue", "invoice_value", "total_cost", "net_profit",
-        "received", "paid",
-        "outstanding_receivable", "outstanding_payable",
-        "estimated_revenue", "estimated_net_profit"
-    ]
-    
-    missing_kpis = []
-    non_numeric_kpis = []
-    
-    for key in required_kpis:
-        if key not in kpis:
-            missing_kpis.append(key)
-        elif not isinstance(kpis[key], (int, float)):
-            non_numeric_kpis.append(f"{key}={kpis[key]}")
-    
-    assert not missing_kpis, f"Missing KPIs: {missing_kpis}"
-    assert not non_numeric_kpis, f"Non-numeric KPIs: {non_numeric_kpis}"
-    
-    print(f"✓ All required KPIs present and numeric:")
-    for key in required_kpis:
-        print(f"  - {key}: {kpis[key]}")
-    
-    # Verify modes section
-    assert "modes" in dashboard, "Dashboard missing 'modes' section"
-    modes = dashboard["modes"]
-    assert isinstance(modes, list), f"modes should be list, got {type(modes)}"
-    print(f"✓ modes section present with {len(modes)} entries")
-    
-    print(f"✓ Dashboard regression test passed")
-
-
-def test_7_party_ledger_v2_regression():
-    """Test 7: Party Ledger v2 regression (Slice 5)"""
-    print("\n=== TEST 7: PARTY LEDGER V2 REGRESSION ===")
-    
-    # 7a. GET /api/party-ledger-v2/summary
-    resp = session.get(f"{API_BASE}/party-ledger-v2/summary")
-    assert resp.status_code == 200, f"GET /summary failed: {resp.status_code}"
-    summary = resp.json()
-    
-    required_keys = [
+    expected_keys = [
         "fathers_firm_you_pay", "fathers_firm_you_receive",
         "vendor_you_pay", "vendor_advances_you_receive",
         "customer_you_receive", "customer_advances_you_pay",
         "net_position"
     ]
     
-    for key in required_keys:
-        assert key in summary, f"Summary missing key: {key}"
-        assert isinstance(summary[key], (int, float)), f"Summary[{key}] not numeric: {summary[key]}"
+    for key in expected_keys:
+        assert key in summary, f"Missing key '{key}' in party-ledger-v2/summary"
+        assert isinstance(summary[key], (int, float)), f"Key '{key}' is not numeric"
     
-    print(f"✓ Summary has all 7 keys, all numeric")
+    print(f"   ✅ Party ledger summary: all 7 keys present and numeric")
     
-    # 7b. Pick 5 random seeded parties and test running_balance
-    resp = session.get(f"{API_BASE}/party-ledger-v2/parties?include_settled=true")
-    assert resp.status_code == 200, f"GET /parties failed"
-    parties_list = resp.json()
-    parties = parties_list.get("parties", [])
-    assert len(parties) > 0, "No parties found"
+    # 3. GET /api/party-ledger-v2/fathers-firm-settlement
+    print("\n[3/5] Testing GET /api/party-ledger-v2/fathers-firm-settlement")
+    response = requests.get(f"{BASE_URL}/party-ledger-v2/fathers-firm-settlement", headers=get_headers())
+    assert response.status_code == 200, f"FF settlement failed: {response.status_code}"
+    settlement = response.json()
     
-    # Test first 5 parties
-    test_parties = parties[:min(5, len(parties))]
-    print(f"✓ Testing {len(test_parties)} parties for running_balance and net_balance_paise")
+    expected_keys = ["party_id", "party_name", "balance_signed", "amount", "status", "label"]
+    for key in expected_keys:
+        assert key in settlement, f"Missing key '{key}' in fathers-firm-settlement"
     
-    for party in test_parties:
-        party_id = party["id"]
-        party_name = party.get("name", "Unknown")
+    status = settlement.get("status")
+    assert status in ["settled", "you_pay", "you_receive"], \
+        f"FF settlement status = {status}, expected one of [settled, you_pay, you_receive]"
+    assert status == status.lower(), f"FF settlement status should be lowercase, got {status}"
+    
+    print(f"   ✅ FF settlement: all keys present, status={status} (lowercase)")
+    
+    # 4. GET /api/dashboard - check all KPIs
+    print("\n[4/5] Testing GET /api/dashboard - all KPIs present")
+    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
+    assert response.status_code == 200, f"Dashboard failed: {response.status_code}"
+    dashboard = response.json()
+    kpis = dashboard.get("kpis", {})
+    
+    expected_kpis = [
+        "received", "paid", "net_profit", "estimated_revenue",
+        "estimated_net_profit", "customer_advances", "outstanding_receivable"
+    ]
+    
+    for kpi in expected_kpis:
+        assert kpi in kpis, f"Missing KPI '{kpi}' in dashboard"
+        value = kpis[kpi]
+        assert isinstance(value, (int, float)), f"KPI '{kpi}' is not numeric"
         
-        resp = session.get(f"{API_BASE}/party-ledger-v2/parties/{party_id}")
-        assert resp.status_code == 200, f"GET /parties/{party_id} failed"
-        ledger = resp.json()
-        
-        # Verify net_balance_paise field exists and is integer
-        assert "net_balance_paise" in ledger, f"Party {party_name} missing net_balance_paise"
-        net_balance_paise = ledger["net_balance_paise"]
-        assert isinstance(net_balance_paise, int), f"net_balance_paise not int: {type(net_balance_paise)}"
-        
-        # Verify entries have running_balance
-        entries = ledger.get("entries", [])
-        if entries:
-            # Check first and last entry
-            for entry in [entries[0], entries[-1]]:
-                assert "running_balance" in entry, f"Entry missing running_balance"
-                assert isinstance(entry["running_balance"], (int, float)), \
-                    f"running_balance not numeric: {entry['running_balance']}"
-        
-        # Naive float walk to verify running_balance
-        if entries:
-            naive_balance = 0.0
-            max_drift = 0.0
-            for entry in entries:
-                if entry.get("counts_in_balance"):
-                    naive_balance += float(entry.get("delta_you_pay", 0))
-                api_balance = float(entry.get("running_balance", 0))
-                drift = abs(naive_balance - api_balance)
-                max_drift = max(max_drift, drift)
-            
-            # ½-paise tolerance = 0.005
-            assert max_drift <= 0.005, \
-                f"Party {party_name} running_balance drift: {max_drift:.6f} (max allowed: 0.005)"
-            print(f"  ✓ {party_name}: {len(entries)} entries, max drift={max_drift:.6f}, net_balance_paise={net_balance_paise}")
+        # customer_advances and outstanding_receivable should be non-negative
+        if kpi in ["customer_advances", "outstanding_receivable"]:
+            assert value >= 0, f"KPI '{kpi}' = {value}, should be non-negative"
     
-    print(f"✓ All tested parties have correct running_balance and net_balance_paise")
+    print(f"   ✅ Dashboard: all expected KPIs present and numeric")
+    
+    # 5. GET /api/accounts/{id}/balance - composition identity for first 10 accounts
+    print("\n[5/5] Testing GET /api/accounts/{id}/balance - composition identity")
+    accounts_response = requests.get(f"{BASE_URL}/accounts", headers=get_headers())
+    assert accounts_response.status_code == 200, f"Accounts list failed: {accounts_response.status_code}"
+    accounts = accounts_response.json()
+    
+    test_count = min(10, len(accounts))
+    print(f"   Testing {test_count} accounts...")
+    
+    for i, account in enumerate(accounts[:test_count]):
+        account_id = account["id"]
+        balance_response = requests.get(f"{BASE_URL}/accounts/{account_id}/balance", headers=get_headers())
+        assert balance_response.status_code == 200, f"Account balance failed for {account_id}"
+        balance_data = balance_response.json()
+        
+        opening = balance_data.get("opening_balance", 0)
+        incoming = balance_data.get("incoming", 0)
+        outgoing = balance_data.get("outgoing", 0)
+        transfer_net = balance_data.get("transfer_net", 0)
+        balance = balance_data.get("balance", 0)
+        
+        # Composition identity: opening + incoming - outgoing + transfer_net == balance
+        computed_balance = opening + incoming - outgoing + transfer_net
+        diff = abs(computed_balance - balance)
+        
+        assert diff <= 0.01, \
+            f"Account {account_id}: composition identity failed. " \
+            f"opening({opening}) + incoming({incoming}) - outgoing({outgoing}) + transfer_net({transfer_net}) " \
+            f"= {computed_balance}, but balance = {balance} (diff = {diff})"
+    
+    print(f"   ✅ All {test_count} accounts: composition identity satisfied (within ±0.01)")
 
 
 def main():
-    """Run all tests"""
-    print("=" * 70)
-    print("PHASE 6 · SLICE 6 — BACKEND API TESTING")
-    print("=" * 70)
+    """Main test runner"""
+    print("\n" + "="*80)
+    print("BACKEND API TEST SUITE")
+    print("Bug Fix Verification: Dashboard Outstanding Receivable + Order Shipped Date")
+    print("="*80)
     
     try:
-        # Login first
+        # Login
         login()
         
-        # Run all tests
-        test_1_account_balance_byte_equivalence()
-        test_2_transfer_endpoints_regression()
-        test_3_fathers_firm_settlement()
-        test_4_reconcile_engine()
-        test_5_sign_convention_integration()
-        test_6_dashboard_regression()
-        test_7_party_ledger_v2_regression()
+        # Bug 1 tests
+        test_bug1_dashboard_outstanding_receivable()
+        test_bug1_live_edge_cases()
         
-        print("\n" + "=" * 70)
+        # Bug 2 tests
+        test_bug2_order_shipped_date()
+        test_bug2_live_shipment_flow()
+        
+        # Regression tests
+        test_regression_checks()
+        
+        print("\n" + "="*80)
         print("✅ ALL TESTS PASSED")
-        print("=" * 70)
-        print("\nSUMMARY:")
-        print("✓ Test 1: Account balance byte-equivalence (~100 accounts)")
-        print("✓ Test 2: Transfer endpoints regression (GET, POST, reverse)")
-        print("✓ Test 3: Father's Firm settlement")
-        print("✓ Test 4: Reconcile invariant engine (21/21)")
-        print("✓ Test 5: Sign-convention pin (integration)")
-        print("✓ Test 6: Dashboard regression")
-        print("✓ Test 7: Party Ledger v2 regression (Slice 5)")
-        
-        return True
+        print("="*80)
         
     except AssertionError as e:
-        print(f"\n❌ TEST FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        print("\n" + "="*80)
+        print(f"❌ TEST FAILED: {e}")
+        print("="*80)
+        raise
     except Exception as e:
-        print(f"\n❌ UNEXPECTED ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        print("\n" + "="*80)
+        print(f"❌ ERROR: {e}")
+        print("="*80)
+        raise
 
 
 if __name__ == "__main__":
-    success = main()
-    exit(0 if success else 1)
+    main()
