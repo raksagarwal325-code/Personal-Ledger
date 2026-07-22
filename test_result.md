@@ -1102,6 +1102,64 @@ frontend:
           Phase 4 is now fully verified and working as specified.
 
 backend:
+  - task: "Bug fix — Packing default vendor = Father's Firm / Factory (auto-link when blank on new orders, no historical backfill)"
+    implemented: true
+    working: "NA"
+    file: "backend/server.py, backend/tests/test_bug_packing_ff_default.py, frontend/src/components/OrderDialog.jsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          Bug fix landed 2026-07-22. Business rule (per user):
+
+            • Default packing vendor is Father's Firm / Factory. When
+              `packing_cost > 0` and no explicit `packer_name` on a NEW
+              order, the auto-generated packing Purchase is stamped with
+              `vendor_party_id=SYSTEM_FF_ID` (via existing FF alias route).
+            • Users may still select any other vendor for exceptions.
+            • Exactly ONE linked packing Purchase per order (deterministic
+              `linked_source_key = {order_id}::order::packing`). Repeated
+              syncs never duplicate.
+            • FF-linked packing purchase REDUCES the Father's Firm
+              settlement (Rakshit owes FF for what FF/Factory paid) via
+              the existing FF party-ledger v2 derivation.
+            • Preserved: vendor payable linkage, idempotency, edits,
+              reversals, reconciliation.
+            • NO auto-backfill of historical entries — historical orders
+              stamped `packing_ff_default=False` by idempotent startup
+              migration. PUT preserves the stored flag (mirrors the
+              `gst_ff_settle` preservation pattern).
+            • Only NEW orders opt in (`packing_ff_default=True` forced by
+              POST /orders).
+
+          Files:
+            - `backend/server.py`:
+                * `OrderBase.packing_ff_default: bool = False` field.
+                * POST /orders forces `packing_ff_default=True`.
+                * PUT /orders preserves stored flag.
+                * `_sync_order_linked_packing_purchases` defaults to
+                  SYSTEM_FF_NAME when blank packer + flag set.
+                * Startup: idempotent migration stamps historical orders
+                  with `packing_ff_default=False`.
+            - `frontend/src/components/OrderDialog.jsx`: removed the hard
+              save-block validation; updated hint/placeholder text.
+            - `backend/tests/test_bug_packing_ff_default.py` (NEW): 10 tests.
+            - `backend/tests/test_bug_vendor_party_linkage.py`: updated
+              `test_blank_packer_creates_no_packing_purchase` to reflect
+              the new FF-default behavior.
+
+          Main-agent local pytest:
+            - New test file: 10/10 PASS
+            - Combined bug-fix + reconcile suites: 55/55 PASS
+            - Related P4/P6 slice suites: 144/144 PASS
+            - `/api/reconcile` remains healthy (21/21 passed).
+
+          Testing agent, please independently verify the 6 scenarios listed
+          in `agent_communication` at the end of this file.
+
   - task: "Bug fix — GST settlement with Father's Firm at invoice time (derived, opt-in for new orders)"
     implemented: true
     working: true
@@ -3114,12 +3172,91 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Bug fix — GST settlement with Father's Firm at invoice time (derived, opt-in for new orders)"
+    - "Bug fix — Packing default vendor = Father's Firm / Factory (auto-link when blank on new orders, no historical backfill)"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
 
 agent_communication:
+  - agent: "main"
+    message: |
+      Implemented bug fix: Packing default vendor = Father's Firm / Factory.
+
+      **Business rule (user, 2026-07-22):**
+      - Default packing vendor is Father's Firm / Factory. When `packing_cost > 0`
+        and no explicit `packer_name` is selected on a NEW order, the auto-linked
+        packing Purchase is stamped with `vendor_party_id=SYSTEM_FF_ID`.
+      - Users can still override with any vendor for exceptional cases.
+      - Packing cost creates/updates EXACTLY ONE linked Purchase per order
+        (deterministic `linked_source_key = {order_id}::order::packing`).
+      - The FF-linked packing purchase reduces the FF settlement (Rakshit owes FF
+        the packing amount FF/Factory pays on his behalf) via the existing FF
+        party-ledger v2 derivation.
+      - Preserved: vendor payable linkage, idempotency, edits, reversals,
+        reconciliation.
+      - **NO historical backfill**: historical orders keep `packing_ff_default=False`
+        (stamped by idempotent startup migration) so blank packer_name on them
+        continues to mean "internal expense, no vendor bill".
+
+      **Files changed:**
+      - `backend/server.py`:
+        - `OrderBase` model: added `packing_ff_default: bool = False` field.
+        - `POST /api/orders`: forces `packing_ff_default=True` on create.
+        - `PUT /api/orders`: preserves stored `packing_ff_default` flag (mirrors
+          the `gst_ff_settle` preservation pattern).
+        - `_sync_order_linked_packing_purchases`: when `packer_name` is blank AND
+          `packing_ff_default=True` AND `packing_cost > 0`, the effective packer
+          defaults to `SYSTEM_FF_NAME` (routes to `SYSTEM_FF_ID` via existing
+          `is_ff_alias` short-circuit). Notes are tagged `default: Father's Firm
+          / Factory` for traceability.
+        - Startup: idempotent migration stamps every pre-existing order with
+          `packing_ff_default=False` (opt-out).
+        - Import: added `SYSTEM_FF_NAME` from `party_sync`.
+      - `frontend/src/components/OrderDialog.jsx`:
+        - Removed the hard save-block validation that required a packer_name
+          when packing_cost > 0.
+        - Updated placeholder + hint text to describe the new default behavior
+          (and the historical-order carve-out).
+      - `backend/tests/test_bug_packing_ff_default.py` (NEW): 10 tests
+        covering: blank-packer FF default, explicit packer override,
+        idempotency across edits, FF settlement shift, zero-cost removal,
+        switching between blank/explicit, historical no-backfill, historical
+        with explicit packer still links, reconcile healthy, outstanding
+        purchase visibility.
+      - `backend/tests/test_bug_vendor_party_linkage.py`: updated the
+        `test_blank_packer_creates_no_packing_purchase` test to reflect the
+        new FF-default behavior (the "no purchase on blank" carve-out is now
+        preserved only for historical orders and covered by the new test file).
+
+      **Local pytest results (main-agent run):**
+      - `tests/test_bug_packing_ff_default.py`: 10/10 PASS
+      - Combined bug-fix + reconcile suites (55 tests): 55/55 PASS
+      - Related P4/P6 slice suites (144 tests): 144/144 PASS
+      - Reconcile `/api/reconcile` still returns `healthy=True`.
+
+      **Please run the deep_testing_backend_v2 agent** to independently verify
+      these 6 scenarios via the live API:
+
+      1. POST a new order with `packing_cost>0` and `packer_name=""` → confirm
+         a single Purchase exists with `linked_source_key={oid}::order::packing`,
+         `source_type=order_packing_purchase`, `vendor_party_id=system_fathers_firm`.
+         Confirm order response has `packing_ff_default: true`.
+      2. POST a new order with `packing_cost>0` and `packer_name="Some Vendor"`
+         → confirm the linked Purchase uses that vendor's canonical
+         `vendor_party_id` (NOT FF).
+      3. Idempotency: PUT the order twice with unchanged data → the linked
+         packing Purchase must retain identity (same id) and NOT duplicate.
+         Change `packing_cost` → same row updated with new amount.
+      4. FF settlement shift: GET `/api/party-ledger-v2/fathers-firm-settlement`
+         before and after creating an FF-default packing order → confirm
+         `balance_signed` shifts in the "you_pay" direction (more negative)
+         by at least the packing amount.
+      5. Historical order (direct Mongo insert with `packing_ff_default: false`)
+         → confirm no linked Purchase is auto-created; a subsequent PUT does
+         NOT retroactively opt in (flag remains False).
+      6. Reconcile: `GET /api/reconcile` returns `healthy: true` after all
+         write operations above; `passed: 21`, `failed: 0`.
+
   - agent: "testing"
     message: |
       ✅ FRONTEND POLISH — ROUND 2 RE-VERIFICATION COMPLETE — ALL 3 PRIORITY SCENARIOS PASSED

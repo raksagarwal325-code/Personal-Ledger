@@ -410,8 +410,13 @@ class TestPackingPurchaseAutoSync:
             _delete(f"/api/orders/{o['id']}", token)
 
     def test_blank_packer_creates_no_packing_purchase(self, token):
-        """packing_cost > 0 without a packer_name must NOT emit a Purchase
-        (treated as internal expense; nothing to link)."""
+        """UPDATED (2026-07-22, packing-FF-default bug): NEW orders opt in
+        to packing_ff_default=True, so a blank packer_name auto-links the
+        packing Purchase to Father's Firm / Factory (SYSTEM_FF_ID). The
+        prior "no purchase on blank packer" behavior is preserved ONLY for
+        historical orders (packing_ff_default=False) — covered by
+        `test_bug_packing_ff_default.py::test_historical_order_not_auto_backfilled`.
+        """
         o = _make_order_with_packing(
             token, client="TestClient_Packing_B",
             packer_name="", packing_cost=100,
@@ -420,7 +425,9 @@ class TestPackingPurchaseAutoSync:
             pack_pur = _find_linked_purchase(
                 token, order_id=o["id"], source_type="order_packing_purchase"
             )
-            assert pack_pur is None
+            # New behavior: FF-default auto-link.
+            assert pack_pur is not None
+            assert pack_pur.get("vendor_party_id") == "system_fathers_firm"
         finally:
             _delete(f"/api/orders/{o['id']}", token)
 

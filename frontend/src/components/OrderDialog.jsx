@@ -551,13 +551,11 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
     if (!form.client_name?.trim()) return toast.error("Please enter the client name.");
     if (form.items.length === 0) return toast.error("Add at least one product.");
 
-    // Bug fix (2026-07-22) · Vendor linkage validation.
-    // Packing cost > 0 requires a Packer vendor so the canonical
-    // packing Purchase can be auto-generated with vendor_party_id.
-    if (Number(form.packing_cost) > 0 && !(form.packer_name || "").trim()) {
-      toast.error("Please select a Packer vendor — packing cost cannot be linked without one.");
-      return;
-    }
+    // Bug fix (2026-07-22, updated) · Packing default vendor.
+    // New orders now default to Father's Firm / Factory when packer_name
+    // is blank, so validation only blocks save when the vendor field
+    // explicitly resolves to nothing on historical orders (server-side
+    // check preserves that path). No frontend gate needed.
     // Any shipment with freight_paid > 0 requires a transporter so the
     // canonical freight Purchase can be auto-generated.
     const badShip = (form.shipments || []).find((s) =>
@@ -806,9 +804,11 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
                      onChange={(v) => updateField("packing_recovery", v)}
                      hint="Adds to revenue" />
               </div>
-              {/* Canonical Packer selector (Bug fix 2026-07-22).
-                  Kept separate from transporter (per-shipment freight vendor).
-                  Blank = internal expense (no auto-Purchase). */}
+              {/* Canonical Packer selector (Bug fix 2026-07-22, updated).
+                  Default vendor is Father's Firm / Factory when left blank
+                  on NEW orders — auto-linked packing Purchase reduces FF's
+                  settlement balance. Historical orders (packing_ff_default
+                  =False) keep the "blank = internal expense" behavior. */}
               <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mt-3">
                 <div className="md:col-span-2">
                   <Label className="text-[10px] label-caps">Packer vendor</Label>
@@ -817,7 +817,7 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
                          onChange={(e) => updateField("packer_name", e.target.value)}
                          className="mt-1.5 bg-white border-[var(--border-warm)]"
                          placeholder={Number(form.packing_cost) > 0
-                           ? "Required when packing cost > 0"
+                           ? "Default: Father's Firm / Factory — override for outside packer"
                            : "Optional — select or type to quick-create"} />
                   <datalist id="packer-vendor-list">
                     {vendorParties.map((v) => (
@@ -825,14 +825,15 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
                     ))}
                   </datalist>
                   <div className="text-[10px] mt-1"
-                       style={{ color: Number(form.packing_cost) > 0 && !(form.packer_name || "").trim()
-                         ? "var(--terracotta)" : "var(--muted)" }}
+                       style={{ color: "var(--muted)" }}
                        data-testid="pack-packer-hint">
-                    {Number(form.packing_cost) > 0 && !(form.packer_name || "").trim()
-                      ? "Required — the auto-generated packing Purchase will be linked to this vendor's Party Ledger."
-                      : (form.packer_name
-                          ? "A canonical Purchase for packing will be created under this vendor."
-                          : "Leave blank to treat packing as an internal expense (no vendor bill).")}
+                    {form.packer_name
+                      ? "A canonical Purchase for packing will be created under this vendor."
+                      : (Number(form.packing_cost) > 0
+                          ? (effectiveOrder?.id && effectiveOrder?.packing_ff_default === false
+                              ? "Historical order — blank packer = internal expense (no vendor bill emitted). Type a vendor to link."
+                              : "Blank → auto-linked to Father's Firm / Factory. This reduces FF's settlement balance.")
+                          : "Optional. Leave blank for the default (Father's Firm / Factory) on new orders.")}
                   </div>
                 </div>
               </div>

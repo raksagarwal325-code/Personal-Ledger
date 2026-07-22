@@ -52,7 +52,7 @@ from party_ledger_v2 import make_router as make_party_ledger_v2_router, ensure_b
 from party_sync import (                                                                                                     # noqa: E402
     get_or_create_customer_party, get_or_create_vendor_party,
     sync_vendor_directory, rename_party, resolve_party,
-    run_party_migration, is_ff_alias, SYSTEM_FF_ID,
+    run_party_migration, is_ff_alias, SYSTEM_FF_ID, SYSTEM_FF_NAME,
 )
 from transfers import (                                                                                                       # noqa: E402
     Transfer, TransferIn, TransferSide,
@@ -234,9 +234,18 @@ class OrderBase(BaseModel):
     # Bug fix (2026-07-22) · Packing vendor linkage.
     # When packing_cost > 0 AND packer_name is set, a canonical Purchase
     # row is auto-created under this vendor (source_type='order_packing_purchase').
-    # If packer_name is empty the packing cost is treated as an internal
-    # expense (no vendor bill emitted).
+    # Bug fix (2026-07-22, updated) · When packer_name is empty AND
+    # packing_ff_default=True (new orders opt-in), the packing purchase is
+    # auto-linked to Father's Firm / Factory (SYSTEM_FF_ID) so packing outgo
+    # is reflected on FF's settlement ledger. Historical orders keep
+    # packing_ff_default=False (stamped by startup migration) so blank
+    # packer_name continues to mean "internal expense, no vendor bill".
     packer_name: Optional[str] = ""
+
+    # Bug fix (2026-07-22) · Packing default vendor = Father's Firm / Factory.
+    # New orders default to True at API-create time. Historical orders
+    # stamped False by idempotent startup migration.
+    packing_ff_default: bool = False
 
     # Future-ready adjustments — generic descriptor+amount rows
     other_revenue: List[AdjustmentEntry] = []
@@ -1007,27 +1016,54 @@ async def _sync_order_linked_freight_purchases(order: dict) -> dict:
 
 
 async def _sync_order_linked_packing_purchases(order: dict) -> dict:
-    """Emit one Purchase per ORDER with (packer_name, packing_cost > 0).
-    Deterministic key `{order_id}::order::packing`."""
+    """Emit one Purchase per ORDER with packing_cost > 0.
+    Deterministic key `{order_id}::order::packing`.
+
+    Bug fix (2026-07-22, updated) · Packing default vendor is Father's Firm /
+    Factory. When packer_name is blank AND `packing_ff_default=True`
+    (new orders opt-in), the packing purchase is auto-linked to
+    SYSTEM_FF_ID via the FF alias. Historical orders keep
+    `packing_ff_default=False` (stamped by idempotent startup migration)
+    so blank packer_name continues to mean "no vendor bill" — NEVER
+    auto-backfilled retroactively.
+    """
     order_id = order.get("id")
     if not order_id:
         return {"created": 0, "updated": 0, "deleted": 0, "kept_paid": 0}
 
     created = updated = deleted = kept_paid = 0
-    packer_name = (order.get("packer_name") or "").strip()
+    packer_name_raw = (order.get("packer_name") or "").strip()
     packing_cost = float(order.get("packing_cost") or 0)
+    packing_ff_default = bool(order.get("packing_ff_default") or False)
     key = f"{order_id}::order::packing"
 
-    should_have = bool(packer_name) and packing_cost > 0.005
+    # Resolve the effective packer:
+    #   • explicit packer_name → use it (may itself be an FF alias).
+    #   • blank + packing_ff_default → route to Father's Firm.
+    #   • blank + no FF default (historical order) → no linked purchase.
+    if packer_name_raw:
+        effective_packer_name = packer_name_raw
+    elif packing_ff_default:
+        effective_packer_name = SYSTEM_FF_NAME
+    else:
+        effective_packer_name = ""
+
+    should_have = bool(effective_packer_name) and packing_cost > 0.005
 
     if should_have:
-        vendor_pid, vendor_name = await _resolve_service_vendor_party(packer_name)
+        vendor_pid, vendor_name = await _resolve_service_vendor_party(effective_packer_name)
         if vendor_name:
             purchase_date = (order.get("order_date") or order.get("shipped_date")
                              or datetime.now(timezone.utc).date().isoformat())
             boxes = float(order.get("boxes_used") or 0)
             desc = "Packing charges" + (f" ({boxes:g} boxes)" if boxes > 0 else "")
-            notes = f"Auto-linked packing from Order {order_id[:8]}"
+            # When falling back to FF default, tag notes so it's easy to
+            # trace in Vendor Party Ledger why this row was created.
+            is_default_ff = (not packer_name_raw) and packing_ff_default
+            notes = (
+                f"Auto-linked packing from Order {order_id[:8]}"
+                + (" · default: Father's Firm / Factory" if is_default_ff else "")
+            )
             res = await _upsert_linked_service_purchase(
                 order_id=order_id,
                 linked_source_key=key,
@@ -1139,6 +1175,13 @@ async def create_order(payload: OrderBase):
     # (startup migration stamps them False) so the balance shift is
     # additive-only and never disturbs old data.
     data["gst_ff_settle"] = True
+    # Bug fix (2026-07-22) · Packing default vendor = Father's Firm / Factory.
+    # New orders opt in to the FF-default packing linkage. When packer_name
+    # is blank AND packing_cost > 0, the auto-generated packing Purchase is
+    # stamped with vendor_party_id=SYSTEM_FF_ID (see
+    # `_sync_order_linked_packing_purchases`). Historical orders keep this
+    # False and continue to treat blank packer_name as an internal expense.
+    data["packing_ff_default"] = True
     order = Order(**data).model_dump()
     compute_order_aggregates(order)
     order["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -1221,6 +1264,12 @@ async def update_order(oid: str, payload: OrderBase):
     if "gst_ff_settle" in existing and payload.gst_ff_settle is False:
         # Caller passed the default False → treat as "no change requested".
         data["gst_ff_settle"] = existing["gst_ff_settle"]
+    # Bug fix (2026-07-22) · Preserve packing_ff_default flag on PUT so
+    # historical orders (stamped False by startup migration) never get
+    # opted into FF-default packing retroactively via a PUT that omits the
+    # field. Mirrors the gst_ff_settle preservation pattern above.
+    if "packing_ff_default" in existing and payload.packing_ff_default is False:
+        data["packing_ff_default"] = existing["packing_ff_default"]
     # Phase 2: preserve customer_party_id when the client name matches or
     # resolves to the same party; changing to a different customer only
     # updates the id when the caller has explicitly reassigned via a fresh
@@ -5318,6 +5367,25 @@ async def _startup():
             )
     except Exception as e:
         logger.error(f"GST-FF-settle historical stamp failed: {e}")
+
+    # Bug fix (2026-07-22): One-time backfill — every ORDER that predates
+    # the packing-FF-default rule keeps packing_ff_default=False so its
+    # blank packer_name is NOT auto-backfilled to Father's Firm. Only NEW
+    # orders (via POST /orders) opt in. Idempotent — subsequent runs no-op.
+    # This explicitly protects historical packing entries per the bug spec
+    # ("Do not backfill historical packing entries automatically").
+    try:
+        res = await db.orders.update_many(
+            {"packing_ff_default": {"$exists": False}},
+            {"$set": {"packing_ff_default": False}},
+        )
+        if res.modified_count:
+            logger.info(
+                f"Packing-FF-default stamp: marked {res.modified_count} pre-existing "
+                "orders as packing_ff_default=False (opt-out for historical data)."
+            )
+    except Exception as e:
+        logger.error(f"Packing-FF-default historical stamp failed: {e}")
 
 
 @app.on_event("shutdown")
