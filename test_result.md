@@ -131,6 +131,57 @@ user_problem_statement: |
       `derive_completion_shipped_date` — no manual entry.
 
 frontend:
+  - task: "Bug fix — Orders table footer column alignment (Realized Rev, Est. Rev, Cost, Realized Profit, Est. Profit, Outstanding all mapped to matching headers)"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/components/OrdersTableFooter.jsx, frontend/src/components/OrdersTableFooter.test.jsx, frontend/src/pages/Orders.jsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          Bug fix landed 2026-07-22. The Orders table `<tfoot>` row was
+          rendering aggregate cells in the wrong columns and the
+          "Est. Profit" total was missing entirely.
+
+          Pre-fix layout emitted only 4 aggregate cells then colSpan=2 for
+          the trailing 3 columns → every value from "Est. Rev" onwards
+          was shifted one column to the left.
+
+          Post-fix: extracted `<OrdersTableFooter>` component with 6
+          dedicated `<td>` aggregate cells (one per header column
+          between [4..9]), colSpan=4 label + colSpan=2 trailing gap.
+          Total colSpan sums to 12 (matches the 12-column `<thead>`).
+
+          Backend calculations and row values were NOT changed. The
+          `totals` memo in `Orders.jsx` was already computing `est_revenue`
+          and `est_profit`; they were simply never rendered in the
+          previous footer.
+
+          Files:
+            - `frontend/src/components/OrdersTableFooter.jsx` (NEW)
+            - `frontend/src/components/OrdersTableFooter.test.jsx` (NEW) —
+              3 focused regression tests: (a) all 6 aggregate cells
+              present, (b) column order + colspan sums to 12, (c) exact
+              totals from the bug report (₹1,10,700 / ₹1,10,700 /
+              ₹84,725 / ₹25,975 / ₹25,975 / ₹38,292) map to the correct
+              testIds.
+            - `frontend/src/pages/Orders.jsx` — imports the new
+              component; inline `<tfoot>` removed.
+            - `frontend/package.json` / `yarn.lock` — added
+              `@testing-library/react@14` + `@testing-library/jest-dom@6.9.1`
+              devDependencies (Node 20 compatible).
+
+          Main-agent local test run:
+            $ CI=true yarn test --testPathPattern=OrdersTableFooter --watchAll=false
+            PASS — 3/3 tests pass.
+
+          Testing agent, please verify the fix in a live browser session
+          per the scenarios listed in `agent_communication` at the end of
+          this file. Also please re-run the added unit test.
+
   - task: "Frontend polish — Canonical vendor linkage in Purchases + Packer/Transporter selectors + validation"
     implemented: true
     working: true
@@ -3172,7 +3223,7 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Bug fix — Packing default vendor = Father's Firm / Factory (auto-link when blank on new orders, no historical backfill)"
+    - "Bug fix — Orders table footer column alignment (Realized Rev, Est. Rev, Cost, Realized Profit, Est. Profit, Outstanding all mapped to matching headers)"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -3180,7 +3231,91 @@ test_plan:
 agent_communication:
   - agent: "main"
     message: |
-      Implemented bug fix: Packing default vendor = Father's Firm / Factory.
+      Applied a frontend-only bug fix: Orders table `<tfoot>` column alignment.
+
+      **The bug (user report):**
+      Footer aggregate values were shifted into the wrong columns and the
+      "Est. Profit" total was missing entirely. Pre-fix layout emitted only
+      4 aggregate cells (Realized Rev, Total Cost, Realized Profit,
+      Outstanding) followed by `colSpan={2}` for the trailing 3 columns —
+      that mis-aligns every cell after "Realized Rev" and hides
+      "Est. Profit" entirely.
+
+      **The fix:**
+      The `<tfoot>` now emits one dedicated aggregate cell per header
+      column between [4..9]: Realized Rev → Est. Rev → Total Cost →
+      Realized Profit → Est. Profit → Outstanding, with `colSpan={4}` on
+      the label and `colSpan={2}` on the trailing Status/actions gap.
+      Total colspan = 12 (matches the 12-column `<thead>`).
+
+      **Files changed:**
+      - `frontend/src/components/OrdersTableFooter.jsx` (NEW): extracted
+        the footer into its own component so the column layout is
+        unit-testable without wiring axios/router/context.
+      - `frontend/src/pages/Orders.jsx`: imports `OrdersTableFooter` and
+        replaces the inline `<tfoot>` block. All backend calculations
+        and row values are UNCHANGED — `totals` memo was already
+        computing `est_revenue` and `est_profit`, they just weren't being
+        rendered in the footer.
+      - `frontend/src/components/OrdersTableFooter.test.jsx` (NEW):
+        focused regression test covering:
+          1. All 6 aggregate `<td>` cells are emitted (guards against
+             the "missing Est. Profit" regression).
+          2. Aggregate cells appear in the exact expected order
+             (Realized Rev → Est. Rev → Cost → Realized Profit →
+             Est. Profit → Outstanding), and colspan sums to 12 (matches
+             the header).
+          3. Numeric values map to the correct cells using the exact
+             totals from the bug report (₹1,10,700 / ₹1,10,700 / ₹84,725
+             / ₹25,975 / ₹25,975 / ₹38,292).
+      - `frontend/package.json` / `yarn.lock`: added devDependency
+        `@testing-library/react@14` + `@testing-library/jest-dom@6.9.1`
+        (Node-20 compatible) so unit tests can run under `craco test`.
+
+      **Local test run (main-agent):**
+      ```
+      $ CI=true yarn test --testPathPattern=OrdersTableFooter --watchAll=false
+      PASS src/components/OrdersTableFooter.test.jsx
+        OrdersTableFooter column alignment
+          ✓ emits ALL six aggregate cells (67 ms)
+          ✓ aggregate values appear in the exact expected order under matching header columns (11 ms)
+          ✓ expected totals map to the correct aggregate cells (no more shifted values) (7 ms)
+        Tests: 3 passed, 3 total
+      ```
+
+      Backend calculations were NOT changed.
+
+      **Please run the auto_frontend_testing_agent** to verify via a live
+      browser session:
+
+      1. Login as admin (admin@artisan.local / Admin@12345 — see
+         `/app/memory/test_credentials.md`).
+      2. Navigate to `/orders`.
+      3. Confirm the footer row (`[data-testid="orders-footer-totals"]`)
+         renders EIGHT `<td>` nodes total: 1 label + 6 aggregates + 1 tail.
+      4. Confirm each aggregate cell aligns under its matching header
+         column by data-testid:
+           - `orders-footer-realized-rev`   → column "Realized Rev"
+           - `orders-footer-est-rev`        → column "Est. Rev"
+           - `orders-footer-cost`           → column "Total Cost"
+           - `orders-footer-realized-profit`→ column "Realized Profit"
+           - `orders-footer-est-profit`     → column "Est. Profit"
+           - `orders-footer-outstanding`    → column "Outstanding"
+      5. The bounding-box centre of each footer `<td>` must fall within
+         the horizontal extent of its matching `<th>` cell (this is what
+         the user really cares about — the visual mis-alignment).
+      6. `orders-footer-est-profit` MUST be non-empty (previously it was
+         missing entirely).
+
+      Also please run the added unit test to confirm it passes:
+      ```
+      cd /app/frontend && CI=true yarn test --testPathPattern=OrdersTableFooter --watchAll=false
+      ```
+
+      Update the "Orders table footer column alignment" task in
+      `test_result.md` with `working: true/false` and a status_history
+      entry with your findings.
+
 
       **Business rule (user, 2026-07-22):**
       - Default packing vendor is Father's Firm / Factory. When `packing_cost > 0`

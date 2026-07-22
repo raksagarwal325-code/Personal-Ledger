@@ -7,6 +7,7 @@ import { Input } from "../components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { Plus, Search, Trash2, Pencil, ChevronDown, ChevronRight, Package, Truck } from "lucide-react";
 import OrderDialog from "../components/OrderDialog";
+import OrdersTableFooter from "../components/OrdersTableFooter";
 import { toast } from "sonner";
 
 const STATUS_STYLE = {
@@ -573,26 +574,7 @@ export default function Orders() {
               })}
             </tbody>
             {orders.length > 0 && !loading && (
-              <tfoot>
-                <tr style={{ background: "var(--surface-alt)", fontWeight: 600, borderTop: "2px solid var(--border-warm)" }}
-                    data-testid="orders-footer-totals">
-                  <td colSpan={4} className="py-3 px-3 label-caps" style={{ fontSize: 11 }}>
-                    Totals · {orders.length} orders
-                  </td>
-                  <td className="num py-3">{fmtINR(totals.revenue)}</td>
-                  <td className="num py-3" style={{ color: "var(--muted)" }}>{fmtINR(totals.cost)}</td>
-                  <td className="num py-3"
-                      style={{ color: totals.profit >= 0 ? "var(--sage)" : "var(--danger)" }}>
-                    {fmtINR(totals.profit)}
-                  </td>
-                  <td className="num py-3"
-                      style={{ color: totals.outstanding > 0.5 ? "var(--terracotta)" : "var(--sage)" }}
-                      data-testid="orders-footer-outstanding">
-                    {fmtINR(totals.outstanding)}
-                  </td>
-                  <td colSpan={2}></td>
-                </tr>
-              </tfoot>
+              <OrdersTableFooter count={orders.length} totals={totals} />
             )}
           </table>
         </div>
