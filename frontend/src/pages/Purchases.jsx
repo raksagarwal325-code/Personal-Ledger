@@ -76,7 +76,12 @@ export default function Purchases() {
     // the stable party id. Financial linkage keys off vendor_party_id;
     // vendor_name is denormalised for display only.
     api.get("/party-ledger-v2/parties", { params: { type: "vendor" } })
-      .then((r) => setParties(Array.isArray(r.data) ? r.data : []))
+      .then((r) => {
+        // Endpoint shape: { count, parties: [...] }.
+        const list = Array.isArray(r.data?.parties) ? r.data.parties
+                   : (Array.isArray(r.data) ? r.data : []);
+        setParties(list);
+      })
       .catch(() => setParties([]));
   }, []);
 

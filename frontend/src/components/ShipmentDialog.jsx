@@ -19,10 +19,12 @@ export default function ShipmentDialog({ open, onOpenChange, order, shipment, on
     if (!open) return;
     Promise.all([
       api.get("/party-ledger-v2/parties", { params: { type: "vendor" } })
-        .catch(() => ({ data: [] })),
+        .catch(() => ({ data: { parties: [] } })),
       api.get("/vendors").catch(() => ({ data: [] })),
     ]).then(([partyRes, vendorRes]) => {
-      const parties = Array.isArray(partyRes.data) ? partyRes.data : [];
+      // Party Ledger v2 returns { count, parties: [...] }; be defensive.
+      const parties = Array.isArray(partyRes.data?.parties) ? partyRes.data.parties
+                    : (Array.isArray(partyRes.data) ? partyRes.data : []);
       const legacy = Array.isArray(vendorRes.data) ? vendorRes.data : [];
       const seen = new Set();
       const merged = [];

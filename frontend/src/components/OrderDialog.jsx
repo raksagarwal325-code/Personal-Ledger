@@ -219,10 +219,12 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
   useEffect(() => {
     Promise.all([
       api.get("/party-ledger-v2/parties", { params: { type: "vendor" } })
-        .catch(() => ({ data: [] })),
+        .catch(() => ({ data: { parties: [] } })),
       api.get("/vendors").catch(() => ({ data: [] })),
     ]).then(([partyRes, vendorRes]) => {
-      const parties = Array.isArray(partyRes.data) ? partyRes.data : [];
+      // Party Ledger v2 returns { count, parties: [...] }; be defensive.
+      const parties = Array.isArray(partyRes.data?.parties) ? partyRes.data.parties
+                    : (Array.isArray(partyRes.data) ? partyRes.data : []);
       const legacy = Array.isArray(vendorRes.data) ? vendorRes.data : [];
       // dedupe by name, prefer canonical parties (they carry a stable id)
       const seen = new Set();

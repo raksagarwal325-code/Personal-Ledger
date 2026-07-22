@@ -4136,6 +4136,11 @@ async def add_shipment(oid: str, payload: Shipment):
     order["updated_at"] = datetime.now(timezone.utc).isoformat()
     await db.orders.update_one({"id": oid}, {"$set": order})
     await _recompute_payment_aggregates_for_orders([oid])
+    # Bug fix (2026-07-22): trigger the canonical freight/packing purchase
+    # sync so a shipment added directly via this endpoint (from the
+    # ShipmentDialog) immediately materialises its freight Purchase.
+    updated = await db.orders.find_one({"id": oid}, {"_id": 0})
+    await _sync_order_all_linked_purchases(updated)
     updated = await db.orders.find_one({"id": oid}, {"_id": 0})
     return Order(**updated)
 
@@ -4157,6 +4162,10 @@ async def update_shipment(oid: str, sid: str, payload: Shipment):
     order["updated_at"] = datetime.now(timezone.utc).isoformat()
     await db.orders.update_one({"id": oid}, {"$set": order})
     await _recompute_payment_aggregates_for_orders([oid])
+    # Bug fix (2026-07-22): keep freight/packing purchases in lockstep with
+    # the shipment edit — transporter / freight_paid changes must reflect.
+    updated = await db.orders.find_one({"id": oid}, {"_id": 0})
+    await _sync_order_all_linked_purchases(updated)
     updated = await db.orders.find_one({"id": oid}, {"_id": 0})
     return Order(**updated)
 
@@ -4173,6 +4182,10 @@ async def delete_shipment(oid: str, sid: str):
     compute_order_aggregates(order)
     await db.orders.update_one({"id": oid}, {"$set": order})
     await _recompute_payment_aggregates_for_orders([oid])
+    # Bug fix (2026-07-22): freight Purchase auto-deleted (or marked stale
+    # if paid) when the shipment it was linked to disappears.
+    updated = await db.orders.find_one({"id": oid}, {"_id": 0})
+    await _sync_order_all_linked_purchases(updated)
     return {"deleted": True}
 
 
