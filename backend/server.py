@@ -2230,6 +2230,25 @@ async def meta():
                     if pn:
                         products_by_sub[f"{mc}/{sc}"].add(pn)
 
+    # Bug fix (2026-07-22) · Advance-payment customer reuse.
+    # Extend the `clients` dropdown source to also include:
+    #   • customer_name recorded on any customer_payment (covers advances
+    #     that have no order yet), and
+    #   • canonical customer parties (type='customer' in db.parties).
+    # Without this, a NEW customer entered on an advance payment never
+    # appears in the customer dropdown for future payments.
+    payment_clients = await db.customer_payments.distinct("customer_name")
+    for name in payment_clients or []:
+        if name and str(name).strip():
+            clients.add(str(name).strip())
+    party_clients_cursor = db.parties.find(
+        {"type": "customer"}, {"_id": 0, "display_name": 1, "name": 1}
+    )
+    async for pc in party_clients_cursor:
+        n = (pc.get("display_name") or pc.get("name") or "").strip()
+        if n:
+            clients.add(n)
+
     # Parties / modes list — derived from canonical sources plus legacy for continuity
     cust_names = await db.customer_payments.distinct("customer_name")
     vend_names_from_pp = await db.purchase_payments.distinct("vendor_name")
@@ -4280,10 +4299,28 @@ def _finalise_customer_payment(cp: dict) -> dict:
 async def create_customer_payment(payload: CustomerPaymentBase):
     cp = CustomerPayment(**payload.model_dump()).model_dump()
     _finalise_customer_payment(cp)
-    # Phase 2: canonical customer party id
-    party = await get_or_create_customer_party(db, cp.get("customer_name") or "")
+    # Phase 2: canonical customer party id.
+    # Bug fix (2026-07-22) · Advance-payment customer reuse.
+    # When a NEW customer name is entered on an advance payment, resolve /
+    # create the canonical party AND mirror the display name into the
+    # legacy `db.customers` directory so it appears in the customer
+    # dropdown (`/api/meta` → `clients`) for future payments. Normalized
+    # name matching inside `get_or_create_customer_party` prevents
+    # duplicate parties on re-entry (e.g. "John Doe" vs "  john  doe ").
+    cname = (cp.get("customer_name") or "").strip()
+    party = await get_or_create_customer_party(db, cname)
     if party:
         cp["customer_party_id"] = party["id"]
+        # Persist the canonical display_name back onto the payment so the
+        # dropdown surface (meta.clients) shows the tidied form.
+        canon_name = (party.get("display_name") or party.get("name") or cname).strip()
+        if canon_name:
+            cp["customer_name"] = canon_name
+            await db.customers.update_one(
+                {"name": canon_name},
+                {"$setOnInsert": Customer(name=canon_name).model_dump()},
+                upsert=True,
+            )
     await db.customer_payments.insert_one(cp)
     order_ids = [a.get("order_id") for a in (cp.get("allocations") or []) if a.get("order_id")]
     await _recompute_payment_aggregates_for_orders(order_ids)
@@ -4333,9 +4370,19 @@ async def update_customer_payment(pid: str, payload: CustomerPaymentBase):
     old_order_ids = [a.get("order_id") for a in (existing.get("allocations") or []) if a.get("order_id")]
     cp = {**existing, **payload.model_dump()}
     _finalise_customer_payment(cp)
-    party = await get_or_create_customer_party(db, cp.get("customer_name") or "")
+    # Bug fix (2026-07-22) · Advance-payment customer reuse (see POST).
+    cname = (cp.get("customer_name") or "").strip()
+    party = await get_or_create_customer_party(db, cname)
     if party:
         cp["customer_party_id"] = party["id"]
+        canon_name = (party.get("display_name") or party.get("name") or cname).strip()
+        if canon_name:
+            cp["customer_name"] = canon_name
+            await db.customers.update_one(
+                {"name": canon_name},
+                {"$setOnInsert": Customer(name=canon_name).model_dump()},
+                upsert=True,
+            )
     await db.customer_payments.update_one({"id": pid}, {"$set": cp})
     new_order_ids = [a.get("order_id") for a in (cp.get("allocations") or []) if a.get("order_id")]
     await _recompute_payment_aggregates_for_orders(list(set(old_order_ids + new_order_ids)))

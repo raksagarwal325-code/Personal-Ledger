@@ -1,5 +1,15 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "./ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "./ui/alert-dialog";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
@@ -197,6 +207,26 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
   // so subsequent shipment/payment dialogs can be attached to a real order id.
   const [savedOrder, setSavedOrder] = useState(null);
   const effectiveOrder = order || savedOrder;
+
+  // Bug fix (2026-07-22) · Accidental-close protection.
+  // Track a JSON snapshot of the last-clean form state ("baseline"). The
+  // dialog is `dirty` iff `dirtySnapshot(form) !== baselineJSON`. We use
+  // this to:
+  //   • block outside-click / Esc close paths when the user has unsaved
+  //     entries,
+  //   • prompt "Discard unsaved changes?" when the user clicks Cancel/X.
+  // Baseline is refreshed whenever we open the dialog and after any
+  // successful save. Shipments and order_payments are excluded because
+  // they are managed by their own nested dialogs which persist
+  // server-side atomically — user typing doesn't touch them.
+  const dirtySnapshot = (f) => {
+    if (!f) return "";
+    const { shipments, order_payments, ...rest } = f;
+    return JSON.stringify(rest);
+  };
+  const [baselineJSON, setBaselineJSON] = useState(null);
+  const dirty = baselineJSON != null && dirtySnapshot(form) !== baselineJSON;
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [meta, setMeta] = useState({
     main_categories: [],
     sub_categories_by_main: {},
@@ -242,25 +272,30 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
   }, []);
 
   useEffect(() => {
-    if (order) {
-      setForm({
-        ...emptyOrder(),
-        ...order,
-        order_date: order.order_date ? order.order_date.substring(0, 10) : "",
-        shipped_date: order.shipped_date ? order.shipped_date.substring(0, 10) : "",
-        items: (order.items && order.items.length) ? order.items : [emptyItem()],
-        shipments: order.shipments || [],
-        other_revenue: order.other_revenue || [],
-        other_expense: order.other_expense || [],
-        order_payments: order.order_payments || [],
-        tax_amount_manual: !!order.tax_amount_manual,
-        packing_cost_manual: !!order.packing_cost_manual,
-      });
-      setSavedOrder(null);
-    } else {
-      setForm(emptyOrder());
-      setSavedOrder(null);
+    // Bug fix (2026-07-22) · Reset the discard-confirm modal + baseline
+    // whenever the dialog is (re)opened or the target order changes.
+    if (!open) {
+      setConfirmDiscard(false);
+      return;
     }
+    const init = order
+      ? {
+          ...emptyOrder(),
+          ...order,
+          order_date: order.order_date ? order.order_date.substring(0, 10) : "",
+          shipped_date: order.shipped_date ? order.shipped_date.substring(0, 10) : "",
+          items: (order.items && order.items.length) ? order.items : [emptyItem()],
+          shipments: order.shipments || [],
+          other_revenue: order.other_revenue || [],
+          other_expense: order.other_expense || [],
+          order_payments: order.order_payments || [],
+          tax_amount_manual: !!order.tax_amount_manual,
+          packing_cost_manual: !!order.packing_cost_manual,
+        }
+      : emptyOrder();
+    setForm(init);
+    setBaselineJSON(dirtySnapshot(init));
+    setSavedOrder(null);
   }, [order, open]);
 
   // Nested shipment dialog + inline shipments section state
@@ -581,6 +616,12 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
         await api.post("/orders", payload);
         toast.success("Order added");
       }
+      // Bug fix (2026-07-22) · Accidental-close protection.
+      // Reset the dirty baseline to the just-saved snapshot BEFORE the
+      // parent's onSaved runs (which typically closes the dialog). This
+      // guarantees the `handleOpenChange` guard sees a clean form and does
+      // NOT show the "Discard unsaved changes?" prompt on a fresh save.
+      setBaselineJSON(dirtySnapshot(form));
       onSaved?.();
     } catch (err) {
       console.error(err);
@@ -612,12 +653,16 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
       const created = r.data;
       setSavedOrder(created);
       // sync form with server-generated ids for items etc
-      setForm((f) => ({
-        ...f,
-        items: created.items && created.items.length ? created.items : f.items,
+      const nextForm = {
+        ...form,
+        items: created.items && created.items.length ? created.items : form.items,
         shipments: created.shipments || [],
         status: created.status,
-      }));
+      };
+      setForm(nextForm);
+      // Bug fix (2026-07-22) · Baseline is now the server-echoed draft
+      // — dialog is clean again.
+      setBaselineJSON(dirtySnapshot(nextForm));
       toast.success("Order draft saved");
       return created.id;
     } catch (err) {
@@ -629,9 +674,45 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
 
   const subsForMain = (mc) => meta.sub_categories_by_main?.[mc] || [];
 
+  // Bug fix (2026-07-22) · Accidental-close protection.
+  // Radix Dialog closes on: (1) outside pointer down, (2) Esc key, (3)
+  // internal Close button, (4) any caller-initiated `onOpenChange(false)`.
+  // We intercept ALL close attempts here so that:
+  //   • outside-click and interact-outside are ALWAYS ignored while the
+  //     dialog is open (see `onPointerDownOutside` + `onInteractOutside`
+  //     preventDefault below),
+  //   • Esc is ignored ONLY while the form is dirty
+  //     (see `onEscapeKeyDown`),
+  //   • Cancel / Close / X clicks funnel through `handleOpenChange`,
+  //     which prompts a discard confirmation when dirty.
+  const requestClose = () => {
+    if (saving) return;                   // don't close mid-save
+    if (dirty) { setConfirmDiscard(true); return; }
+    onOpenChange(false);
+  };
+
+  const handleOpenChange = (nextOpen) => {
+    if (nextOpen) { onOpenChange(true); return; }
+    requestClose();
+  };
+
+  const discardAndClose = () => {
+    setConfirmDiscard(false);
+    // Baseline reset so a next open of THIS same order starts clean
+    // — form itself is reset by the [order, open] effect on reopen.
+    setBaselineJSON(dirtySnapshot(form));
+    onOpenChange(false);
+  };
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-5xl max-h-[92vh] overflow-y-auto" data-testid="order-dialog">
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent
+        className="max-w-5xl max-h-[92vh] overflow-y-auto"
+        data-testid="order-dialog"
+        onPointerDownOutside={(e) => e.preventDefault()}
+        onInteractOutside={(e) => e.preventDefault()}
+        onEscapeKeyDown={(e) => { if (dirty) e.preventDefault(); }}
+      >
         <DialogHeader>
           <DialogTitle className="serif text-3xl">
             {effectiveOrder ? "Edit order" : "New order"}
@@ -1644,7 +1725,8 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
           </section>
 
           <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}
+            <Button type="button" variant="outline" onClick={requestClose}
+                    data-testid="ord-cancel-btn"
                     className="border-[var(--border-warm)]">Cancel</Button>
             <Button type="submit" disabled={saving} data-testid="ord-save-btn"
                     className="bg-[var(--terracotta)] hover:bg-[var(--terracotta-hover)] text-white">
@@ -1682,6 +1764,38 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
           />
         )}
       </DialogContent>
+
+      {/* Bug fix (2026-07-22) · Accidental-close protection.
+          Discard-unsaved-changes confirmation. Rendered as a sibling to
+          the main dialog content so its portal stacks ABOVE the parent
+          Dialog overlay (Radix uses per-portal z-index of 50; nesting
+          works because the AlertDialog portal mounts last). */}
+      <AlertDialog
+        open={confirmDiscard}
+        onOpenChange={(v) => setConfirmDiscard(v)}
+      >
+        <AlertDialogContent data-testid="ord-discard-confirm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Discard unsaved changes?</AlertDialogTitle>
+            <AlertDialogDescription>
+              You have unsaved edits to this order. Closing now will lose
+              anything you have not yet saved.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel data-testid="ord-discard-cancel">
+              Keep editing
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={discardAndClose}
+              data-testid="ord-discard-confirm-btn"
+              className="bg-[var(--danger)] hover:bg-[var(--danger)] text-white"
+            >
+              Discard changes
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Dialog>
   );
 }

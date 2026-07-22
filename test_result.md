@@ -1153,6 +1153,181 @@ frontend:
           Phase 4 is now fully verified and working as specified.
 
 backend:
+  - task: "Bug fix — Advance-payment customer reuse (canonical party creation + dropdown surfacing + normalized-name dedupe)"
+    implemented: true
+    working: true
+    file: "backend/server.py, backend/tests/test_bug_advance_payment_customer_reuse.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "testing"
+        comment: |
+          ✅ BUG FIX VERIFICATION COMPLETE — ALL SCENARIOS PASSED
+          
+          Executed comprehensive backend API testing covering all 3 verification scenarios
+          plus pytest regression tests. The advance-payment customer reuse bug fix is
+          working correctly as specified.
+          
+          **SCENARIO 1: New customer via advance payment becomes reusable ✅ PASSED (5/5 checks)**
+          
+          Test customer: "AdvReuse T1 ebc2ca32" (unique UUID-based name)
+          
+          ✅ (a) GET /api/meta confirmed test name NOT in clients before payment (38 clients total)
+          ✅ (b) POST /api/customer-payments with new customer name succeeded
+          ✅ (c) Response included valid customer_party_id: 368fefcf-16ce-4b1e-ace5-52f4d75c8001
+          ✅ (d) Fresh GET /api/meta confirmed test name NOW in clients list
+          ✅ (e) GET /api/party-ledger-v2/parties?type=customer confirmed party exists with matching ID
+          
+          **Business rule verified:**
+          - New customer entered via advance payment creates canonical party ✓
+          - customer_party_id persisted on payment document ✓
+          - Customer name surfaces in /api/meta clients for dropdown reuse ✓
+          
+          **SCENARIO 2: Normalized-name reuse (no duplicate parties) ✅ PASSED (4/4 checks)**
+          
+          Test customer: "AdvReuse T2 7d47b31a" with 4 variants:
+          - Variant 1: "AdvReuse T2 7d47b31a" (original)
+          - Variant 2: "ADVREUSE T2 7D47B31A" (uppercase)
+          - Variant 3: "  advreuse t2 7d47b31a  " (lowercase + leading/trailing spaces)
+          - Variant 4: "AdvReuse T2 7d47b31a\t\t" (trailing tabs)
+          
+          ✅ (a) Created 4 payments with different case/whitespace variants
+             - Payment 1: amount=1000, customer_party_id=a58d1132-ba75-45b3-93a4-abde9ed929a6
+             - Payment 2: amount=1001, customer_party_id=a58d1132-ba75-45b3-93a4-abde9ed929a6
+             - Payment 3: amount=1002, customer_party_id=a58d1132-ba75-45b3-93a4-abde9ed929a6
+             - Payment 4: amount=1003, customer_party_id=a58d1132-ba75-45b3-93a4-abde9ed929a6
+          
+          ✅ (b) All 4 payments share the SAME customer_party_id (no duplicates created)
+          ✅ (c) GET /api/party-ledger-v2/parties confirmed exactly ONE canonical party
+             - Party ID: a58d1132-ba75-45b3-93a4-abde9ed929a6
+             - Display name: "AdvReuse T2 7d47b31a" (normalized)
+          
+          ✅ (d) Payment allocation semantics preserved:
+             - All 4 payments have allocations=[] (empty)
+             - Each payment retains its own amount (1000, 1001, 1002, 1003)
+             - Each payment has correct unallocated value matching amount
+          
+          **Business rule verified:**
+          - Normalized-name matching (trim + casefold + whitespace collapse) working ✓
+          - No duplicate parties created for case/whitespace variants ✓
+          - Payment allocation logic unchanged ✓
+          
+          **SCENARIO 3: Regressions ✅ PASSED (2/2 checks)**
+          
+          ✅ (a) GET /api/reconcile returned:
+             - healthy: True
+             - passed: 21/21
+             - failed: 0
+             - All reconciliation invariants passing ✓
+          
+          ✅ (b) Pytest execution (69 tests total):
+             - tests/test_bug_advance_payment_customer_reuse.py: 2/2 PASSED
+             - tests/test_p6_slice5_party_ledger.py: 48/48 PASSED
+             - tests/test_p5_reconcile.py: 19/19 PASSED
+             - Total: 69/69 tests passed in 7.72s
+          
+          **Business rule verified:**
+          - No regressions in reconciliation logic ✓
+          - No regressions in party ledger functionality ✓
+          - No regressions in payment allocation logic ✓
+          
+          **CLEANUP:**
+          All 5 test payments successfully deleted after verification.
+          
+          **ADMIN CREDENTIALS USED:**
+          - Email: admin@artisan.local
+          - Password: Admin@12345
+          - Source: /app/memory/test_credentials.md
+          
+          **BACKEND URL:**
+          - https://1781388d-eca6-4416-aced-add139d9246b.preview.emergentagent.com/api
+          - Source: /app/frontend/.env (REACT_APP_BACKEND_URL)
+          
+          **CONCLUSION:**
+          The advance-payment customer reuse bug fix is WORKING CORRECTLY and PRODUCTION-READY.
+          All 3 verification scenarios passed with 100% success rate:
+          • New customers via advance payments are now reusable in dropdowns ✓
+          • Normalized-name matching prevents duplicate parties ✓
+          • Payment allocation logic remains unchanged ✓
+          • Reconciliation remains healthy ✓
+          • All 69 pytest tests pass ✓
+          
+          The bug reported by the user (customer names not appearing in dropdown after
+          advance payment entry) is fully resolved. The fix correctly implements canonical
+          party creation, dropdown surfacing via /api/meta, and normalized-name deduplication.
+      - working: "NA"
+        agent: "main"
+        comment: |
+          Bug fix landed 2026-07-22. Business rule (per user):
+
+            • When a NEW customer name is entered while recording an
+              advance / customer payment, the backend must:
+                (1) create or resolve the canonical customer party
+                    (already done via `get_or_create_customer_party`),
+                (2) save `customer_party_id` on the payment doc
+                    (already done),
+                (3) make that customer available in the customer dropdown
+                    for future payments,
+                (4) reuse the same party on exact / normalized-name match
+                    instead of creating duplicates.
+            • Payment allocation logic MUST NOT change.
+
+          Root cause identified: `/api/meta` was building its `clients`
+          list ONLY from `orders.client_name`, so a customer introduced
+          via an advance payment (no order yet) was invisible to the
+          CustomerPaymentDialog's `<datalist id="cp-clients">` and the
+          user had to retype the name each time — which risked further
+          duplicates.
+
+          Fix:
+            - `create_customer_payment` / `update_customer_payment`
+              (server.py): after resolving the canonical party, mirror
+              the party's `display_name` onto both the payment doc and
+              the legacy `db.customers` directory (`$setOnInsert`), so
+              the tidied canonical name is what shows up in the
+              dropdown. Duplicate-safe via upsert on `name`.
+            - `/api/meta` (server.py): extended the `clients` set to
+              also include:
+                • `db.customer_payments.distinct("customer_name")`, and
+                • every party with `type='customer'` in `db.parties`.
+              This guarantees advance-only customers appear in the
+              dropdown for future payments.
+            - Normalized-name reuse is handled by the pre-existing
+              `resolve_party` (party_sync.py) which does an exact
+              `normalized_name` lookup (trim + casefold + whitespace
+              collapse) before creating any new row. No new logic there
+              — the fix just surfaces the already-canonical party via
+              the meta dropdown.
+
+          Files changed:
+            - `backend/server.py`:
+                * `create_customer_payment`: canonical name mirroring
+                  onto payment + `db.customers`.
+                * `update_customer_payment`: same mirroring on edit.
+                * `meta`: `clients` set extended with payment-only + all
+                  canonical customer parties.
+            - `backend/tests/test_bug_advance_payment_customer_reuse.py`
+              (NEW): two focused tests.
+                * T1: brand-new customer entered via advance payment →
+                  `customer_party_id` persisted, name appears in
+                  `/api/meta` clients.
+                * T2: four payments with the SAME normalized name (case
+                  / whitespace variants) all share the same
+                  `customer_party_id`, and only ONE canonical party
+                  exists.
+
+          Main-agent pytest run:
+            - tests/test_bug_advance_payment_customer_reuse.py: 2/2 PASS
+            - Combined bug-fix + reconcile + party-ledger suites
+              (104 tests): 104/104 PASS
+            - No changes to allocation logic; existing allocation tests
+              stay green.
+
+          Testing agent, please verify the fix through the live API per
+          the scenarios in `agent_communication` at the end of this file.
+
   - task: "Bug fix — Packing default vendor = Father's Firm / Factory (auto-link when blank on new orders, no historical backfill)"
     implemented: true
     working: "NA"
@@ -3223,7 +3398,7 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Bug fix — Orders table footer column alignment (Realized Rev, Est. Rev, Cost, Realized Profit, Est. Profit, Outstanding all mapped to matching headers)"
+    - "Bug fix — Advance-payment customer reuse (canonical party creation + dropdown surfacing + normalized-name dedupe)"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -3231,7 +3406,102 @@ test_plan:
 agent_communication:
   - agent: "main"
     message: |
-      Applied a frontend-only bug fix: Orders table `<tfoot>` column alignment.
+      Applied a backend-only bug fix: **Advance-payment customer reuse**.
+
+      **The bug (user report):**
+      A customer name entered while recording an advance / customer
+      payment for the first time was not appearing in the customer
+      dropdown for future payments — users had to retype the name each
+      time, and slight variations were creating duplicate parties.
+
+      **Root cause:**
+      `/api/meta` was building `clients` ONLY from `orders.client_name`.
+      A customer introduced via an advance payment (no order yet) was
+      invisible to the frontend's `<datalist id="cp-clients">`. The
+      canonical party was in fact being created by
+      `get_or_create_customer_party` in `create_customer_payment`, but
+      the dropdown never reflected it.
+
+      **The fix:**
+      - `create_customer_payment` / `update_customer_payment`
+        (server.py):
+          * After resolving the canonical party, mirror the party's
+            `display_name` onto both the payment doc AND the legacy
+            `db.customers` directory (`$setOnInsert`, so no dupes on
+            re-entry).
+      - `/api/meta` (server.py):
+          * `clients` set now also includes:
+            – `db.customer_payments.distinct("customer_name")`, and
+            – every party with `type='customer'` in `db.parties`.
+      - Normalized-name reuse is delegated to the pre-existing
+        `resolve_party` (party_sync.py) — no changes there. That
+        function already does trim + casefold + whitespace-collapse
+        matching before creating any new row.
+
+      Payment allocation logic was NOT changed.
+
+      **Files touched:**
+      - `backend/server.py` (POST + PUT `/customer-payments`, `/meta`)
+      - `backend/tests/test_bug_advance_payment_customer_reuse.py`
+        (NEW: 2 focused tests)
+
+      **Main-agent pytest results:**
+      - `tests/test_bug_advance_payment_customer_reuse.py`: 2/2 PASS
+      - Combined bug-fix + reconcile + party-ledger suites (104 tests):
+        104/104 PASS
+
+      **Please run deep_testing_backend_v2** to independently verify
+      via the live API at http://localhost:8001:
+
+      1. **New customer via advance payment becomes reusable**
+         (a) Snapshot `GET /api/meta` → confirm a unique test name
+             (`AdvReuse T1 <uuid>`) is NOT in `clients`.
+         (b) `POST /api/customer-payments` with:
+             `{"date": "2026-07-22", "customer_name": "<test name>",
+               "amount": 7500, "mode": "UPI", "allocations": []}`
+         (c) Response must have a non-empty `customer_party_id`.
+         (d) Fresh `GET /api/meta` → `clients` MUST include the test
+             name (exact string match).
+         (e) `GET /api/party-ledger-v2/parties?type=customer` MUST
+             include the returned `customer_party_id`.
+
+      2. **Normalized-name reuse — no duplicate parties**
+         Post FOUR advance payments in sequence with the SAME
+         normalized name in different casing/whitespace forms:
+             base = `AdvReuse T2 <uuid>`
+             variants = [base, base.upper(), f"  {base.lower()}  ",
+                         f"{base}\t\t"]
+         (a) Every returned `customer_party_id` must be the same
+             single UUID across all four payments.
+         (b) `GET /api/party-ledger-v2/parties?type=customer` must
+             contain EXACTLY ONE canonical party matching the
+             base name (case-insensitively) — not four.
+         (c) Payment allocation semantics untouched: each of the four
+             payments still records its own `amount` and `unallocated`
+             fields with allocations = [].
+
+      3. **Regression checks (no changes to allocation logic):**
+         - `GET /api/reconcile` returns `healthy: true`, `passed: 21`,
+           `failed: 0`.
+         - Existing party-ledger and customer-payment tests pass:
+           ```
+           cd /app/backend && python -m pytest \
+             tests/test_bug_advance_payment_customer_reuse.py \
+             tests/test_p6_slice5_party_ledger.py \
+             tests/test_p5_reconcile.py
+           ```
+
+      Please DO NOT test the frontend for this bug — user will decide
+      separately.
+
+      Update the "Bug fix — Advance-payment customer reuse" task in
+      `test_result.md` with `working: true/false` and add a
+      status_history entry with your findings.
+
+  - agent: "main"
+    message: |
+      Prior task (already handled): frontend Orders table footer column
+      alignment fix. Not part of the current verification scope.
 
       **The bug (user report):**
       Footer aggregate values were shifted into the wrong columns and the
