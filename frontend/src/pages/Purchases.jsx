@@ -45,7 +45,11 @@ export default function Purchases() {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [vendors, setVendors] = useState([]);
-  const [parties, setParties] = useState([]);     // canonical vendor parties (id ↔ name)
+  const [parties, setParties] = useState([]);
+  // Bug fix (2026-07-22) · Client column on Purchases table.
+  // Cached order list used to resolve `linked_to_order_id → client_name`
+  // for the new "Client" column. Non-linked purchase rows render "—".
+  const [orders, setOrders] = useState([]);     // canonical vendor parties (id ↔ name)
   const [meta, setMeta] = useState({});
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("all");
@@ -83,6 +87,15 @@ export default function Purchases() {
         setParties(list);
       })
       .catch(() => setParties([]));
+    // Bug fix (2026-07-22) · Client column on Purchases table.
+    // Fetch orders once to build an order_id → client_name lookup used
+    // for the new "Client" column on order-linked purchase rows
+    // (freight, packing, order_purchase). We keep this as a one-shot
+    // client-side fetch so the Purchases page can render its column
+    // without needing a new backend endpoint. Non-linked rows show "—".
+    api.get("/orders")
+      .then((r) => setOrders(Array.isArray(r.data) ? r.data : []))
+      .catch(() => setOrders([]));
   }, []);
 
   // Fast lookup: party_id → canonical current name (post-rename safe).
@@ -91,6 +104,16 @@ export default function Purchases() {
     (parties || []).forEach((p) => { m[p.id] = p; });
     return m;
   }, [parties]);
+
+  // Bug fix (2026-07-22) · Client column lookup.
+  // order_id → client_name map, derived from the fetched orders list.
+  const clientByOrderId = useMemo(() => {
+    const m = {};
+    (orders || []).forEach((o) => {
+      if (o && o.id) m[o.id] = o.client_name || "";
+    });
+    return m;
+  }, [orders]);
 
   // Open the Party Ledger for a given canonical vendor party id.
   const openVendorLedger = (partyId) => {
@@ -252,11 +275,15 @@ export default function Purchases() {
 
       <div className="card-warm overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="ledger-table w-full min-w-[900px]" data-testid="purchases-table">
+          <table className="ledger-table w-full min-w-[1000px]" data-testid="purchases-table">
             <thead>
               <tr>
                 <th>Date</th>
                 <th>Vendor</th>
+                {/* Bug fix (2026-07-22) · Client column — order-linked purchases
+                    surface the related order's client name; standalone rows
+                    show "—". Uses the existing linked_to_order_id linkage. */}
+                <th>Client</th>
                 <th>Bill no</th>
                 <th className="num">Items</th>
                 <th className="num">Invoice</th>
@@ -268,11 +295,11 @@ export default function Purchases() {
             </thead>
             <tbody>
               {loading && (
-                <tr><td colSpan={9} className="text-center py-10 text-sm" style={{ color: "var(--muted)" }}>Loading…</td></tr>
+                <tr><td colSpan={10} className="text-center py-10 text-sm" style={{ color: "var(--muted)" }}>Loading…</td></tr>
               )}
               {!loading && rows.length === 0 && (
                 <tr>
-                  <td colSpan={9} className="text-center py-12 text-sm" style={{ color: "var(--muted)" }}>
+                  <td colSpan={10} className="text-center py-12 text-sm" style={{ color: "var(--muted)" }}>
                     <ShoppingBag size={22} className="inline-block mb-2" strokeWidth={1.5} />
                     <div>No purchase bills yet. Click "New purchase" to record one.</div>
                   </td>
@@ -312,6 +339,15 @@ export default function Purchases() {
                                          style={{ color: "var(--terracotta)" }} />
                         </span>
                       )}
+                    </td>
+                    {/* Bug fix (2026-07-22) · Client column.
+                        Order-linked purchases show the related order's
+                        client_name. Standalone (non-linked) rows show "—". */}
+                    <td data-testid={`purchase-client-${p.id}`}
+                        style={{ color: p.linked_to_order_id ? "var(--ink)" : "var(--muted)" }}>
+                      {p.linked_to_order_id
+                        ? (clientByOrderId[p.linked_to_order_id] || "—")
+                        : "—"}
                     </td>
                     <td className="num" style={{ color: "var(--muted)" }}>{p.invoice_no || "—"}</td>
                     <td className="num">{(p.items || []).length}</td>

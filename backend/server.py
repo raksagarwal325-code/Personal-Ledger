@@ -169,6 +169,15 @@ class Account(BaseModel):
     # Phase 3: optional opening balance (used by derive_account_balance).
     opening_balance: float = 0.0
     opening_date: Optional[str] = None
+    # Bug fix (2026-07-22) · Account ownership.
+    # `owner_party_id` denotes which party owns the account. None (default)
+    # means the business/self owns it. When set to `SYSTEM_FF_ID`, any
+    # customer_payment received into or purchase_payment paid from this
+    # account is auto-stamped with the corresponding FF settlement link
+    # (received_by_party_id / paid_by_party_id), which triggers the
+    # EXISTING Father's Firm settlement flow — no changes to accounting
+    # calculations, just an auto-fill on payment write.
+    owner_party_id: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -4399,10 +4408,36 @@ def _finalise_customer_payment(cp: dict) -> dict:
     return cp
 
 
+async def _resolve_account_owner_party_id(account_id: Optional[str]) -> Optional[str]:
+    """Return the `owner_party_id` of the account, or None.
+
+    Bug fix (2026-07-22) · Account ownership.
+    Used to auto-stamp `received_by_party_id` / `paid_by_party_id` on
+    payments made through Father's Firm-owned accounts (e.g. ICICI),
+    which routes them through the EXISTING FF settlement flow. Payment
+    allocation and accounting logic remain untouched.
+    """
+    if not account_id:
+        return None
+    acc = await db.accounts.find_one({"id": account_id}, {"_id": 0, "owner_party_id": 1})
+    if not acc:
+        return None
+    owner = acc.get("owner_party_id")
+    return owner if owner else None
+
+
 @api_router.post("/customer-payments", response_model=CustomerPayment)
 async def create_customer_payment(payload: CustomerPaymentBase):
     cp = CustomerPayment(**payload.model_dump()).model_dump()
     _finalise_customer_payment(cp)
+    # Bug fix (2026-07-22) · Account ownership → FF settlement.
+    # If the target account is owned by Father's Firm and the caller
+    # didn't explicitly set `received_by_party_id`, auto-stamp it so the
+    # existing FF settlement flow triggers naturally.
+    if not cp.get("received_by_party_id"):
+        owner = await _resolve_account_owner_party_id(cp.get("account_id"))
+        if owner:
+            cp["received_by_party_id"] = owner
     # Phase 2: canonical customer party id.
     # Bug fix (2026-07-22) · Advance-payment customer reuse.
     # When a NEW customer name is entered on an advance payment, resolve /
@@ -4474,6 +4509,11 @@ async def update_customer_payment(pid: str, payload: CustomerPaymentBase):
     old_order_ids = [a.get("order_id") for a in (existing.get("allocations") or []) if a.get("order_id")]
     cp = {**existing, **payload.model_dump()}
     _finalise_customer_payment(cp)
+    # Bug fix (2026-07-22) · Account ownership → FF settlement.
+    if not cp.get("received_by_party_id"):
+        owner = await _resolve_account_owner_party_id(cp.get("account_id"))
+        if owner:
+            cp["received_by_party_id"] = owner
     # Bug fix (2026-07-22) · Advance-payment customer reuse (see POST).
     cname = (cp.get("customer_name") or "").strip()
     party = await get_or_create_customer_party(db, cname)
@@ -5059,6 +5099,14 @@ async def create_purchase_payment(payload: PurchasePaymentBase):
     alloc = sum(float(a.get("amount") or 0) for a in (p.get("allocations") or []))
     p["allocated_total"] = round(alloc, 2)
     p["unallocated"] = round(max(0.0, amt - alloc), 2)
+    # Bug fix (2026-07-22) · Account ownership → FF settlement.
+    # If the paying account is owned by Father's Firm and the caller
+    # didn't explicitly set `paid_by_party_id`, auto-stamp it so the
+    # existing FF settlement flow triggers naturally.
+    if not p.get("paid_by_party_id"):
+        owner = await _resolve_account_owner_party_id(p.get("account_id"))
+        if owner:
+            p["paid_by_party_id"] = owner
     # Phase 2: canonical vendor party id (Factory→system_fathers_firm).
     vname = p.get("vendor_name") or ""
     party = None
@@ -5101,6 +5149,11 @@ async def update_purchase_payment(pid: str, payload: PurchasePaymentBase):
     alloc = sum(float(a.get("amount") or 0) for a in (p.get("allocations") or []))
     p["allocated_total"] = round(alloc, 2)
     p["unallocated"] = round(max(0.0, amt - alloc), 2)
+    # Bug fix (2026-07-22) · Account ownership → FF settlement.
+    if not p.get("paid_by_party_id"):
+        owner = await _resolve_account_owner_party_id(p.get("account_id"))
+        if owner:
+            p["paid_by_party_id"] = owner
     await db.purchase_payments.update_one({"id": pid}, {"$set": p})
     new_pids = [a.get("purchase_id") for a in (p.get("allocations") or []) if a.get("purchase_id")]
     all_pids = list({*(old_pids or []), *(new_pids or [])})
@@ -5537,6 +5590,34 @@ async def _startup():
             )
     except Exception as e:
         logger.error(f"Packing-FF-default historical stamp failed: {e}")
+
+    # Bug fix (2026-07-22): Account ownership — mark ICICI Current as a
+    # Father's Firm account. Historical amounts are NOT re-attributed;
+    # future customer_payments and purchase_payments made through this
+    # account will auto-stamp received_by_party_id / paid_by_party_id
+    # with SYSTEM_FF_ID and flow through the existing FF settlement
+    # engine. Idempotent — only stamps accounts whose owner_party_id is
+    # unset or blank.
+    try:
+        res = await db.accounts.update_many(
+            {
+                "name": {"$regex": r"^\s*ICICI\b", "$options": "i"},
+                "$or": [
+                    {"owner_party_id": {"$exists": False}},
+                    {"owner_party_id": None},
+                    {"owner_party_id": ""},
+                ],
+            },
+            {"$set": {"owner_party_id": SYSTEM_FF_ID}},
+        )
+        if res.modified_count:
+            logger.info(
+                f"Account-ownership stamp: marked {res.modified_count} "
+                "ICICI account(s) as Father's Firm-owned "
+                "(owner_party_id=SYSTEM_FF_ID)."
+            )
+    except Exception as e:
+        logger.error(f"Account-ownership ICICI stamp failed: {e}")
 
 
 @app.on_event("shutdown")
