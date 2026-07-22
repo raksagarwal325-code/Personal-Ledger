@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -226,9 +227,17 @@ class TestLiveDashboardSnapshotAgainstBaseline:
 
     def test_dashboard_matches_pre_slice2_snapshot(self):
         baseline = json.loads((FIXTURES / "slice2_dashboard_snapshot.json").read_text())
-        r = httpx.get(f"{API_BASE}/api/dashboard", timeout=15.0)
+        # Bug fix (2026-07-22) · Dashboard month filter added the params
+        # `month=all|current|previous|YYYY-MM` (default `current`). Snapshot
+        # was captured pre-filter (equivalent to `all`), so pin that here.
+        r = httpx.get(f"{API_BASE}/api/dashboard",
+                      params={"month": "all"}, timeout=15.0)
         assert r.status_code == 200, r.text
         current = r.json()
+        # Strip the additive filter-metadata keys so they don't diff
+        # against a snapshot captured before the filter existed.
+        current = {k: v for k, v in current.items()
+                   if k not in ("applied_month", "available_months")}
         problems = list(_walk_and_diff(baseline, current))
         assert not problems, "Live dashboard diverged from pre-Slice-2 snapshot:\n" + \
             "\n".join(f"  {p}: {d}" for p, d in problems)
@@ -247,7 +256,8 @@ class TestLiveDashboardSnapshotAgainstBaseline:
         'Other' bucket when there are blank/None modes in the source data,
         OR omit it when there aren't. In either case, the total received
         via `modes` must equal the top-level `received` KPI to the paise."""
-        r = httpx.get(f"{API_BASE}/api/dashboard", timeout=15.0).json()
+        r = httpx.get(f"{API_BASE}/api/dashboard",
+                      params={"month": "all"}, timeout=15.0).json()
         modes = r.get("modes") or []
         total_received_from_modes = sum(_to_paise(m.get("received")) for m in modes)
         total_paid_from_modes = sum(_to_paise(m.get("paid")) for m in modes)
@@ -281,15 +291,20 @@ class TestEndpointsAreThin:
 
     def _dashboard_source(self) -> str:
         src = (Path(__file__).resolve().parents[1] / "server.py").read_text()
-        # Extract everything from `async def dashboard()` to the next top-level
-        # `async def ` or `def ` outside the block.
-        start = src.index("async def dashboard():")
-        end = src.index("\n# ==", start)  # next section banner
+        # Extract everything from `async def dashboard(...)` to the next
+        # section banner. Accepts any argument list so query params added
+        # in later bug fixes (e.g. month filter) don't break the assertion.
+        m = re.search(r"async def dashboard\([^)]*\):", src)
+        assert m, "async def dashboard(...) not found in server.py"
+        start = m.start()
+        end = src.index("\n# ==", start)
         return src[start:end]
 
     def _breakdown_source(self) -> str:
         src = (Path(__file__).resolve().parents[1] / "server.py").read_text()
-        start = src.index("async def dashboard_breakdown():")
+        m = re.search(r"async def dashboard_breakdown\([^)]*\):", src)
+        assert m, "async def dashboard_breakdown(...) not found in server.py"
+        start = m.start()
         end = src.index("\n# ==", start)
         return src[start:end]
 

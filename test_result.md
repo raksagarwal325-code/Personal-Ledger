@@ -1153,6 +1153,79 @@ frontend:
           Phase 4 is now fully verified and working as specified.
 
 backend:
+  - task: "Feature — Dashboard month filter (All Time / Current / Previous / individual months) applied to all KPIs, charts, summaries"
+    implemented: true
+    working: "NA"
+    file: "backend/server.py, backend/tests/test_bug_dashboard_month_filter.py, backend/tests/test_p6_slice2_dashboard.py, frontend/src/pages/Dashboard.jsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          Month filter added on the Dashboard only (2026-07-22).
+
+          Business rule (per user):
+            • Options: All Time · Current Month · Previous Month ·
+              individual months rendered as "April 2026".
+            • Selected month filters ALL Dashboard KPIs, charts and
+              summaries by transaction / order dates.
+            • Default = Current Month.
+            • Frontend and dashboard API only.
+            • Accounting calculations UNCHANGED.
+
+          Backend (`server.py`):
+            - `GET /api/dashboard` accepts optional `month` query param:
+              `"all" | "current" | "previous" | "YYYY-MM"`.
+              Default (omitted) = `"current"`. Invalid value → 400.
+            - `[from_date, to_date)` window computed server-side and
+              applied to five source collections (orders.order_date,
+              customer_payments.date, purchase_payments.date,
+              cash_book_entries.date, purchases.purchase_date) BEFORE
+              aggregation. Every downstream domain helper is called
+              unchanged.
+            - Response gets two additive keys:
+                `applied_month` (mode/key/label/from_date/to_date) and
+                `available_months` (sorted-desc "YYYY-MM" list from ALL
+                orders + payments, independent of current filter).
+
+          Frontend (`Dashboard.jsx`):
+            - New month `<select>` at the top (`dash-month-select`).
+            - Options: "All Time", "Current Month", "Previous Month",
+              and an "Individual months" optgroup listing every entry
+              from `available_months` rendered as "April 2026".
+            - Default value = "current".
+            - `useEffect` re-fetches `/api/dashboard?month=<selected>`
+              whenever the selection changes.
+            - Applied-month label shown next to the dropdown
+              (`dash-month-applied-label`).
+            - No changes to other pages.
+
+          Test (`tests/test_bug_dashboard_month_filter.py`, NEW):
+            - Single focused test class + method that creates two
+              orders (April + May), asserts filter behavior for
+              month=all / current / previous / 2026-04 / 2026-05 /
+              2026-06 / invalid, and confirms the monthly series only
+              contains keys within the selected window.
+
+          Pre-existing snapshot tests were also updated:
+            - `_dashboard_source` / `_breakdown_source` now use a regex
+              to tolerate the additive `month` param.
+            - Snapshot comparison now explicitly requests `?month=all`
+              (equivalent to pre-filter behavior) and strips the
+              additive keys before diffing.
+          Two pre-existing DB-drift failures in this file were already
+          failing before this change (unrelated).
+
+          Main-agent pytest run:
+            - test_bug_dashboard_month_filter.py: 1/1 PASS
+            - test_p6_slice2_dashboard.py: 11/13 (2 pre-existing drift)
+            - reconcile: healthy 21/21.
+
+          Testing agent, please verify the 7 scenarios in
+          `agent_communication` at the end of this file.
+
   - task: "Bug fix — Advance-payment customer reuse (canonical party creation + dropdown surfacing + normalized-name dedupe)"
     implemented: true
     working: true
@@ -3398,7 +3471,7 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Bug fix — Advance-payment customer reuse (canonical party creation + dropdown surfacing + normalized-name dedupe)"
+    - "Feature — Dashboard month filter (All Time / Current / Previous / individual months) applied to all KPIs, charts, summaries"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -3406,7 +3479,114 @@ test_plan:
 agent_communication:
   - agent: "main"
     message: |
-      Applied a backend-only bug fix: **Advance-payment customer reuse**.
+      Added a month filter at the top of the Dashboard only.
+
+      **User spec:**
+      Options: All Time · Current Month · Previous Month · individual
+      months rendered as "April 2026". Selecting a month filters ALL
+      dashboard KPIs, charts and summaries by that month's transaction /
+      order dates. Default = Current Month.
+
+      **Backend changes** (`backend/server.py`):
+      - `/api/dashboard` accepts optional `month` query param:
+        `"all"` | `"current"` | `"previous"` | `"YYYY-MM"`. Default when
+        omitted is `"current"`. Any other value → HTTP 400.
+      - Server-computes `[from_date, to_date)` window and filters the
+        five source collections BEFORE aggregation:
+          • orders → by `order_date`
+          • customer_payments → by `date`
+          • purchase_payments → by `date`
+          • cash_book_entries → by `date`
+          • purchases → by `purchase_date`
+        Every downstream domain helper (`sum_received_kpi`,
+        `sum_paid_kpi`, `sum_mode_totals`, `compute_party_metrics`,
+        `sum_dashboard_outstanding_receivable_paise`) is called
+        unchanged — the filter only narrows the source lists.
+      - Response now also returns:
+          `applied_month`: {mode, key, label, from_date, to_date}
+          `available_months`: sorted-desc list of "YYYY-MM" strings
+            derived from ALL orders + payments (independent of the
+            current filter — used by the dropdown).
+      - **Zero changes** to accounting calculations, `dashboard_breakdown`,
+        `/api/reconcile`, or any other endpoint.
+
+      **Frontend changes** (`frontend/src/pages/Dashboard.jsx`):
+      - New month `<select>` at the top with data-testid
+        `dash-month-select`.
+      - Options: "All Time" / "Current Month" / "Previous Month" +
+        optgroup "Individual months" listing every month from
+        `available_months` rendered as "April 2026".
+      - Default value = `"current"`.
+      - useEffect re-fetches `/api/dashboard` with `?month=<selected>`
+        whenever the selection changes.
+      - Applied-month label shown next to the dropdown
+        (`data-testid="dash-month-applied-label"`).
+      - No changes to any other page or component.
+
+      **Fixture-drift patch:**
+      - `tests/test_p6_slice2_dashboard.py::_dashboard_source` and
+        `::_breakdown_source` used to look for the exact string
+        `"async def dashboard():"` — updated to a regex accepting any
+        argument list so the additive `month` param doesn't break them.
+      - Snapshot tests updated to explicitly call `?month=all` (== old
+        no-filter behavior) and to strip the additive `applied_month` /
+        `available_months` keys before diffing. (Pre-existing DB-drift
+        failures in these snapshot tests are unrelated — they were
+        already failing before this change.)
+
+      **Focused test** (`tests/test_bug_dashboard_month_filter.py`,
+      NEW): single test class `TestDashboardMonthFilter` with one
+      method `test_month_filter_updates_all_dashboard_figures` that
+      creates two orders (April + May), then hits the dashboard with
+      `month=all`, `month=2026-04`, `month=2026-05`, `month=2026-06`,
+      `month=current`, `month=previous`, and an invalid value.
+      Asserts:
+        - `applied_month` metadata matches the requested slice for
+          each call (mode/key/label/from_date/to_date).
+        - `available_months` includes both `2026-04` and `2026-05`.
+        - `top_customers` for April includes only the April client
+          and NOT the May client (and vice versa for May).
+        - `monthly` series in a filtered response only contains keys
+          inside the window.
+        - Invalid `month=not-a-month` → HTTP 400.
+
+      **Main-agent pytest results:**
+      - `tests/test_bug_dashboard_month_filter.py`: 1/1 PASS
+      - Full combined bug-fix + Slice 2 dashboard test file: 11/13 pass;
+        2 pre-existing DB-drift failures unrelated to this change.
+      - `/api/reconcile`: still healthy 21/21.
+
+      **Please run deep_testing_backend_v2** to independently verify
+      the six scenarios in `tests/test_bug_dashboard_month_filter.py`
+      via the live API at http://localhost:8001. Auth:
+      `admin@artisan.local` / `Admin@12345`.
+
+      No frontend testing needed unless the user asks (the frontend
+      change is a small dropdown that rebinds the same fetch to
+      `?month=<value>`). Focus verification on:
+
+      1. `GET /api/dashboard` (no param) uses `month=current` by
+         default — response `applied_month.mode == "current"`.
+      2. `GET /api/dashboard?month=all` returns `applied_month.mode ==
+         "all"` and `available_months` list is populated.
+      3. `GET /api/dashboard?month=2026-04` returns
+         `applied_month.label == "April 2026"` and
+         `applied_month.from_date == "2026-04-01"`,
+         `applied_month.to_date == "2026-05-01"`.
+      4. `GET /api/dashboard?month=previous` and `?month=current`
+         return sensible windows (`from_date < to_date`, one calendar
+         month apart).
+      5. `GET /api/dashboard?month=not-a-month` → HTTP 400.
+      6. Filter actually narrows every downstream aggregate: create a
+         one-off order in April, hit `?month=2026-04` and confirm the
+         client appears in `top_customers`; hit `?month=2026-05` and
+         confirm the client does NOT appear.
+      7. `GET /api/reconcile` remains `healthy: true`, 21/21 passed.
+
+      Update the "Feature — Dashboard month filter" backend task entry
+      in `test_result.md` with `working: true/false` and a
+      status_history entry with your findings.
+
 
       **The bug (user report):**
       A customer name entered while recording an advance / customer

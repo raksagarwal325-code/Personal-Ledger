@@ -87,6 +87,14 @@ const monthLabel = (m) => {
   return d.toLocaleDateString("en-IN", { month: "short", year: "2-digit" });
 };
 
+// Long-form month label used inside the filter dropdown (e.g. "April 2026").
+const monthLabelLong = (m) => {
+  if (!m) return "";
+  const [y, mm] = m.split("-");
+  const d = new Date(Number(y), Number(mm) - 1, 1);
+  return d.toLocaleDateString("en-IN", { month: "long", year: "numeric" });
+};
+
 export default function Dashboard() {
   const [data, setData] = useState(null);
   const [partyLedger, setPartyLedger] = useState(null);
@@ -94,11 +102,16 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [selectedMain, setSelectedMain] = useState(null);
   const [drawerKpi, setDrawerKpi] = useState(null);
+  // Bug fix (2026-07-22) · Dashboard month filter.
+  // Default = "current" (this month) per user spec. Values:
+  //   "all" | "current" | "previous" | "YYYY-MM"
+  const [selectedMonth, setSelectedMonth] = useState("current");
   const openKpi = (id) => setDrawerKpi(id);
 
   useEffect(() => {
+    setLoading(true);
     Promise.all([
-      api.get("/dashboard"),
+      api.get("/dashboard", { params: { month: selectedMonth } }),
       api.get("/party-ledger-v2/summary").catch(() => ({ data: null })),
       api.get("/party-ledger-v2/fathers-firm-settlement").catch(() => ({ data: null })),
     ]).then(([r, r2, r3]) => {
@@ -108,9 +121,11 @@ export default function Dashboard() {
       setLoading(false);
       if (r.data?.main_categories?.length) {
         setSelectedMain(r.data.main_categories[0].main_category);
+      } else {
+        setSelectedMain(null);
       }
     }).catch(() => setLoading(false));
-  }, []);
+  }, [selectedMonth]);
 
   if (loading) {
     return (
@@ -135,6 +150,38 @@ export default function Dashboard() {
         title="Workshop at a glance"
         subtitle="Order-level revenue, cost, profit and GST — with drill-downs into product and customer performance."
       />
+
+      {/* Bug fix (2026-07-22) · Month filter — applies to every KPI,
+          chart and summary below via ?month=… on /api/dashboard. */}
+      <div className="mb-4 flex items-center gap-3 flex-wrap" data-testid="dash-month-filter">
+        <label htmlFor="dash-month-select" className="label-caps text-[11px]"
+               style={{ color: "var(--muted)" }}>
+          Month
+        </label>
+        <select
+          id="dash-month-select"
+          data-testid="dash-month-select"
+          value={selectedMonth}
+          onChange={(e) => setSelectedMonth(e.target.value)}
+          className="border rounded px-3 py-1.5 text-sm bg-white"
+          style={{ borderColor: "var(--border-warm)", color: "var(--ink)" }}
+        >
+          <option value="all">All Time</option>
+          <option value="current">Current Month</option>
+          <option value="previous">Previous Month</option>
+          {(data?.available_months || []).length > 0 && (
+            <optgroup label="Individual months">
+              {(data?.available_months || []).map((m) => (
+                <option key={m} value={m}>{monthLabelLong(m)}</option>
+              ))}
+            </optgroup>
+          )}
+        </select>
+        <span className="text-[11px]" style={{ color: "var(--muted)" }}
+              data-testid="dash-month-applied-label">
+          Showing: <strong>{data?.applied_month?.label || "—"}</strong>
+        </span>
+      </div>
 
       {/* Primary KPI Row */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 md:gap-6 mb-4">

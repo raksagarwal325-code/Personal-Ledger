@@ -1640,8 +1640,103 @@ async def list_customers():
 # DASHBOARD
 # ================================================================
 @api_router.get("/dashboard")
-async def dashboard():
-    orders = await db.orders.find({}, {"_id": 0}).to_list(10000)
+async def dashboard(month: Optional[str] = None):
+    """Aggregate KPIs / charts / summaries.
+
+    Bug fix (2026-07-22) · Dashboard month filter.
+    Optional `month` query param controls a single-month slice applied
+    to every source collection BEFORE aggregation:
+      • `"all"` (or omitted-empty-none) — no date filter.
+      • `"current"` — current calendar month (server-local UTC).
+      • `"previous"` — previous calendar month.
+      • `"YYYY-MM"` — specific month (e.g. `"2026-04"`).
+    Default (when `month` is None) is `"current"` per the user spec.
+    Accounting calculations are UNCHANGED — the filter only narrows
+    the source lists; every downstream sum/aggregate is the identical
+    domain helper as before.
+    """
+    # ── Resolve the requested month window ───────────────────────────────
+    def _month_bounds(year: int, mon: int) -> tuple[str, str, str, str]:
+        start = f"{year:04d}-{mon:02d}-01"
+        if mon == 12:
+            end = f"{year + 1:04d}-01-01"
+        else:
+            end = f"{year:04d}-{mon + 1:02d}-01"
+        label = datetime(year, mon, 1).strftime("%B %Y")
+        key = f"{year:04d}-{mon:02d}"
+        return start, end, key, label
+
+    today = datetime.now(timezone.utc)
+    requested = (month or "current").strip().lower()
+    if requested in ("", "all", "alltime", "all_time"):
+        from_dt, to_dt, applied_key, applied_label = None, None, "all", "All Time"
+        applied_mode = "all"
+    else:
+        if requested == "current":
+            from_dt, to_dt, applied_key, applied_label = _month_bounds(today.year, today.month)
+            applied_mode = "current"
+        elif requested in ("previous", "prev"):
+            prev_year = today.year if today.month > 1 else today.year - 1
+            prev_month = today.month - 1 if today.month > 1 else 12
+            from_dt, to_dt, applied_key, applied_label = _month_bounds(prev_year, prev_month)
+            applied_mode = "previous"
+        else:
+            # Expect "YYYY-MM" — reject anything else.
+            try:
+                y_str, m_str = requested.split("-", 1)
+                y = int(y_str)
+                m = int(m_str)
+                if not (1 <= m <= 12):
+                    raise ValueError
+                from_dt, to_dt, applied_key, applied_label = _month_bounds(y, m)
+                applied_mode = "specific"
+            except Exception:
+                raise HTTPException(
+                    400,
+                    f"Invalid `month` value {requested!r}. "
+                    "Expected 'all', 'current', 'previous', or 'YYYY-MM'."
+                )
+
+    def _in_window(date_str: Optional[str]) -> bool:
+        if from_dt is None:
+            return True
+        if not date_str:
+            return False
+        # ISO-8601 dates sort lexicographically. Compare on the leading
+        # 10 chars so both "YYYY-MM-DD" and "YYYY-MM-DDTHH:MM:SS…Z"
+        # forms work identically.
+        d = str(date_str)[:10]
+        return from_dt <= d < to_dt
+
+    orders_all = await db.orders.find({}, {"_id": 0}).to_list(10000)
+    cust_pays_all = await db.customer_payments.find({}, {"_id": 0}).to_list(20000)
+    purchase_pays_all = await db.purchase_payments.find({}, {"_id": 0}).to_list(20000)
+    cb_entries_all_raw = await db.cash_book_entries.find({}, {"_id": 0}).to_list(20000)
+    purchases_all = await db.purchases.find({}, {"_id": 0}).to_list(20000)
+
+    # Filter each source list by its natural transaction / order date.
+    orders = [o for o in orders_all if _in_window(o.get("order_date"))]
+    cust_pays = [p for p in cust_pays_all if _in_window(p.get("date"))]
+    purchase_pays = [p for p in purchase_pays_all if _in_window(p.get("date"))]
+    cb_entries_all = [c for c in cb_entries_all_raw if _in_window(c.get("date"))]
+    purchases = [p for p in purchases_all if _in_window(p.get("purchase_date"))]
+
+    # Available months (dropdown source) — derived from ALL orders +
+    # payments regardless of the current filter. Sorted DESC so the most
+    # recent month appears first in the frontend menu.
+    _months: set[str] = set()
+    for coll, key in (
+        (orders_all, "order_date"),
+        (cust_pays_all, "date"),
+        (purchase_pays_all, "date"),
+        (cb_entries_all_raw, "date"),
+        (purchases_all, "purchase_date"),
+    ):
+        for row in coll:
+            d = row.get(key)
+            if d and len(str(d)) >= 7:
+                _months.add(str(d)[:7])
+    available_months = sorted(_months, reverse=True)
 
     operating_revenue = sum(o.get("operating_revenue") or 0 for o in orders)
     invoice_value = sum(o.get("invoice_total") or 0 for o in orders)
@@ -1678,9 +1773,9 @@ async def dashboard():
     # of the domain layer. This endpoint fetches EVERYTHING (no inline
     # Mongo filter) and lets `is_*_active` / `is_cash_book_entry_canonical`
     # decide what's canonical. Guarantees the same rule reconcile applies.
-    cust_pays = await db.customer_payments.find({}, {"_id": 0}).to_list(20000)
-    purchase_pays = await db.purchase_payments.find({}, {"_id": 0}).to_list(20000)
-    cb_entries_all = await db.cash_book_entries.find({}, {"_id": 0}).to_list(20000)
+    # Bug fix (2026-07-22) · The `cust_pays`, `purchase_pays`,
+    # `cb_entries_all`, `purchases` and `orders` lists were fetched and
+    # month-filtered at the top of this function — reuse them here.
 
     received = from_paise(sum_received_kpi(cust_pays, cb_entries_all))
     paid = from_paise(sum_paid_kpi(purchase_pays, cb_entries_all))
@@ -1710,7 +1805,7 @@ async def dashboard():
 
     # Purchase KPIs (vendor bills & payments). The `purchase_paid` KPI must
     # equal Σ(active purchase_payments.amount) — routed via domain.
-    purchases = await db.purchases.find({}, {"_id": 0}).to_list(20000)
+    # Bug fix (2026-07-22) · `purchases` was pre-filtered by month above.
     purchase_value = sum((p.get("invoice_total") or 0) for p in purchases)
     purchase_paid = from_paise(sum(
         to_paise(p.get("amount")) for p in purchase_pays
@@ -1855,6 +1950,15 @@ async def dashboard():
         "top_customers": top_customers,
         "top_products": top_products,
         "modes": mode_series,
+        # Bug fix (2026-07-22) · Dashboard month filter metadata.
+        "applied_month": {
+            "mode": applied_mode,   # "all" | "current" | "previous" | "specific"
+            "key": applied_key,     # "all" or "YYYY-MM"
+            "label": applied_label, # "All Time" or "April 2026"
+            "from_date": from_dt,   # inclusive lower bound ("YYYY-MM-01") or null
+            "to_date": to_dt,       # exclusive upper bound or null
+        },
+        "available_months": available_months,
     }
 
 
