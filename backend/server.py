@@ -688,6 +688,22 @@ async def _sync_order_linked_purchases(order: dict) -> dict:
             supplier_id, vendor_name = await _resolve_supplier(supplier_id_raw, supplier_name_raw)
             if not vendor_name:
                 continue
+            # Bug fix (2026-07-22): resolve the canonical vendor party ID
+            # once per (supplier_id, vendor_name) tuple so both new and
+            # updated linked purchases carry it. Factory rows route to
+            # SYSTEM_FF_ID via the FF alias check; other rows resolve
+            # via the deterministic get_or_create_vendor_party helper.
+            vendor_party_id: str | None = None
+            if supplier_id == FACTORY_SUPPLIER_ID or is_ff_alias(vendor_name):
+                vendor_party_id = SYSTEM_FF_ID
+            elif vendor_name:
+                # get_or_create_vendor_party is idempotent — it returns the
+                # existing canonical party if one already matches, else
+                # creates a new one. Never guesses on ambiguous matches.
+                party = await get_or_create_vendor_party(db, vendor_name)
+                if party and party.get("id"):
+                    vendor_party_id = party["id"]
+
             for cat in COST_CATEGORIES:
                 amt = float(src.get(cat) or 0)
                 if amt <= 0.005:
@@ -716,6 +732,11 @@ async def _sync_order_linked_purchases(order: dict) -> dict:
                     "linked_order_item_id": it.get("id"),
                     "linked_cost_category": cat,
                     "source_type": "order_product_purchase",
+                    # Bug fix (2026-07-22): stamp the resolved canonical
+                    # vendor party ID so vendor payables, Party Ledger v2,
+                    # and reconciliation all key off the stable ID rather
+                    # than the (renamable, duplicable) display name.
+                    "vendor_party_id": vendor_party_id,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
 
@@ -2972,6 +2993,164 @@ async def run_party_migration_now():
     doc = {
         "id": str(uuid.uuid4()),
         "phase": "P1_party_identity",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        **report,
+    }
+    await db.admin_migration_reports.insert_one(doc)
+    return {k: v for k, v in doc.items() if k != "_id"}
+
+
+# ─── Bug fix (2026-07-22) · Canonical vendor_party_id backfill ──────────────
+#
+# Every Purchase and PurchasePayment must carry `vendor_party_id` pointing
+# at the canonical `db.parties` row for its vendor. Historically the
+# auto-generated Order → Purchase linkage set only `vendor_name`; renaming
+# a vendor or two similarly-named parties made the display fragile.
+#
+# This migration is idempotent — safe to re-run any number of times. It
+# NEVER guesses on ambiguous matches. Unmatched / ambiguous rows are
+# reported so they can be resolved manually via the party rename / merge
+# admin flow.
+
+async def _resolve_vendor_party_for_doc(doc: dict) -> tuple[str | None, str]:
+    """Resolve the vendor party for a purchase-like doc using the
+    documented resolution order. Returns (party_id, resolution).
+
+    Resolution order (deterministic, non-destructive):
+      1. Existing valid `vendor_party_id` on doc + party actually exists.
+      2. Factory alias on `vendor_name` → SYSTEM_FF_ID.
+      3. `linked_supplier_id == FACTORY_SUPPLIER_ID` → SYSTEM_FF_ID.
+      4. Existing `linked_supplier_id` matches a vendor with `party_id`.
+      5. Normalized `vendor_name` matches EXACTLY ONE non-system vendor
+         party.
+      6. Otherwise unmatched (may be created via `get_or_create_vendor_party`
+         if the name is unambiguous).
+
+    `resolution` is one of: "already_linked" · "factory_alias" ·
+    "supplier_id_match" · "vendor_name_created" · "vendor_name_matched"
+    · "ambiguous" · "unmatched".
+    """
+    # (1) already linked?
+    existing_id = doc.get("vendor_party_id")
+    if existing_id:
+        exists = await db.parties.find_one({"id": existing_id}, {"_id": 1})
+        if exists:
+            return existing_id, "already_linked"
+
+    vname = (doc.get("vendor_name") or "").strip()
+
+    # (2) Factory / FF alias
+    if is_ff_alias(vname):
+        return SYSTEM_FF_ID, "factory_alias"
+
+    # (3) linked_supplier_id === Factory
+    supplier_id = doc.get("linked_supplier_id")
+    if supplier_id and supplier_id == FACTORY_SUPPLIER_ID:
+        return SYSTEM_FF_ID, "factory_alias"
+
+    # (4) linked_supplier_id → vendors → party_id
+    if supplier_id:
+        v = await db.vendors.find_one(
+            {"id": supplier_id}, {"_id": 0, "party_id": 1, "name": 1}
+        )
+        if v and v.get("party_id"):
+            return v["party_id"], "supplier_id_match"
+
+    # (5) Normalized vendor name → non-ambiguous vendor party
+    if vname:
+        # Ambiguity check: how many non-system, non-archived vendor parties
+        # match this normalized name?
+        from party_sync import normalize_name
+        norm = normalize_name(vname)
+        if norm:
+            matches = await db.parties.find(
+                {"type": "vendor", "normalized_name": norm,
+                 "archived": {"$ne": True}, "is_system": {"$ne": True}},
+                {"_id": 0, "id": 1, "name": 1},
+            ).to_list(5)
+            if len(matches) == 1:
+                return matches[0]["id"], "vendor_name_matched"
+            if len(matches) > 1:
+                return None, "ambiguous"
+
+        # Fall through — no exact match: create the canonical vendor party
+        # via the shared helper. This mirrors how manual create_purchase
+        # handled the missing-party case and stays consistent with
+        # `run_party_migration` which already creates parties for
+        # every distinct purchase vendor name.
+        p = await get_or_create_vendor_party(db, vname)
+        if p and p.get("id"):
+            return p["id"], "vendor_name_created"
+
+    return None, "unmatched"
+
+
+async def _backfill_purchase_vendor_party_ids() -> dict:
+    """Set `vendor_party_id` on every db.purchases + db.purchase_payments
+    row per the resolution order above. Never guesses on ambiguous names.
+
+    Report shape:
+      {
+        "purchases": {
+          "scanned": int, "already_linked": int, "newly_linked": int,
+          "ambiguous": [ids...], "unmatched": [ids...],
+          "by_resolution": {"factory_alias": n, "supplier_id_match": n, ...},
+        },
+        "purchase_payments": { ...same shape... },
+      }
+    Idempotent — subsequent runs see previously linked rows as
+    `already_linked` and take no writes for them.
+    """
+    def _blank():
+        return {
+            "scanned": 0, "already_linked": 0, "newly_linked": 0,
+            "ambiguous": [], "unmatched": [],
+            "by_resolution": {},
+        }
+
+    rep = {"purchases": _blank(), "purchase_payments": _blank()}
+
+    async def _sweep(coll_name: str, section: str):
+        bucket = rep[section]
+        async for doc in db[coll_name].find({}, {"_id": 0}):
+            bucket["scanned"] += 1
+            pid, res = await _resolve_vendor_party_for_doc(doc)
+            bucket["by_resolution"][res] = bucket["by_resolution"].get(res, 0) + 1
+            if res == "already_linked":
+                bucket["already_linked"] += 1
+                continue
+            if res == "ambiguous":
+                bucket["ambiguous"].append({"id": doc.get("id"),
+                                            "vendor_name": doc.get("vendor_name")})
+                continue
+            if res == "unmatched" or not pid:
+                bucket["unmatched"].append({"id": doc.get("id"),
+                                            "vendor_name": doc.get("vendor_name")})
+                continue
+            # Newly linked (factory_alias, supplier_id_match,
+            # vendor_name_matched, vendor_name_created).
+            await db[coll_name].update_one(
+                {"id": doc["id"]}, {"$set": {"vendor_party_id": pid}}
+            )
+            bucket["newly_linked"] += 1
+
+    await _sweep("purchases", "purchases")
+    await _sweep("purchase_payments", "purchase_payments")
+    return rep
+
+
+@api_router.post("/admin/purchases/backfill-vendor-party-id")
+async def admin_backfill_purchase_vendor_party_ids(
+    admin=Depends(_admin_dep),
+):
+    """Idempotent — re-runs the vendor_party_id backfill on every
+    db.purchases + db.purchase_payments row. Returns a structured
+    migration report with counts + lists of ambiguous / unmatched rows
+    for manual review."""
+    report = await _backfill_purchase_vendor_party_ids()
+    doc = {
+        "id": str(uuid.uuid4()),
+        "phase": "bug_fix_vendor_party_id_backfill",
         "created_at": datetime.now(timezone.utc).isoformat(),
         **report,
     }

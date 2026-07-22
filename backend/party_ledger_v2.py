@@ -274,10 +274,20 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
             })
 
     elif ptype == "vendor":
-        # Purchase invoices
-        query = {"vendor_name": pname}
+        # Purchase invoices — prefer canonical vendor_party_id, fall back
+        # to vendor_name (+ legacy_vendor_id) for docs that predate the
+        # 2026-07-22 vendor_party_id backfill.
+        purchase_or_clauses = [
+            {"vendor_party_id": party["id"]},
+            {"vendor_name": pname, "vendor_party_id": {"$in": [None, ""]}},
+            {"vendor_name": pname, "vendor_party_id": {"$exists": False}},
+        ]
         if party.get("legacy_vendor_id"):
-            query = {"$or": [{"vendor_id": party["legacy_vendor_id"]}, {"vendor_name": pname}]}
+            purchase_or_clauses.append(
+                {"vendor_id": party["legacy_vendor_id"],
+                 "vendor_party_id": {"$in": [None, ""]}}
+            )
+        query = {"$or": purchase_or_clauses}
         async for pur in db.purchases.find(query, {"_id": 0}):
             inv_p = to_paise(pur.get("invoice_total"))
             delta_p = _domain_derived_delta("purchase", inv_p)
@@ -295,8 +305,13 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
                 "origin": "auto",
                 "created_at": pur.get("created_at"),
             })
-        # Vendor payments
-        async for pay in db.purchase_payments.find({"vendor_name": pname}, {"_id": 0}):
+        # Vendor payments — same canonical-then-fallback resolution.
+        pp_query = {"$or": [
+            {"vendor_party_id": party["id"]},
+            {"vendor_name": pname, "vendor_party_id": {"$in": [None, ""]}},
+            {"vendor_name": pname, "vendor_party_id": {"$exists": False}},
+        ]}
+        async for pay in db.purchase_payments.find(pp_query, {"_id": 0}):
             amt_p = to_paise(pay.get("amount"))
             delta_p = _domain_derived_delta("vendor_payment", amt_p)
             out.append({
@@ -319,13 +334,18 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
 
     elif ptype == "fathers_firm":
         # Father's Firm acts as the "Factory" supplier on Order → Purchases:
-        # auto-linked purchase docs land here with vendor_name = FACTORY_PARTY_NAME
-        # ("Father's Firm"). Each such purchase increases what Rakshit owes FF,
-        # and any purchase payment against them reduces that same balance —
-        # mirroring the vendor branch above.
-        async for pur in db.purchases.find(
-            {"vendor_name": pname}, {"_id": 0},
-        ):
+        # auto-linked purchase docs land here with either vendor_party_id
+        # = SYSTEM_FF_ID (post 2026-07-22 backfill) or vendor_name =
+        # FACTORY_PARTY_NAME ("Father's Firm") for older docs. Each such
+        # purchase increases what Rakshit owes FF, and any purchase
+        # payment against them reduces that same balance — mirroring the
+        # vendor branch above.
+        ff_purchase_query = {"$or": [
+            {"vendor_party_id": party["id"]},
+            {"vendor_name": pname, "vendor_party_id": {"$in": [None, ""]}},
+            {"vendor_name": pname, "vendor_party_id": {"$exists": False}},
+        ]}
+        async for pur in db.purchases.find(ff_purchase_query, {"_id": 0}):
             inv_p = to_paise(pur.get("invoice_total"))
             if inv_p <= 0:
                 continue
@@ -348,7 +368,12 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
                 "origin": "auto",
                 "created_at": pur.get("created_at"),
             })
-        async for pay in db.purchase_payments.find({"vendor_name": pname}, {"_id": 0}):
+        ff_pp_query = {"$or": [
+            {"vendor_party_id": party["id"]},
+            {"vendor_name": pname, "vendor_party_id": {"$in": [None, ""]}},
+            {"vendor_name": pname, "vendor_party_id": {"$exists": False}},
+        ]}
+        async for pay in db.purchase_payments.find(ff_pp_query, {"_id": 0}):
             amt_p = to_paise(pay.get("amount"))
             if amt_p <= 0:
                 continue
