@@ -632,7 +632,7 @@ frontend:
              - Styled with red background (#fdecec) and border (#f5c1c1)
           
           ✅ (c) User remained on /login page
-             - URL: https://import-ledger-app.preview.emergentagent.com/login
+             - URL: https://ledger-sync-94.preview.emergentagent.com/login
              - No navigation occurred
           
           ✅ (d) Form fields retained values
@@ -655,7 +655,7 @@ frontend:
              - Toast visible before auto-dismiss
           
           ✅ (b) Redirected to dashboard
-             - URL changed to: https://import-ledger-app.preview.emergentagent.com/
+             - URL changed to: https://ledger-sync-94.preview.emergentagent.com/
              - Navigation successful
           
           ✅ (c) Dashboard content visible
