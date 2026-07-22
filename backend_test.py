@@ -12,7 +12,7 @@ from datetime import datetime, date
 from typing import Dict, List, Any, Optional
 
 # Backend URL from frontend/.env
-BASE_URL = "https://github-sync-ledger.preview.emergentagent.com/api"
+BASE_URL = "https://import-ledger-app.preview.emergentagent.com/api"
 
 # Test credentials from /app/memory/test_credentials.md
 ADMIN_EMAIL = "admin@artisan.local"
