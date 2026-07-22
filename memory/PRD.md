@@ -3,6 +3,18 @@
 ## Origin
 Repository `raksagarwal325-code/Personal-Ledger` cloned and continued as a full-stack ERP (FastAPI + MongoDB + React).
 
+## Latest bug fix (2026-07-22) · Canonical vendor_party_id linkage
+- **Every Purchase (manual + auto-generated) now carries `vendor_party_id`** stamped via the deterministic `get_or_create_vendor_party` helper (Factory/FF aliases → `SYSTEM_FF_ID`).
+- **NEW auto-generated Purchases** from Orders/Shipments:
+  - `source_type='order_freight_purchase'` — one per shipment with `(transporter, freight_paid>0)`. Stamped with transporter's canonical party_id. Deterministic linked_source_key `{order_id}::shipment::{shipment_id}::freight` → idempotent, no duplicates.
+  - `source_type='order_packing_purchase'` — one per order with `(packer_name, packing_cost>0)`. Stamped with packer's canonical party_id. Deterministic linked_source_key `{order_id}::order::packing`.
+  - Master sync `_sync_order_all_linked_purchases(order)` now called from POST + PUT /orders (runs product + freight + packing).
+- **New Order field** `packer_name: Optional[str] = ""`. Blank → no packing Purchase (internal expense only).
+- **PUT /purchases** now re-resolves `vendor_party_id` on vendor_name change (moves payable to new canonical party); same name → preserves linkage. Vendor **rename** never moves the linkage (identity preserved).
+- **Startup** auto-runs the idempotent `_backfill_purchase_vendor_party_ids` migration; reports scanned/already_linked/newly_linked/ambiguous/unmatched counts.
+- **Admin endpoint** `POST /api/admin/purchases/backfill-vendor-party-id` remains available for manual re-runs.
+- **Tests**: `backend/tests/test_bug_vendor_party_linkage.py` — **16/16 pass** (1.5s). testing_agent independently verified all 12 review scenarios pass + reconcile still healthy (21/21).
+
 ## Current mission
 Multi-phase refactor to make Cash Book a unified timeline sourced from canonical modules and remove dual sources-of-truth for money movement. Phases:
 1. **P0 — Retire legacy `db.payments`** *(shipped Feb 2026)*
