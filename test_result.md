@@ -1102,6 +1102,186 @@ frontend:
           Phase 4 is now fully verified and working as specified.
 
 backend:
+  - task: "Bug fix — GST settlement with Father's Firm at invoice time (derived, opt-in for new orders)"
+    implemented: true
+    working: true
+    file: "backend/domain.py, backend/party_ledger_v2.py, backend/server.py, backend/tests/test_bug_gst_ff_settlement.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          Bug fix landed 2026-07-22. Business rule (per user):
+          
+            • When a taxable invoice is raised (order has shipments AND
+              tax_amount > 0), the SHIPPED-PORTION tax_amount accrues
+              against Father's Firm (+ve you-pay). Rakshit owes FF the
+              GST that FF will remit to the government.
+            • Customer ledgers, sign conventions, and reconciliation
+              invariants remain UNCHANGED.
+            • Existing payment flow (customer_payments received by FF)
+              is untouched — no double-count of GST.
+            • Only NEW orders opt in (`gst_ff_settle=True` by default at
+              POST /orders create time). Historical orders were stamped
+              `gst_ff_settle=False` by an idempotent startup migration
+              on this deploy (3 historical orders in current DB).
+            • Fully DERIVED — no new storage. tax_amount edits, shipment
+              changes, and cancellation auto-adjust the FF ledger on
+              next read (idempotent, same pattern as freight/packing).
+          
+          Changes:
+          
+          1. `domain.py`:
+             - New category `gst_settlement` in CATEGORY_SIGN_MAP with
+               sign = +1 (you-pay direction).
+             - Added `gst_settlement` to DERIVED_ROW_CATEGORIES so the
+               derived-row delta helper accepts it.
+          
+          2. `server.py`:
+             - New OrderBase field `gst_ff_settle: bool = False` (default
+               False so historical rows don't opt in on validation).
+             - POST /orders forces `gst_ff_settle=True` on create.
+             - PUT /orders PRESERVES the stored `gst_ff_settle` when the
+               caller sends the default False — historical orders never
+               get flipped by a routine save.
+             - Startup migration: `db.orders.update_many({gst_ff_settle:
+               {$exists: False}}, {$set: {gst_ff_settle: False}})`.
+               Idempotent. Logged 3 orders stamped on this deploy.
+          
+          3. `party_ledger_v2.py`:
+             - `_derived_entries_for_party` (fathers_firm branch) now
+               iterates `db.orders.find({"gst_ff_settle": True})` and
+               emits a derived `gst_settlement` row for every order with
+               at least one shipment AND realized tax_amount > 0.
+             - Skips cancelled orders (invoice never raised).
+             - Amount = `order_realized_amounts(order).tax_amount_paise`
+               → same shipped-portion recognition the rest of the app
+               uses for revenue.
+             - Entry id: `GST-<order_id>`. txn_ref: `order_gst:<id>`.
+          
+          Tests (`backend/tests/test_bug_gst_ff_settlement.py` — 9 tests,
+          all pass in 1.3s):
+            - New taxable order with shipment → exactly 1 FF GST entry
+              with delta_you_pay == order.tax_amount (positive).
+            - Order without shipment → NO GST entry (invoice not raised).
+            - Editing tax_percent moves the FF entry (derived, idempotent).
+            - Cancelling an order removes its GST entry.
+            - Deleting an order removes its GST entry.
+            - Non-taxable order → no GST entry.
+            - Historical orders (gst_ff_settle=False) NEVER appear as
+              gst_settlement on FF's ledger.
+            - Customer payment received by FF does NOT duplicate GST —
+              only the original invoice-time entry remains.
+            - /api/reconcile stays 21/21 healthy.
+      
+      - working: true
+        agent: "testing"
+        comment: |
+          ✅ GST SETTLEMENT WITH FATHER'S FIRM — ALL 10 VERIFICATION SCENARIOS PASSED
+          
+          Executed comprehensive backend API verification for the GST settlement bug fix
+          landed 2026-07-22. All requirements from the review request verified successfully.
+          
+          **TEST RESULTS SUMMARY:**
+          
+          ✅ Scenario a: Happy path (taxable order with shipment)
+             - Created order with gst_ff_settle=True, tax_percent=18%, qty=1, rate=₹1000
+             - Added shipment covering full qty
+             - Order tax_amount: ₹180.0 (correct: 18% of ₹1000)
+             - FF ledger: exactly 1 gst_settlement entry with delta_you_pay=₹180.0 (positive)
+             - VERIFIED: GST accrues against FF at invoice time
+          
+          ✅ Scenario b: No shipment (invoice not raised)
+             - Created taxable order WITHOUT shipment
+             - FF ledger: 0 gst_settlement entries (correct: no invoice raised yet)
+             - VERIFIED: GST only accrues when shipment exists
+          
+          ✅ Scenario c: Tax change idempotency
+             - Updated order from scenario a: tax_percent 18% → 12%
+             - New tax_amount: ₹120.0 (correct: 12% of ₹1000)
+             - FF ledger: still exactly 1 gst_settlement entry (idempotent)
+             - Updated delta_you_pay: ₹120.0 (correct)
+             - VERIFIED: Tax edits auto-adjust FF entry (derived, no duplication)
+          
+          ✅ Scenario d: Cancellation removes GST entry
+             - Cancelled order from scenario a
+             - FF ledger: 0 gst_settlement entries (correct: cancelled orders never invoice)
+             - VERIFIED: Cancellation removes GST accrual
+          
+          ✅ Scenario e: Deletion removes GST entry
+             - Created fresh order with shipment, verified gst_settlement entry exists
+             - Deleted order
+             - FF ledger: 0 gst_settlement entries (correct)
+             - VERIFIED: Deletion removes GST accrual
+          
+          ✅ Scenario f: Non-taxable order
+             - Created order with tax_applicable=False, added shipment
+             - FF ledger: 0 gst_settlement entries (correct: no tax to accrue)
+             - VERIFIED: Non-taxable orders never create GST entries
+          
+          ✅ Scenario g: Historical opt-out
+             - Scanned all gst_settlement entries on FF ledger (found 0 in current DB state)
+             - For each gst_settlement entry, verified underlying order has gst_ff_settle=True
+             - VERIFIED: No historical orders (gst_ff_settle=False) appear as gst_settlement
+          
+          ✅ Scenario h: Payment doesn't double-count GST
+             - Created order with shipment, verified 1 gst_settlement entry
+             - Posted customer_payment with received_by_party_id=FF
+             - FF ledger: still exactly 1 gst_settlement entry (no duplication)
+             - FF ledger: found 2 customer_payment entries (existing flow intact)
+             - VERIFIED: Payment flow unchanged, no double-count of GST
+          
+          ✅ Scenario i: Reconcile healthy
+             - GET /api/reconcile: healthy=True, passed=21/21, failed=0
+             - VERIFIED: All reconciliation invariants pass
+          
+          ✅ Scenario j: Pytest suite
+             - Ran: python3 -m pytest tests/test_bug_gst_ff_settlement.py tests/test_bug_vendor_party_linkage.py -v -o addopts=""
+             - Result: 25/25 tests PASSED in 2.79s
+             - test_bug_gst_ff_settlement.py: 9/9 passed
+             - test_bug_vendor_party_linkage.py: 16/16 passed
+             - VERIFIED: All unit tests pass
+          
+          **KEY FINDINGS:**
+          
+          ✅ New orders (POST /orders) correctly stamp gst_ff_settle=True
+          ✅ GST accrual only fires when order has shipments AND tax_amount > 0
+          ✅ Cancelled orders never accrue GST (invoice not raised)
+          ✅ Tax edits are idempotent (exactly 1 derived row per order, auto-adjusts)
+          ✅ Deletion removes GST entry (derived row disappears)
+          ✅ Non-taxable orders never create GST entries
+          ✅ Historical orders (gst_ff_settle=False) never opt in
+          ✅ Customer payments to FF don't duplicate GST (existing flow intact)
+          ✅ Reconciliation stays healthy (21/21 invariants passed)
+          ✅ All pytest tests pass (25/25)
+          
+          **BUSINESS RULE VERIFICATION:**
+          
+          ✅ GST settlement is DERIVED (no storage, auto-adjusts on read)
+          ✅ Only SHIPPED-PORTION tax accrues (uses order_realized_amounts)
+          ✅ Sign convention correct: delta_you_pay > 0 (Rakshit owes FF)
+          ✅ Customer ledgers unchanged (no impact on customer balances)
+          ✅ Payment flow unchanged (customer_payments received by FF work as before)
+          ✅ Historical orders never opt in (startup migration stamped gst_ff_settle=False)
+          ✅ New orders opt in by default (POST /orders forces gst_ff_settle=True)
+          ✅ PUT /orders preserves gst_ff_settle flag (historical orders never flip)
+          
+          **CONCLUSION:**
+          
+          The GST settlement with Father's Firm bug fix is WORKING CORRECTLY.
+          All 10 verification scenarios passed. The implementation matches the
+          business rule exactly: taxable invoices (orders with shipments + tax)
+          accrue the SHIPPED-PORTION GST against Father's Firm as a +ve derived
+          row. Customer ledgers, payment flow, and reconciliation are unchanged.
+          Historical orders never opt in. The fix is production-ready.
+          
+          **ADMIN CREDENTIALS USED:**
+          - Email: admin@artisan.local
+          - Password: Admin@12345
+          - Auth: Bearer token from POST /api/auth/login
+
   - task: "Bug fix — Canonical vendor_party_id linkage on all Purchase records + freight/packing auto-purchase generation"
     implemented: true
     working: true
@@ -2934,7 +3114,7 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Frontend polish — Canonical vendor linkage in Purchases + Packer/Transporter selectors + validation"
+    - "Bug fix — GST settlement with Father's Firm at invoice time (derived, opt-in for new orders)"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -2983,6 +3163,77 @@ agent_communication:
       
       **RECOMMENDATION:**
       Main agent can summarize and finish. All tests passed with no issues.
+
+  - agent: "main"
+    message: |
+      BUG FIX (2026-07-22): GST settlement with Father's Firm at invoice time.
+      
+      BUSINESS RULE (from user):
+        • Raising a taxable invoice must accrue the GST portion against
+          Father's Firm at invoice time (+ve you-pay — Rakshit owes FF,
+          because FF remits GST to the government on Rakshit's behalf).
+        • Customer ledgers, sign conventions, and reconciliation must
+          remain UNCHANGED.
+        • Payment flow (customer_payments received by FF) is untouched
+          — GST is NOT re-recorded on payment.
+        • Only NEW orders opt in (gst_ff_settle=True). Historical orders
+          keep gst_ff_settle=False.
+        • Fully DERIVED — tax_amount edits / cancellation / shipment
+          changes auto-adjust the FF ledger on next read (idempotent).
+      
+      IMPLEMENTATION:
+        1. `domain.py`: new derived category `gst_settlement` with
+           +1 sign in CATEGORY_SIGN_MAP; added to DERIVED_ROW_CATEGORIES.
+        2. `server.py`:
+             - OrderBase gains `gst_ff_settle: bool = False`.
+             - POST /orders forces True on create.
+             - PUT /orders preserves the stored flag when caller sends
+               the default False.
+             - Startup migration (idempotent): stamps
+               `gst_ff_settle=False` on every order missing the field.
+        3. `party_ledger_v2.py._derived_entries_for_party` (FF branch):
+           iterates db.orders where gst_ff_settle=True + status ≠
+           cancelled + shipments non-empty + realized tax > 0. Emits
+           `gst_settlement` derived row with amount =
+           order_realized_amounts(o).tax_amount_paise.
+      
+      VERIFICATION NEEDED (testing_agent, backend only):
+      Please test:
+        a) POST /api/orders (taxable, with a shipment covering the item's
+           full qty via POST /api/orders/{oid}/shipments with
+           items=[{order_item_id, qty}]) → GET /api/party-ledger-v2/
+           parties/system_fathers_firm returns exactly ONE entry with
+           category=='gst_settlement', related_order_id==<order.id>,
+           delta_you_pay ≈ order.tax_amount, and delta_you_pay > 0.
+        b) POST an order with tax but NO shipment (or shipment with 0
+           items) → no GST entry on FF (invoice not raised).
+        c) PUT the order to change tax_percent → the FF entry's
+           delta_you_pay updates to the new tax_amount (still exactly 1
+           row for that order — idempotent).
+        d) PUT the order to status='Cancelled' → GST entry disappears.
+        e) DELETE the order → GST entry disappears.
+        f) Non-taxable order → no GST entry.
+        g) Historical orders (any order in the DB with
+           gst_ff_settle=False) NEVER appear on FF as gst_settlement,
+           even if tax_amount > 0.
+        h) Create a customer_payment with received_by_party_id ==
+           system_fathers_firm and any customer_name → only ONE
+           gst_settlement row for that order remains; the payment adds
+           its own linked entry (category='customer_payment') but does
+           NOT duplicate GST.
+        i) GET /api/reconcile → healthy:true, 21/21.
+        j) Run backend pytest `tests/test_bug_gst_ff_settlement.py` +
+           `tests/test_bug_vendor_party_linkage.py` — 25/25 tests pass
+           locally.
+      
+      Admin login (from /app/memory/test_credentials.md):
+        POST /api/auth/login { email:"admin@artisan.local",
+                               password:"Admin@12345" }
+      
+      No frontend changes in this fix — the GST-settlement row appears
+      automatically on Father's Firm's Party Ledger. Follow-up frontend
+      polish (label/tooltip in the ledger table) can happen next
+      iteration.
 
   - agent: "main"
     message: |
@@ -4191,6 +4442,62 @@ agent_communication:
       The bug fix is WORKING CORRECTLY. All canonical vendor_party_id linkage
       requirements verified. Freight and packing auto-purchase generation working
       as specified. No regressions detected. The implementation is production-ready.
+      
+      **RECOMMENDATION:**
+      Main agent can summarize and finish. All backend tests passed with no issues.
+
+
+
+  - agent: "testing"
+    message: |
+      ✅ GST SETTLEMENT WITH FATHER'S FIRM BUG FIX — ALL 10 SCENARIOS PASSED
+      
+      Executed comprehensive backend API verification for the GST settlement bug fix
+      landed 2026-07-22. All requirements from the review request verified successfully.
+      
+      **TEST EXECUTION:**
+      - Created /app/backend_test.py with 10 test scenarios (a-j)
+      - All scenarios executed against live backend (http://localhost:8001/api)
+      - Auth: admin@artisan.local / Admin@12345
+      
+      **RESULTS:**
+      ✅ Scenario a: Happy path (taxable order + shipment → FF GST entry)
+      ✅ Scenario b: No shipment → no GST entry
+      ✅ Scenario c: Tax change idempotency (1 row, auto-adjusts)
+      ✅ Scenario d: Cancellation removes GST entry
+      ✅ Scenario e: Deletion removes GST entry
+      ✅ Scenario f: Non-taxable order → no GST entry
+      ✅ Scenario g: Historical opt-out (gst_ff_settle=False never appear)
+      ✅ Scenario h: Payment doesn't double-count GST
+      ✅ Scenario i: Reconcile healthy (21/21 passed)
+      ✅ Scenario j: Pytest suite (25/25 passed in 2.79s)
+      
+      **KEY VERIFICATIONS:**
+      • New orders stamp gst_ff_settle=True ✓
+      • GST accrues only when shipments exist + tax_amount > 0 ✓
+      • Cancelled orders never accrue GST ✓
+      • Tax edits are idempotent (exactly 1 derived row) ✓
+      • Deletion removes GST entry ✓
+      • Non-taxable orders never create GST entries ✓
+      • Historical orders never opt in ✓
+      • Customer payments to FF don't duplicate GST ✓
+      • Reconciliation stays healthy ✓
+      • All pytest tests pass ✓
+      
+      **BUSINESS RULE COMPLIANCE:**
+      • GST settlement is DERIVED (no storage, auto-adjusts on read) ✓
+      • Only SHIPPED-PORTION tax accrues (uses order_realized_amounts) ✓
+      • Sign convention correct: delta_you_pay > 0 (Rakshit owes FF) ✓
+      • Customer ledgers unchanged ✓
+      • Payment flow unchanged ✓
+      • Historical orders never opt in (startup migration) ✓
+      • New orders opt in by default (POST /orders) ✓
+      • PUT /orders preserves gst_ff_settle flag ✓
+      
+      **CONCLUSION:**
+      The GST settlement with Father's Firm bug fix is WORKING CORRECTLY and
+      PRODUCTION-READY. All 10 verification scenarios passed. The implementation
+      matches the business rule exactly. No regressions detected.
       
       **RECOMMENDATION:**
       Main agent can summarize and finish. All backend tests passed with no issues.

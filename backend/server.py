@@ -253,6 +253,14 @@ class OrderBase(BaseModel):
     tax_amount: float = 0
     tax_amount_manual: bool = False
 
+    # Bug fix (2026-07-22) · GST settlement with Father's Firm on invoice.
+    # When True, the REALIZED (shipped-portion) tax_amount accrues as a
+    # +ve `gst_settlement` derived entry on Father's Firm's ledger
+    # (Rakshit owes FF the GST that FF will remit to the government).
+    # Historical orders keep gst_ff_settle=False (stamped by startup
+    # migration). New orders default to True at API-create time.
+    gst_ff_settle: bool = False
+
 
 class Order(OrderBase):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -1123,6 +1131,14 @@ async def create_order(payload: OrderBase):
     if validation_errors:
         raise HTTPException(400, {"detail": "Some purchase rows are missing a supplier.",
                                   "errors": validation_errors})
+    # Bug fix (2026-07-22): every ORDER created after the GST-FF-settlement
+    # rule shipped must accrue GST against Father's Firm at invoice time.
+    # We stamp gst_ff_settle=True on create so the derived FF ledger row
+    # fires as soon as the order becomes invoiced (i.e. has tax_amount > 0
+    # AND at least one shipment). Historical orders remain untouched
+    # (startup migration stamps them False) so the balance shift is
+    # additive-only and never disturbs old data.
+    data["gst_ff_settle"] = True
     order = Order(**data).model_dump()
     compute_order_aggregates(order)
     order["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -1196,6 +1212,15 @@ async def update_order(oid: str, payload: OrderBase):
                                   "errors": validation_errors})
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     compute_order_aggregates(data)
+    # Bug fix (2026-07-22): PRESERVE the existing gst_ff_settle flag so
+    # historical orders (stamped False by startup migration) NEVER get
+    # opted into GST-FF settlement retroactively via a PUT that omits the
+    # field (Pydantic default_factory = False on OrderBase). Only the
+    # explicit toggle path can flip it. Same idempotency guarantee as
+    # customer_party_id / vendor_party_id preservation.
+    if "gst_ff_settle" in existing and payload.gst_ff_settle is False:
+        # Caller passed the default False → treat as "no change requested".
+        data["gst_ff_settle"] = existing["gst_ff_settle"]
     # Phase 2: preserve customer_party_id when the client name matches or
     # resolves to the same party; changing to a different customer only
     # updates the id when the caller has explicitly reassigned via a fresh
@@ -5276,6 +5301,23 @@ async def _startup():
             })
     except Exception as e:
         logger.error(f"Vendor party linkage backfill failed: {e}")
+
+    # Bug fix (2026-07-22): One-time backfill — every ORDER that predates
+    # the GST-FF-settlement rule keeps gst_ff_settle=False so its GST
+    # never accrues against Father's Firm. Only NEW orders (via
+    # POST /orders) opt in. This is idempotent — subsequent runs no-op.
+    try:
+        res = await db.orders.update_many(
+            {"gst_ff_settle": {"$exists": False}},
+            {"$set": {"gst_ff_settle": False}},
+        )
+        if res.modified_count:
+            logger.info(
+                f"GST-FF-settle stamp: marked {res.modified_count} pre-existing "
+                "orders as gst_ff_settle=False (opt-out for historical data)."
+            )
+    except Exception as e:
+        logger.error(f"GST-FF-settle historical stamp failed: {e}")
 
 
 @app.on_event("shutdown")

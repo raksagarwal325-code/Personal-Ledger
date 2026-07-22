@@ -523,6 +523,13 @@ CATEGORY_SIGN_MAP = {
     "income":           +1,   # party gave Rakshit income
     "credit_note":      -1,
     "discount":         -1,
+    # Bug fix (2026-07-22) · GST settlement at invoice time.
+    # When a taxable invoice is raised, the GST portion accrues against
+    # Father's Firm (FF remits GST to the government on Rakshit's behalf).
+    # Rakshit owes FF the GST → you-pay increases by the realized tax.
+    # This is a DERIVED row (never stored) — same idempotency guarantee
+    # as sale_invoice / purchase / customer_payment.
+    "gst_settlement":   +1,
     # 'opening_balance', 'transfer', 'adjustment' use explicit direction hint.
 }
 
@@ -629,6 +636,10 @@ DERIVED_ROW_CATEGORIES = frozenset({
     "sale_invoice", "customer_payment",
     "purchase", "vendor_payment",
     "opening_balance",
+    # Bug fix (2026-07-22): GST accrual on invoice raises FF's you-pay
+    # balance. Derived row (auto-materialised from db.orders where
+    # gst_ff_settle=True and realised tax_amount > 0). Never stored.
+    "gst_settlement",
 })
 
 

@@ -61,6 +61,7 @@ from domain import (
     derived_row_delta_paise as _domain_derived_delta,
     fathers_firm_signed_amount_paise as _domain_ff_signed,
     fathers_firm_status_label as _domain_ff_status,
+    order_realized_amounts as _domain_order_realized,
 )
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -394,6 +395,48 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
                 "account_name": pay.get("account_name"),
                 "origin": "auto",
                 "created_at": pay.get("created_at"),
+            })
+
+        # ─── Bug fix (2026-07-22) · GST settlement at invoice time ─────────
+        # Every ORDER with `gst_ff_settle=True` AND realised tax_amount > 0
+        # AND at least one shipment (i.e. an invoice has actually been
+        # raised) contributes a +ve `gst_settlement` derived row against
+        # Father's Firm. The amount is the SHIPPED-PORTION tax_amount
+        # (from `order_realized_amounts`) — the same "recognised on
+        # shipment" rule the rest of the app uses for revenue.
+        #
+        # Historical orders (stamped `gst_ff_settle=False` by startup
+        # migration) never contribute. New orders default to True at
+        # create time. Fully DERIVED — nothing stored. If tax_amount
+        # is edited or shipments change, the entry auto-adjusts on the
+        # next read (idempotent, same pattern as freight/packing).
+        async for o in db.orders.find(
+            {"gst_ff_settle": True}, {"_id": 0}
+        ):
+            # Skip cancelled orders — they never invoice.
+            if (o.get("status") or "").lower() == "cancelled":
+                continue
+            # Skip orders with no shipment yet (invoice not raised).
+            if not (o.get("shipments") or []):
+                continue
+            real = _domain_order_realized(o)
+            tax_p = int(real.get("tax_amount_paise") or 0)
+            if tax_p <= 0:
+                continue
+            delta_p = _domain_derived_delta("gst_settlement", tax_p)
+            out.append({
+                "id": f"GST-{o.get('id')}",
+                "txn_ref": f"order_gst:{o.get('id')}",
+                "party_id": party["id"], "party_name": pname,
+                "date": o.get("last_shipped_date") or o.get("shipped_date") or o.get("order_date"),
+                "category": "gst_settlement",
+                "amount": from_paise(tax_p),
+                "delta_you_pay": from_paise(delta_p),
+                "notes": f"GST on invoice · Order {(o.get('id') or '')[:8]}"
+                         + (f" · {o.get('client_name')}" if o.get("client_name") else ""),
+                "related_order_id": o.get("id"),
+                "origin": "auto",
+                "created_at": o.get("created_at"),
             })
 
     # Opening balance as a synthetic first entry
