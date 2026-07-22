@@ -103,20 +103,32 @@
 #====================================================================================================
 
 user_problem_statement: |
-  Enable ALLOW_ADMIN_DATA_RESET=true in backend .env and verify Admin Data Management v1
-  works end-to-end:
-    1. Create sample orders + payments.
-    2. Run "Clear Transaction Data" (scope=clear_transaction_data).
-    3. Verify preserved: customers, vendors, products, accounts, the protected
-       Father's Firm system party (parties collection), users, business_settings.
-    4. Verify cleared: orders, quotations, purchases, customer_payments,
-       purchase_payments, cash_book_entries, transfers, party_ledger_entries,
-       legacy payments, admin_migration_reports.
-    5. Verify dashboard KPIs return to zero where expected after clear.
-    6. Load the test dataset (POST /api/admin/test-dataset/load) and verify it
-       appears (2 accounts, 2 purchases, 1 order, 1 customer_payment, 1 transfer),
-       plus system_fathers_firm still exists.
-  If those end-to-end tests pass, Admin Data Management v1 is complete.
+  Fix canonical vendor party linkage on all Purchase records + auto-generate
+  canonical freight & packing Purchases from Orders/Shipments.
+  
+  Required behaviours (from user brief, 2026-07-22):
+    1. Every purchase (manual + auto-generated) must store `vendor_party_id`
+       pointing at the canonical db.parties row. Vendor name is a
+       denormalized display field only.
+    2. `vendor_party_id` drives: Vendor Party Ledger, Vendor Outstanding,
+       Purchase Payments allocations, Vendor Payables/Advances, search,
+       exports, reconciliation.
+    3. Auto-generated purchases (order product sources, freight, packing,
+       other shipment services) MUST inherit the selected vendor's party_id
+       deterministically via `get_or_create_vendor_party` (or SYSTEM_FF_ID
+       for Factory/FF aliases).
+    4. Vendor rename must PRESERVE vendor_party_id. Editing a purchase to
+       a different vendor must MOVE the payable to the new party.
+    5. Backfill migration (idempotent) resolves missing vendor_party_id on
+       existing purchases and purchase_payments; reports scanned /
+       already_linked / newly_linked / ambiguous / unmatched counts.
+    6. /api/reconcile must remain healthy.
+  
+  Combined with earlier verified fixes:
+    - Dashboard Outstanding Receivable single-sourced through
+      `sum_dashboard_outstanding_receivable_paise`.
+    - Order-level `shipped_date` derived from shipments via
+      `derive_completion_shipped_date` — no manual entry.
 
 frontend:
   - task: "Login/Bootstrap — Toaster now global + CORS credentials fix"
@@ -747,6 +759,174 @@ frontend:
           Phase 4 is now fully verified and working as specified.
 
 backend:
+  - task: "Bug fix — Canonical vendor_party_id linkage on all Purchase records + freight/packing auto-purchase generation"
+    implemented: true
+    working: true
+    file: "backend/server.py, backend/tests/test_bug_vendor_party_linkage.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          Bug fix landed 2026-07-22. Changes:
+          
+          BACKEND (backend/server.py):
+          1. NEW helpers `_sync_order_linked_freight_purchases(order)` and
+             `_sync_order_linked_packing_purchases(order)` — deterministic,
+             idempotent auto-generation of canonical Purchase rows for
+             (shipment.transporter, freight_paid>0) and (order.packer_name,
+             packing_cost>0). Stamped with `vendor_party_id` resolved via
+             `get_or_create_vendor_party` (Factory/FF aliases → SYSTEM_FF_ID).
+             `source_type` ∈ {'order_freight_purchase', 'order_packing_purchase'}.
+             `linked_source_key` is deterministic → repeated syncs never duplicate.
+          2. NEW `_sync_order_all_linked_purchases(order)` — master sync that
+             calls product + freight + packing. POST/PUT /orders now call this.
+          3. Extended `_delete_order_linked_purchases` to purge ALL three
+             auto-linked source_types on order deletion.
+          4. Extended `_upsert_linked_service_purchase` — shared upsert helper
+             that preserves payment history + stale-marks when payments exist.
+          5. `PUT /purchases/{pid}` now re-resolves `vendor_party_id` when
+             vendor_name changes. Same name → keeps existing linkage. Different
+             name → moves the payable to the new canonical party. Ensures
+             vendors master has the new name too.
+          6. NEW Order field `packer_name: Optional[str] = ""` (default blank).
+             When blank, packing_cost is treated as internal expense — no
+             linked Purchase is emitted.
+          7. Startup auto-runs `_backfill_purchase_vendor_party_ids` (idempotent).
+             Logs counts (scanned/already_linked/newly_linked/ambiguous/unmatched)
+             and writes a migration report only when it actually did work.
+          8. `POST /admin/purchases/backfill-vendor-party-id` was already
+             present (from prior fix) — kept as manual re-run entry point.
+          
+          TESTS (backend/tests/test_bug_vendor_party_linkage.py — 16 tests):
+          - Manual POST /purchases stamps vendor_party_id.
+          - Same vendor across 2 purchases → same party_id (no duplicates).
+          - PUT /purchases preserves party_id on no-name-change.
+          - PUT /purchases MOVES party_id when vendor_name changes.
+          - Vendor RENAME preserves vendor_party_id on existing purchases.
+          - Order with (transporter, freight_paid>0) → linked freight Purchase
+            with correct vendor_party_id.
+          - Freight Purchase vendor_party_id matches a control manual purchase
+            for the same transporter (single canonical linkage).
+          - Repeated PUT /orders does NOT duplicate freight purchases.
+          - freight_paid=0 or blank transporter → no freight Purchase.
+          - Order with (packer_name, packing_cost>0) → linked packing Purchase
+            with correct vendor_party_id.
+          - Blank packer_name → no packing Purchase.
+          - Removing packer/packing on edit removes the linked Purchase.
+          - Admin backfill endpoint returns structured report.
+          - Second consecutive backfill run has newly_linked=0 (idempotent).
+          - /api/reconcile stays healthy.
+          
+          Local run: 16/16 pass in 1.57s. Ready for testing_agent verification.
+      - working: true
+        agent: "testing"
+        comment: |
+          ✅ BUG FIX VERIFICATION COMPLETE — ALL 12 SCENARIOS PASSED (16/16 pytest tests)
+          
+          Executed comprehensive backend API verification covering all requirements from
+          the review request (2026-07-22). All tests passed successfully.
+          
+          **TEST RESULTS SUMMARY:**
+          
+          ✅ Test 1: Manual Purchase Linkage (4/4 scenarios)
+             a. POST /purchases stamps vendor_party_id ✓
+             b. Same vendor returns same vendor_party_id (deterministic) ✓
+             c. PUT with same vendor_name preserves vendor_party_id ✓
+             d. PUT with different vendor_name MOVES vendor_party_id ✓
+          
+          ✅ Test 2: Vendor Rename Preserves Linkage
+             - Created purchase with vendor_party_id
+             - Renamed party via POST /parties/{pid}/rename
+             - Verified vendor_party_id unchanged on purchase ✓
+          
+          ✅ Test 3: Freight Auto-Purchase Generation
+             - Order with (transporter="TestTransporter_A", freight_paid=250)
+             - Exactly ONE freight Purchase created ✓
+             - vendor_party_id non-null ✓
+             - vendor_name matches transporter ✓
+             - invoice_total = 250.0 ✓
+          
+          ✅ Test 4: Freight Linkage Matches Manual Purchase
+             - Order with transporter="TestTransporter_B"
+             - Manual purchase with same vendor_name
+             - Both have SAME vendor_party_id (canonical linkage) ✓
+          
+          ✅ Test 5: Freight Sync Idempotency
+             - Created order with freight
+             - PUT order with identical body
+             - Exactly 1 freight purchase (not duplicated) ✓
+          
+          ✅ Test 6: Zero Freight/Blank Transporter Suppresses Purchase (2/2)
+             a. freight_paid=0 → NO freight Purchase ✓
+             b. transporter="" + freight_paid>0 → NO freight Purchase ✓
+          
+          ✅ Test 7: Packing Auto-Purchase Generation
+             - Order with (packer_name="TestPacker_A", packing_cost=180)
+             - Exactly ONE packing Purchase created ✓
+             - vendor_party_id non-null ✓
+             - invoice_total = 180.0 ✓
+          
+          ✅ Test 8: Blank Packer Suppresses Packing Purchase
+             - packing_cost=100, packer_name="" → NO packing Purchase ✓
+          
+          ✅ Test 9: Removing Packer/Packing Removes Linked Purchase
+             - Created order with packing → Purchase exists ✓
+             - PUT with packing_cost=0, packer_name="" → Purchase deleted ✓
+          
+          ✅ Test 10: Admin Backfill Migration Report (2/2)
+             - POST /admin/purchases/backfill-vendor-party-id returns structured report ✓
+             - Report has purchases + purchase_payments sections ✓
+             - Each section has: scanned, already_linked, newly_linked, ambiguous, 
+               unmatched, by_resolution ✓
+             - Second consecutive call: newly_linked=0 for both sections (idempotent) ✓
+          
+          ✅ Test 11: Reconciliation Stays Healthy
+             - GET /api/reconcile: healthy=true ✓
+             - summary.passed (21) == summary.total (21) ✓
+          
+          ✅ Test 12: Pre-Existing Pytest Suite
+             - Ran: python3 -m pytest tests/test_bug_vendor_party_linkage.py -v -o addopts=""
+             - Result: 16/16 tests PASSED in 1.53s ✓
+          
+          **DETAILED VERIFICATION:**
+          
+          All 12 scenarios from the review request verified:
+          1. Manual purchase linkage (POST/PUT with vendor_name) ✓
+          2. Vendor rename preserves linkage ✓
+          3. Freight auto-purchase generation ✓
+          4. Freight linkage matches manual purchase for same vendor ✓
+          5. Freight sync idempotency ✓
+          6. Zero freight or blank transporter suppresses purchase ✓
+          7. Packing auto-purchase ✓
+          8. Blank packer suppresses packing purchase ✓
+          9. Removing packer/packing removes linked purchase (when unpaid) ✓
+          10. Admin backfill migration report (idempotent) ✓
+          11. Reconciliation stays healthy ✓
+          12. Pytest suite (16/16 tests passed) ✓
+          
+          **KEY FINDINGS:**
+          
+          ✅ Every Purchase (manual + auto-generated) carries vendor_party_id
+          ✅ Deterministic party resolution (same vendor → same party_id)
+          ✅ Vendor rename preserves linkage (party_id unchanged)
+          ✅ Vendor change moves payable to new canonical party
+          ✅ Freight purchases auto-generated with correct vendor_party_id
+          ✅ Packing purchases auto-generated with correct vendor_party_id
+          ✅ Idempotent sync (repeated saves never duplicate)
+          ✅ Zero/blank suppression rules working correctly
+          ✅ Removal of packer/packing deletes linked purchase (when unpaid)
+          ✅ Admin backfill migration idempotent (newly_linked=0 on second run)
+          ✅ Reconciliation healthy (21/21 invariants passed)
+          
+          **CONCLUSION:**
+          
+          The bug fix is WORKING CORRECTLY. All canonical vendor_party_id linkage
+          requirements verified. Freight and packing auto-purchase generation working
+          as specified. No regressions detected. The implementation is production-ready.
+
   - task: "Phase 5 — /api/reconcile invariant engine + Admin UI"
     implemented: true
     working: true
@@ -2405,18 +2585,89 @@ backend:
 
 metadata:
   created_by: "main_agent"
-  version: "1.0"
-  test_sequence: 5
+  version: "1.1"
+  test_sequence: 6
   run_ui: true
 
 test_plan:
-  current_focus:
-    - "Bug fix — Dashboard Outstanding Receivable + Order Shipped Date derivation"
+  current_focus: []
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
 
 agent_communication:
+  - agent: "main"
+    message: |
+      BUG FIX (2026-07-22): Canonical vendor_party_id linkage on ALL Purchase
+      records + freight/packing auto-purchase generation.
+      
+      SCOPE:
+      Every Purchase (manual + auto-generated from Orders/Shipments) must be
+      linked to a canonical db.parties row via `vendor_party_id`. Vendor
+      name is a denormalized display field only. Financial relationships
+      key off the stable ID, not the (renamable/duplicable) display name.
+      
+      CHANGES:
+      1. Backend (server.py):
+         - NEW `_sync_order_linked_freight_purchases` — one linked Purchase
+           per (shipment.transporter, freight_paid>0), source_type =
+           'order_freight_purchase', stamped with transporter's party_id.
+         - NEW `_sync_order_linked_packing_purchases` — one linked Purchase
+           per (order.packer_name, packing_cost>0), source_type =
+           'order_packing_purchase', stamped with packer's party_id.
+         - NEW `_sync_order_all_linked_purchases` — master sync (called
+           from POST + PUT /orders) that runs product + freight + packing.
+         - `_delete_order_linked_purchases` now purges ALL three source_types.
+         - PUT /purchases now re-resolves vendor_party_id when vendor_name
+           changes (moves payable to new canonical party). Preserves it on
+           no-name-change.
+         - NEW Order field `packer_name` (Optional[str]).
+         - Startup auto-runs the idempotent
+           `_backfill_purchase_vendor_party_ids` migration (already existed
+           as admin endpoint) so every existing purchase gets linked before
+           any reads.
+      
+      2. Tests (backend/tests/test_bug_vendor_party_linkage.py):
+         16 tests, all passing locally in 1.57s.
+      
+      VERIFICATION NEEDED (testing_agent):
+      Please test:
+         a) POST /api/purchases stamps vendor_party_id.
+         b) PUT /api/purchases with same vendor name preserves party_id.
+         c) PUT /api/purchases with different vendor name MOVES payable
+            to a different canonical party (party_id changes).
+         d) Renaming a vendor party via POST /api/parties/{pid}/rename does
+            NOT affect vendor_party_id on existing purchases.
+         e) Creating an order with a shipment containing (transporter,
+            freight_paid > 0) auto-creates a canonical Purchase with
+            source_type='order_freight_purchase' and correct vendor_party_id.
+         f) Creating an order with (packer_name, packing_cost > 0)
+            auto-creates a canonical Purchase with
+            source_type='order_packing_purchase' and correct vendor_party_id.
+         g) Freight/packing Purchase's vendor_party_id equals the same
+            party_id resolved for a manually-created Purchase under the
+            same vendor name.
+         h) Repeated PUT /orders does not duplicate freight or packing
+            purchases.
+         i) freight_paid=0, blank transporter, or blank packer_name yield
+            NO auto-generated Purchase.
+         j) Removing packer_name / packing_cost from an existing order
+            removes the linked packing Purchase (when no payments exist).
+         k) POST /api/admin/purchases/backfill-vendor-party-id returns a
+            structured report with purchases + purchase_payments sections
+            and (scanned/already_linked/newly_linked/ambiguous/unmatched)
+            counts. Second consecutive call has newly_linked=0.
+         l) /api/reconcile stays healthy (all invariants pass).
+      
+      Admin auth for test:
+        POST /api/auth/login  {email:"admin@artisan.local",
+                               password:"Admin@12345"}
+        → Bearer token for all subsequent requests.
+      
+      Test file already exists: backend/tests/test_bug_vendor_party_linkage.py
+      (invoke via pytest with `-o addopts=""` to skip xdist; runs single-worker
+      in ~1.5s — 16/16 pass locally).
+
   - agent: "main"
     message: |
       BUG REPORT (user, Jul 2026): "Why am I unable to login in admin".
@@ -3296,3 +3547,82 @@ agent_communication:
       **Conclusion:**
       Both ERP bug fixes are PRODUCTION-READY. All requirements verified.
       No regressions detected. Main agent can summarize and finish.
+
+
+  - agent: "testing"
+    message: |
+      ✅ BUG FIX VERIFICATION COMPLETE — CANONICAL VENDOR_PARTY_ID LINKAGE + FREIGHT/PACKING AUTO-PURCHASE
+      
+      Executed comprehensive backend API verification for the bug fix landed 2026-07-22.
+      All 12 scenarios from the review request verified successfully.
+      
+      **TEST RESULTS SUMMARY:**
+      
+      ✅ Test 1: Manual Purchase Linkage (4/4 scenarios)
+         a. POST /purchases stamps vendor_party_id ✓
+         b. Same vendor returns same vendor_party_id (deterministic) ✓
+         c. PUT with same vendor_name preserves vendor_party_id ✓
+         d. PUT with different vendor_name MOVES vendor_party_id ✓
+      
+      ✅ Test 2: Vendor Rename Preserves Linkage
+         - Renamed party via POST /parties/{pid}/rename
+         - Verified vendor_party_id unchanged on purchase ✓
+      
+      ✅ Test 3: Freight Auto-Purchase Generation
+         - Order with (transporter, freight_paid=250) → freight Purchase created ✓
+         - vendor_party_id non-null, vendor_name matches, invoice_total correct ✓
+      
+      ✅ Test 4: Freight Linkage Matches Manual Purchase
+         - Freight purchase and manual purchase for same vendor have SAME vendor_party_id ✓
+      
+      ✅ Test 5: Freight Sync Idempotency
+         - PUT order with identical body → exactly 1 freight purchase (not duplicated) ✓
+      
+      ✅ Test 6: Zero Freight/Blank Transporter Suppresses Purchase (2/2)
+         a. freight_paid=0 → NO freight Purchase ✓
+         b. transporter="" + freight_paid>0 → NO freight Purchase ✓
+      
+      ✅ Test 7: Packing Auto-Purchase Generation
+         - Order with (packer_name, packing_cost=180) → packing Purchase created ✓
+         - vendor_party_id non-null, invoice_total correct ✓
+      
+      ✅ Test 8: Blank Packer Suppresses Packing Purchase
+         - packing_cost=100, packer_name="" → NO packing Purchase ✓
+      
+      ✅ Test 9: Removing Packer/Packing Removes Linked Purchase
+         - Created order with packing → Purchase exists ✓
+         - PUT with packing_cost=0, packer_name="" → Purchase deleted ✓
+      
+      ✅ Test 10: Admin Backfill Migration Report (2/2)
+         - POST /admin/purchases/backfill-vendor-party-id returns structured report ✓
+         - Second consecutive call: newly_linked=0 for both sections (idempotent) ✓
+      
+      ✅ Test 11: Reconciliation Stays Healthy
+         - GET /api/reconcile: healthy=true, 21/21 passed ✓
+      
+      ✅ Test 12: Pre-Existing Pytest Suite
+         - Ran: python3 -m pytest tests/test_bug_vendor_party_linkage.py -v
+         - Result: 16/16 tests PASSED in 1.53s ✓
+      
+      **KEY FINDINGS:**
+      
+      ✅ Every Purchase (manual + auto-generated) carries vendor_party_id
+      ✅ Deterministic party resolution (same vendor → same party_id)
+      ✅ Vendor rename preserves linkage (party_id unchanged)
+      ✅ Vendor change moves payable to new canonical party
+      ✅ Freight purchases auto-generated with correct vendor_party_id
+      ✅ Packing purchases auto-generated with correct vendor_party_id
+      ✅ Idempotent sync (repeated saves never duplicate)
+      ✅ Zero/blank suppression rules working correctly
+      ✅ Removal of packer/packing deletes linked purchase (when unpaid)
+      ✅ Admin backfill migration idempotent (newly_linked=0 on second run)
+      ✅ Reconciliation healthy (21/21 invariants passed)
+      
+      **CONCLUSION:**
+      
+      The bug fix is WORKING CORRECTLY. All canonical vendor_party_id linkage
+      requirements verified. Freight and packing auto-purchase generation working
+      as specified. No regressions detected. The implementation is production-ready.
+      
+      **RECOMMENDATION:**
+      Main agent can summarize and finish. All backend tests passed with no issues.

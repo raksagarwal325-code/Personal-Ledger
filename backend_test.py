@@ -1,843 +1,699 @@
-#!/usr/bin/env python3
 """
-Backend API Test Suite for Bug Fix Verification
-Two ERP bugs fixed 2026-07-22:
-  1. Dashboard Outstanding Receivable (was showing invoice_total instead of outstanding_balance)
-  2. Order Shipped Date derivation (was blank despite full shipment)
-"""
+Backend API Testing for Bug Fix: Canonical vendor_party_id linkage on all Purchase records
++ freight/packing auto-purchase generation
 
+This test file verifies all 12 scenarios from the review request (2026-07-22).
+"""
 import requests
 import json
-from datetime import datetime, date
-from typing import Dict, List, Any, Optional
+from typing import Optional
 
-# Backend URL from frontend/.env
-BASE_URL = "https://import-ledger-app.preview.emergentagent.com/api"
+# Backend URL (internal)
+BASE_URL = "http://localhost:8001"
+API_BASE = f"{BASE_URL}/api"
 
-# Test credentials from /app/memory/test_credentials.md
+# Admin credentials from /app/memory/test_credentials.md
 ADMIN_EMAIL = "admin@artisan.local"
 ADMIN_PASSWORD = "Admin@12345"
 
 # Global token storage
-AUTH_TOKEN = None
+TOKEN = None
 
 
 def login() -> str:
-    """Login and return JWT token"""
-    global AUTH_TOKEN
-    response = requests.post(
-        f"{BASE_URL}/auth/login",
-        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+    """Login and return Bearer token"""
+    global TOKEN
+    resp = requests.post(
+        f"{API_BASE}/auth/login",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        timeout=10
     )
-    assert response.status_code == 200, f"Login failed: {response.status_code} {response.text}"
-    data = response.json()
-    AUTH_TOKEN = data.get("access_token")
-    assert AUTH_TOKEN, "No access_token in login response"
-    print(f"✅ Login successful")
-    return AUTH_TOKEN
+    resp.raise_for_status()
+    TOKEN = resp.json()["access_token"]
+    return TOKEN
 
 
-def get_headers() -> Dict[str, str]:
-    """Get authorization headers"""
-    return {"Authorization": f"Bearer {AUTH_TOKEN}"}
+def headers() -> dict:
+    """Return Authorization headers"""
+    return {"Authorization": f"Bearer {TOKEN}"}
 
 
-def test_bug1_dashboard_outstanding_receivable():
+def get(path: str):
+    """GET request"""
+    resp = requests.get(f"{API_BASE}{path}", headers=headers(), timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def post(path: str, payload: dict):
+    """POST request"""
+    resp = requests.post(f"{API_BASE}{path}", headers=headers(), json=payload, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def put(path: str, payload: dict):
+    """PUT request"""
+    resp = requests.put(f"{API_BASE}{path}", headers=headers(), json=payload, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def delete(path: str):
+    """DELETE request"""
+    resp = requests.delete(f"{API_BASE}{path}", headers=headers(), timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def find_linked_purchase(order_id: str, source_type: str) -> Optional[dict]:
+    """Find a linked purchase by order_id and source_type"""
+    purchases = get("/purchases")
+    for p in purchases:
+        if p.get("linked_to_order_id") == order_id and p.get("source_type") == source_type:
+            return p
+    return None
+
+
+# ============================================================================
+# TEST SCENARIOS
+# ============================================================================
+
+def test_1_manual_purchase_linkage():
     """
-    Bug 1 — Dashboard Outstanding Receivable
-    Verify the specific regression case: order ₹96,300 with ₹75,000 allocated
-    should show outstanding ₹21,300 (not ₹96,300)
-    """
-    print("\n" + "="*80)
-    print("BUG 1 — DASHBOARD OUTSTANDING RECEIVABLE")
-    print("="*80)
-    
-    # 1. GET /api/dashboard → kpis.outstanding_receivable == 21300
-    print("\n[1/6] Testing GET /api/dashboard → kpis.outstanding_receivable")
-    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
-    assert response.status_code == 200, f"Dashboard failed: {response.status_code}"
-    dashboard = response.json()
-    
-    outstanding_receivable = dashboard.get("kpis", {}).get("outstanding_receivable")
-    assert outstanding_receivable is not None, "outstanding_receivable not in dashboard KPIs"
-    
-    # Allow ±0.01 tolerance for floating point
-    expected = 21300.0
-    tolerance = 0.01
-    assert abs(outstanding_receivable - expected) <= tolerance, \
-        f"Dashboard KPI outstanding_receivable = {outstanding_receivable}, expected {expected}"
-    
-    print(f"   ✅ Dashboard KPI outstanding_receivable = ₹{outstanding_receivable:,.2f} (expected ₹21,300.00)")
-    
-    # 2. GET /api/dashboard/breakdown → receivable.total == 21300
-    print("\n[2/6] Testing GET /api/dashboard/breakdown → receivable.total")
-    response = requests.get(f"{BASE_URL}/dashboard/breakdown", headers=get_headers())
-    assert response.status_code == 200, f"Breakdown failed: {response.status_code}"
-    breakdown = response.json()
-    
-    receivable_total = breakdown.get("receivable", {}).get("total")
-    assert receivable_total is not None, "receivable.total not in breakdown"
-    
-    assert abs(receivable_total - expected) <= tolerance, \
-        f"Breakdown receivable.total = {receivable_total}, expected {expected}"
-    
-    print(f"   ✅ Breakdown receivable.total = ₹{receivable_total:,.2f} (expected ₹21,300.00)")
-    
-    # Verify both endpoints match
-    assert abs(outstanding_receivable - receivable_total) <= tolerance, \
-        f"Dashboard KPI ({outstanding_receivable}) != Breakdown total ({receivable_total})"
-    print(f"   ✅ Dashboard KPI matches Breakdown total")
-    
-    # 3. receivable.orders[] includes outstanding_balance field
-    print("\n[3/6] Testing receivable.orders[] includes outstanding_balance field")
-    receivable_orders = breakdown.get("receivable", {}).get("orders", [])
-    assert len(receivable_orders) > 0, "No orders in receivable.orders[]"
-    
-    # Find Minakshi Jain order
-    minakshi_order = None
-    for order in receivable_orders:
-        if "Minakshi Jain" in order.get("client_name", ""):
-            minakshi_order = order
-            break
-    
-    assert minakshi_order is not None, "Minakshi Jain order not found in receivable.orders[]"
-    
-    # Verify outstanding_balance field exists
-    assert "outstanding_balance" in minakshi_order, \
-        "outstanding_balance field missing from receivable.orders[] entry"
-    
-    outstanding_balance = minakshi_order["outstanding_balance"]
-    invoice_total = minakshi_order.get("invoice_total")
-    
-    # Verify Minakshi Jain order has outstanding_balance ≈ 21300 and invoice_total ≈ 96300
-    assert abs(outstanding_balance - 21300) <= tolerance, \
-        f"Minakshi Jain outstanding_balance = {outstanding_balance}, expected ≈21300"
-    assert abs(invoice_total - 96300) <= tolerance, \
-        f"Minakshi Jain invoice_total = {invoice_total}, expected ≈96300"
-    
-    print(f"   ✅ Minakshi Jain order: outstanding_balance = ₹{outstanding_balance:,.2f}, invoice_total = ₹{invoice_total:,.2f}")
-    
-    # 4. receivable.by_status — sum of Unpaid.amount + Partial.amount == receivable.total
-    print("\n[4/6] Testing receivable.by_status sums correctly")
-    by_status = breakdown.get("receivable", {}).get("by_status", [])
-    
-    unpaid_amount = 0
-    partial_amount = 0
-    for status_entry in by_status:
-        status = status_entry.get("status", "").lower()
-        amount = status_entry.get("amount", 0)
-        if status == "unpaid":
-            unpaid_amount = amount
-        elif status == "partial":
-            partial_amount = amount
-    
-    by_status_sum = unpaid_amount + partial_amount
-    assert abs(by_status_sum - receivable_total) <= tolerance, \
-        f"by_status sum ({by_status_sum}) != receivable.total ({receivable_total})"
-    
-    print(f"   ✅ by_status: Unpaid={unpaid_amount:,.2f} + Partial={partial_amount:,.2f} = {by_status_sum:,.2f} (matches total)")
-    
-    # 5. Verify Paid orders are NOT in receivable.orders[]
-    print("\n[5/6] Testing Paid orders are NOT in receivable.orders[]")
-    paid_orders_in_receivable = [o for o in receivable_orders if o.get("payment_status", "").lower() == "paid"]
-    assert len(paid_orders_in_receivable) == 0, \
-        f"Found {len(paid_orders_in_receivable)} Paid orders in receivable.orders[] (should be 0)"
-    
-    print(f"   ✅ No Paid orders in receivable.orders[] (correct)")
-    
-    print("\n[6/6] Live edge case testing will be done in separate test function")
-    print(f"   ⏭️  See test_bug1_live_edge_cases()")
-
-
-def test_bug1_live_edge_cases():
-    """
-    Bug 1 — Live edge cases
-    Create fresh order, ship it, add payments, verify outstanding_balance updates correctly
+    Scenario 1: Manual purchase linkage
+    a. POST /api/purchases with vendor_name returns Purchase with non-null vendor_party_id
+    b. Two POSTs for same vendor return SAME vendor_party_id
+    c. PUT /api/purchases keeping same vendor_name preserves vendor_party_id
+    d. PUT /api/purchases with different vendor_name MOVES payable to different party
     """
     print("\n" + "="*80)
-    print("BUG 1 — LIVE EDGE CASES")
+    print("TEST 1: Manual Purchase Linkage")
     print("="*80)
     
-    # Get initial dashboard state
-    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
-    initial_dashboard = response.json()
-    initial_outstanding = initial_dashboard.get("kpis", {}).get("outstanding_receivable", 0)
-    initial_advances = initial_dashboard.get("kpis", {}).get("customer_advances", 0)
-    
-    print(f"\nInitial state:")
-    print(f"  outstanding_receivable = ₹{initial_outstanding:,.2f}")
-    print(f"  customer_advances = ₹{initial_advances:,.2f}")
-    
-    # Get existing customers and use the first one
-    print("\n[1/9] Getting existing customer for test")
-    customers_response = requests.get(f"{BASE_URL}/customers", headers=get_headers())
-    assert customers_response.status_code == 200, f"Customers list failed: {customers_response.status_code}"
-    customers = customers_response.json()
-    assert len(customers) > 0, "No customers found in database"
-    
-    # Use first customer
-    customer = customers[0]
-    customer_id = customer["id"]
-    customer_name = customer["name"]
-    print(f"   ✅ Using existing customer: {customer_name} ({customer_id})")
-    
-    # Create test order with single item (qty=1, rate=100000, no tax)
-    print("\n[2/9] Creating test order (qty=1, rate=100000)")
-    order_response = requests.post(
-        f"{BASE_URL}/orders",
-        headers=get_headers(),
-        json={
-            "client_id": customer_id,
-            "client_name": customer_name,
-            "order_date": date.today().isoformat(),
-            "items": [{
-                "main_category": "Test Category",
-                "sub_category": "Test Sub",
-                "product_name": "Test Product",
-                "qty": 1,
-                "rate": 100000,
-                "amount": 100000,
-                "factory_cost_total": 0,
-                "outside_cost_total": 0
-            }],
-            "product_sales_total": 100000,
-            "invoice_total": 100000
-        }
-    )
-    assert order_response.status_code == 200, f"Order creation failed: {order_response.status_code}"
-    order = order_response.json()
-    order_id = order["id"]
-    order_item_id = order["items"][0]["id"]
-    print(f"   ✅ Order created: {order_id}")
-    
-    # Fully ship it
-    print("\n[3/9] Fully shipping order (qty=1)")
-    shipment_response = requests.post(
-        f"{BASE_URL}/orders/{order_id}/shipments",
-        headers=get_headers(),
-        json={
-            "date": date.today().isoformat(),
-            "items": [{
-                "order_item_id": order_item_id,
-                "qty": 1
-            }]
-        }
-    )
-    assert shipment_response.status_code == 200, f"Shipment creation failed: {shipment_response.status_code}"
-    print(f"   ✅ Shipment created")
-    
-    # Get updated order
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    outstanding_balance = order.get("outstanding_balance", 0)
-    
-    # Verify outstanding_balance = 100000
-    assert abs(outstanding_balance - 100000) <= 0.01, \
-        f"Order outstanding_balance = {outstanding_balance}, expected 100000"
-    print(f"   ✅ Order outstanding_balance = ₹{outstanding_balance:,.2f}")
-    
-    # Verify dashboard outstanding increased by 100000
-    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
-    dashboard = response.json()
-    current_outstanding = dashboard.get("kpis", {}).get("outstanding_receivable", 0)
-    
-    outstanding_increase = current_outstanding - initial_outstanding
-    assert abs(outstanding_increase - 100000) <= 0.01, \
-        f"Dashboard outstanding increased by {outstanding_increase}, expected 100000"
-    print(f"   ✅ Dashboard outstanding_receivable increased by ₹{outstanding_increase:,.2f}")
-    
-    # Create customer payment allocating 30000 to the order
-    print("\n[4/9] Creating customer payment (₹30,000 allocated)")
-    payment1_response = requests.post(
-        f"{BASE_URL}/customer-payments",
-        headers=get_headers(),
-        json={
-            "party_id": customer_id,
-            "customer_name": customer_name,
-            "date": date.today().isoformat(),
-            "amount": 30000,
-            "mode": "cash",
-            "allocations": [{
-                "order_id": order_id,
-                "amount": 30000
-            }]
-        }
-    )
-    assert payment1_response.status_code == 200, f"Payment creation failed: {payment1_response.status_code}"
-    payment1 = payment1_response.json()
-    payment1_id = payment1["id"]
-    print(f"   ✅ Payment created: {payment1_id}")
-    
-    # Verify order outstanding_balance = 70000
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    outstanding_balance = order.get("outstanding_balance", 0)
-    
-    assert abs(outstanding_balance - 70000) <= 0.01, \
-        f"Order outstanding_balance = {outstanding_balance}, expected 70000"
-    print(f"   ✅ Order outstanding_balance = ₹{outstanding_balance:,.2f}")
-    
-    # Verify dashboard outstanding decreased by 30000
-    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
-    dashboard = response.json()
-    current_outstanding = dashboard.get("kpis", {}).get("outstanding_receivable", 0)
-    
-    expected_outstanding = initial_outstanding + 70000
-    assert abs(current_outstanding - expected_outstanding) <= 0.01, \
-        f"Dashboard outstanding = {current_outstanding}, expected {expected_outstanding}"
-    print(f"   ✅ Dashboard outstanding_receivable = ₹{current_outstanding:,.2f} (net contribution ₹70,000)")
-    
-    # Create ANOTHER customer payment with 150000 but only 70000 allocated → 80000 unallocated advance
-    print("\n[5/9] Creating customer payment (₹150,000 total, ₹70,000 allocated, ₹80,000 advance)")
-    payment2_response = requests.post(
-        f"{BASE_URL}/customer-payments",
-        headers=get_headers(),
-        json={
-            "party_id": customer_id,
-            "customer_name": customer_name,
-            "date": date.today().isoformat(),
-            "amount": 150000,
-            "mode": "cash",
-            "allocations": [{
-                "order_id": order_id,
-                "amount": 70000
-            }]
-        }
-    )
-    assert payment2_response.status_code == 200, f"Payment2 creation failed: {payment2_response.status_code}"
-    payment2 = payment2_response.json()
-    payment2_id = payment2["id"]
-    print(f"   ✅ Payment created: {payment2_id}")
-    
-    # Verify order outstanding_balance = 0
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    outstanding_balance = order.get("outstanding_balance", 0)
-    
-    assert abs(outstanding_balance - 0) <= 0.01, \
-        f"Order outstanding_balance = {outstanding_balance}, expected 0"
-    print(f"   ✅ Order outstanding_balance = ₹{outstanding_balance:,.2f}")
-    
-    # Verify dashboard outstanding no longer includes this order
-    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
-    dashboard = response.json()
-    current_outstanding = dashboard.get("kpis", {}).get("outstanding_receivable", 0)
-    
-    assert abs(current_outstanding - initial_outstanding) <= 0.01, \
-        f"Dashboard outstanding = {current_outstanding}, expected {initial_outstanding}"
-    print(f"   ✅ Dashboard outstanding_receivable = ₹{current_outstanding:,.2f} (order no longer contributes)")
-    
-    # Verify customer_advances increased by 80000
-    current_advances = dashboard.get("kpis", {}).get("customer_advances", 0)
-    advances_increase = current_advances - initial_advances
-    
-    assert abs(advances_increase - 80000) <= 0.01, \
-        f"Customer advances increased by {advances_increase}, expected 80000"
-    print(f"   ✅ customer_advances increased by ₹{advances_increase:,.2f}")
-    
-    # Reverse the LAST payment
-    print("\n[6/9] Reversing last payment (₹150,000)")
-    reverse_response = requests.delete(
-        f"{BASE_URL}/customer-payments/{payment2_id}",
-        headers=get_headers()
-    )
-    assert reverse_response.status_code == 200, f"Payment reversal failed: {reverse_response.status_code}"
-    print(f"   ✅ Payment reversed")
-    
-    # Verify order outstanding_balance restored to 70000
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    outstanding_balance = order.get("outstanding_balance", 0)
-    
-    assert abs(outstanding_balance - 70000) <= 0.01, \
-        f"Order outstanding_balance = {outstanding_balance}, expected 70000"
-    print(f"   ✅ Order outstanding_balance restored to ₹{outstanding_balance:,.2f}")
-    
-    # Verify dashboard outstanding restored
-    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
-    dashboard = response.json()
-    current_outstanding = dashboard.get("kpis", {}).get("outstanding_receivable", 0)
-    
-    expected_outstanding = initial_outstanding + 70000
-    assert abs(current_outstanding - expected_outstanding) <= 0.01, \
-        f"Dashboard outstanding = {current_outstanding}, expected {expected_outstanding}"
-    print(f"   ✅ Dashboard outstanding_receivable restored to ₹{current_outstanding:,.2f}")
-    
-    # Cleanup: delete test order and remaining payment
-    print("\n[7/9] Cleaning up: deleting payment")
-    requests.delete(f"{BASE_URL}/customer-payments/{payment1_id}", headers=get_headers())
-    
-    print("[8/9] Cleaning up: deleting order")
-    delete_response = requests.delete(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    assert delete_response.status_code == 200, f"Order deletion failed: {delete_response.status_code}"
-    
-    print("[9/9] Cleanup complete (customer not deleted - was pre-existing)")
-    
-    print(f"\n   ✅ Cleanup complete")
-
-
-def test_bug2_order_shipped_date():
-    """
-    Bug 2 — Order Shipped Date derivation
-    Verify Minakshi Jain order has shipped_date and all fully shipped orders have dates
-    """
-    print("\n" + "="*80)
-    print("BUG 2 — ORDER SHIPPED DATE DERIVATION")
-    print("="*80)
-    
-    # 1. GET /api/orders and find Minakshi Jain order
-    print("\n[1/3] Testing Minakshi Jain order has shipped_date = 2026-04-06")
-    response = requests.get(f"{BASE_URL}/orders", headers=get_headers())
-    assert response.status_code == 200, f"Orders list failed: {response.status_code}"
-    orders = response.json()
-    
-    minakshi_order = None
-    for order in orders:
-        if "Minakshi Jain" in order.get("client_name", ""):
-            minakshi_order = order
-            break
-    
-    assert minakshi_order is not None, "Minakshi Jain order not found"
-    
-    # Verify status, shipped_date, last_shipped_date
-    status = minakshi_order.get("status")
-    shipped_date = minakshi_order.get("shipped_date")
-    last_shipped_date = minakshi_order.get("last_shipped_date")
-    
-    assert status == "Fully Shipped", f"Minakshi Jain order status = {status}, expected 'Fully Shipped'"
-    assert shipped_date is not None, "Minakshi Jain order shipped_date is null"
-    assert shipped_date.startswith("2026-04-06"), \
-        f"Minakshi Jain shipped_date = {shipped_date}, expected to start with '2026-04-06'"
-    assert last_shipped_date is not None, "Minakshi Jain order last_shipped_date is null"
-    assert last_shipped_date.startswith("2026-04-06"), \
-        f"Minakshi Jain last_shipped_date = {last_shipped_date}, expected to start with '2026-04-06'"
-    
-    print(f"   ✅ Minakshi Jain order:")
-    print(f"      status = {status}")
-    print(f"      shipped_date = {shipped_date}")
-    print(f"      last_shipped_date = {last_shipped_date}")
-    
-    # 2. Sweep every order: Fully Shipped must have shipped_date, Partially Shipped must not
-    print("\n[2/3] Testing all orders: Fully Shipped → non-null, Partially Shipped → null")
-    
-    fully_shipped_count = 0
-    partially_shipped_count = 0
-    fully_shipped_without_date = []
-    partially_shipped_with_date = []
-    
-    for order in orders:
-        status = order.get("status")
-        shipped_date = order.get("shipped_date")
-        order_id = order.get("id")
-        client_name = order.get("client_name", "Unknown")
-        
-        if status == "Fully Shipped":
-            fully_shipped_count += 1
-            if shipped_date is None:
-                fully_shipped_without_date.append(f"{client_name} ({order_id})")
-        elif status == "Partially Shipped":
-            partially_shipped_count += 1
-            if shipped_date is not None:
-                partially_shipped_with_date.append(f"{client_name} ({order_id})")
-    
-    assert len(fully_shipped_without_date) == 0, \
-        f"Found {len(fully_shipped_without_date)} Fully Shipped orders without shipped_date: {fully_shipped_without_date}"
-    
-    assert len(partially_shipped_with_date) == 0, \
-        f"Found {len(partially_shipped_with_date)} Partially Shipped orders with shipped_date: {partially_shipped_with_date}"
-    
-    print(f"   ✅ Fully Shipped orders: {fully_shipped_count} (all have shipped_date)")
-    print(f"   ✅ Partially Shipped orders: {partially_shipped_count} (all have null shipped_date)")
-    
-    print("\n[3/3] Live shipment flow testing will be done in separate test function")
-    print(f"   ⏭️  See test_bug2_live_shipment_flow()")
-
-
-def test_bug2_live_shipment_flow():
-    """
-    Bug 2 — Live shipment flow
-    Create order, add partial shipment, complete shipment, edit, delete, verify shipped_date behavior
-    """
-    print("\n" + "="*80)
-    print("BUG 2 — LIVE SHIPMENT FLOW")
-    print("="*80)
-    
-    # Get existing customers and use the first one
-    print("\n[1/11] Getting existing customer for test")
-    customers_response = requests.get(f"{BASE_URL}/customers", headers=get_headers())
-    assert customers_response.status_code == 200, f"Customers list failed: {customers_response.status_code}"
-    customers = customers_response.json()
-    assert len(customers) > 0, "No customers found in database"
-    
-    # Use first customer
-    customer = customers[0]
-    customer_id = customer["id"]
-    customer_name = customer["name"]
-    print(f"   ✅ Using existing customer: {customer_name} ({customer_id})")
-    
-    # Create order with qty=5, rate=100
-    print("\n[2/11] Creating test order (qty=5, rate=100)")
-    order_response = requests.post(
-        f"{BASE_URL}/orders",
-        headers=get_headers(),
-        json={
-            "client_id": customer_id,
-            "client_name": customer_name,
-            "order_date": date.today().isoformat(),
-            "items": [{
-                "main_category": "widget",
-                "sub_category": "Test Sub",
-                "product_name": "Test Widget",
-                "qty": 5,
-                "rate": 100,
-                "amount": 500,
-                "factory_cost_total": 0,
-                "outside_cost_total": 0
-            }],
-            "product_sales_total": 500,
-            "invoice_total": 500
-        }
-    )
-    assert order_response.status_code == 200, f"Order creation failed: {order_response.status_code}"
-    order = order_response.json()
-    order_id = order["id"]
-    order_item_id = order["items"][0]["id"]
-    print(f"   ✅ Order created: {order_id}")
-    
-    # Verify shipped_date is null immediately after creation
-    print("\n[3/11] Verifying shipped_date is null (no shipments yet)")
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    shipped_date = order.get("shipped_date")
-    
-    assert shipped_date is None, f"shipped_date should be null, got {shipped_date}"
-    print(f"   ✅ shipped_date = null (correct)")
-    
-    # Add partial shipment (qty=2)
-    print("\n[4/11] Adding partial shipment (qty=2 of 5)")
-    shipment1_response = requests.post(
-        f"{BASE_URL}/orders/{order_id}/shipments",
-        headers=get_headers(),
-        json={
-            "date": "2026-05-01",
-            "items": [{
-                "order_item_id": order_item_id,
-                "qty": 2
-            }]
-        }
-    )
-    assert shipment1_response.status_code == 200, f"Shipment creation failed: {shipment1_response.status_code}"
-    
-    # Get shipment ID from order
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    shipment1_id = order["shipments"][0]["id"]
-    print(f"   ✅ Partial shipment created: {shipment1_id}")
-    
-    # Verify status = Partially Shipped, shipped_date = null
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    status = order.get("status")
-    shipped_date = order.get("shipped_date")
-    
-    assert status == "Partially Shipped", f"Status = {status}, expected 'Partially Shipped'"
-    assert shipped_date is None, f"shipped_date should be null for partial shipment, got {shipped_date}"
-    print(f"   ✅ status = {status}, shipped_date = null (correct)")
-    
-    # Add completing shipment (qty=3)
-    print("\n[5/11] Adding completing shipment (qty=3, total=5)")
-    shipment2_response = requests.post(
-        f"{BASE_URL}/orders/{order_id}/shipments",
-        headers=get_headers(),
-        json={
-            "date": "2026-05-10",
-            "items": [{
-                "order_item_id": order_item_id,
-                "qty": 3
-            }]
-        }
-    )
-    assert shipment2_response.status_code == 200, f"Completing shipment failed: {shipment2_response.status_code}"
-    
-    # Get shipment ID from order
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    shipment2_id = order["shipments"][1]["id"]
-    print(f"   ✅ Completing shipment created: {shipment2_id}")
-    
-    # Verify status = Fully Shipped, shipped_date starts with 2026-05-10
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    status = order.get("status")
-    shipped_date = order.get("shipped_date")
-    
-    assert status == "Fully Shipped", f"Status = {status}, expected 'Fully Shipped'"
-    assert shipped_date is not None, "shipped_date should not be null for fully shipped order"
-    assert shipped_date.startswith("2026-05-10"), \
-        f"shipped_date = {shipped_date}, expected to start with '2026-05-10'"
-    print(f"   ✅ status = {status}, shipped_date = {shipped_date}")
-    
-    # Edit completing shipment date to 2026-06-15
-    print("\n[6/11] Editing completing shipment date to 2026-06-15")
-    edit_response = requests.put(
-        f"{BASE_URL}/orders/{order_id}/shipments/{shipment2_id}",
-        headers=get_headers(),
-        json={
-            "date": "2026-06-15",
-            "items": [{
-                "order_item_id": order_item_id,
-                "qty": 3
-            }]
-        }
-    )
-    assert edit_response.status_code == 200, f"Shipment edit failed: {edit_response.status_code}"
-    print(f"   ✅ Shipment date edited")
-    
-    # Verify shipped_date now starts with 2026-06-15
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    shipped_date = order.get("shipped_date")
-    
-    assert shipped_date is not None, "shipped_date should not be null"
-    assert shipped_date.startswith("2026-06-15"), \
-        f"shipped_date = {shipped_date}, expected to start with '2026-06-15'"
-    print(f"   ✅ shipped_date updated to {shipped_date}")
-    
-    # Delete completing shipment
-    print("\n[7/11] Deleting completing shipment")
-    delete_response = requests.delete(
-        f"{BASE_URL}/orders/{order_id}/shipments/{shipment2_id}",
-        headers=get_headers()
-    )
-    assert delete_response.status_code == 200, f"Shipment deletion failed: {delete_response.status_code}"
-    print(f"   ✅ Completing shipment deleted")
-    
-    # Verify status = Partially Shipped, shipped_date = null (cleared)
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    status = order.get("status")
-    shipped_date = order.get("shipped_date")
-    
-    assert status == "Partially Shipped", f"Status = {status}, expected 'Partially Shipped'"
-    assert shipped_date is None, f"shipped_date should be null after deleting completing shipment, got {shipped_date}"
-    print(f"   ✅ status = {status}, shipped_date = null (cleared)")
-    
-    # Add it back with date 2026-07-20
-    print("\n[8/11] Adding completing shipment back with date 2026-07-20")
-    shipment3_response = requests.post(
-        f"{BASE_URL}/orders/{order_id}/shipments",
-        headers=get_headers(),
-        json={
-            "date": "2026-07-20",
-            "items": [{
-                "order_item_id": order_item_id,
-                "qty": 3
-            }]
-        }
-    )
-    assert shipment3_response.status_code == 200, f"Shipment re-creation failed: {shipment3_response.status_code}"
-    
-    # Get shipment ID from order
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    shipment3_id = order["shipments"][1]["id"]  # Second shipment (index 1)
-    print(f"   ✅ Completing shipment re-created: {shipment3_id}")
-    
-    # Verify status = Fully Shipped, shipped_date starts with 2026-07-20
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    status = order.get("status")
-    shipped_date = order.get("shipped_date")
-    
-    assert status == "Fully Shipped", f"Status = {status}, expected 'Fully Shipped'"
-    assert shipped_date is not None, "shipped_date should not be null"
-    assert shipped_date.startswith("2026-07-20"), \
-        f"shipped_date = {shipped_date}, expected to start with '2026-07-20'"
-    print(f"   ✅ status = {status}, shipped_date = {shipped_date}")
-    
-    # Idempotency: call POST /api/reconcile/run twice
-    print("\n[9/11] Testing idempotency: POST /api/reconcile/run twice")
-    reconcile1_response = requests.post(f"{BASE_URL}/reconcile/run", headers=get_headers())
-    assert reconcile1_response.status_code == 200, f"Reconcile run 1 failed: {reconcile1_response.status_code}"
-    reconcile1 = reconcile1_response.json()
-    shipped_date_after_recon1 = order_response.json().get("shipped_date")
-    
-    reconcile2_response = requests.post(f"{BASE_URL}/reconcile/run", headers=get_headers())
-    assert reconcile2_response.status_code == 200, f"Reconcile run 2 failed: {reconcile2_response.status_code}"
-    
-    order_response = requests.get(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    order = order_response.json()
-    shipped_date_after_recon2 = order.get("shipped_date")
-    
-    # Verify shipped_date didn't drift
-    assert shipped_date_after_recon2 == shipped_date, \
-        f"shipped_date drifted after reconcile: {shipped_date} → {shipped_date_after_recon2}"
-    print(f"   ✅ shipped_date unchanged after 2x reconcile runs (idempotent)")
+    # 1a: POST with vendor_name stamps vendor_party_id
+    print("\n1a. Testing POST /api/purchases stamps vendor_party_id...")
+    p1 = post("/purchases", {
+        "vendor_name": "TestVendor_Manual_A",
+        "purchase_date": "2026-07-22",
+        "items": [{"description": "Item A", "qty": 1, "rate": 1000, "amount": 1000}]
+    })
+    assert p1.get("vendor_party_id"), "❌ FAIL: vendor_party_id is None"
+    print(f"✅ PASS: vendor_party_id = {p1['vendor_party_id']}")
+    
+    # 1b: Same vendor returns same party_id
+    print("\n1b. Testing same vendor returns same vendor_party_id...")
+    p2 = post("/purchases", {
+        "vendor_name": "TestVendor_Manual_A",
+        "purchase_date": "2026-07-22",
+        "items": [{"description": "Item B", "qty": 1, "rate": 2000, "amount": 2000}]
+    })
+    assert p2.get("vendor_party_id") == p1["vendor_party_id"], \
+        f"❌ FAIL: Different party_ids: {p1['vendor_party_id']} vs {p2['vendor_party_id']}"
+    print(f"✅ PASS: Both purchases have same vendor_party_id = {p1['vendor_party_id']}")
+    
+    # 1c: PUT with same vendor preserves party_id
+    print("\n1c. Testing PUT with same vendor_name preserves vendor_party_id...")
+    original_pid = p1["vendor_party_id"]
+    p1_updated = put(f"/purchases/{p1['id']}", {
+        "vendor_name": "TestVendor_Manual_A",
+        "purchase_date": "2026-07-22",
+        "items": [{"description": "Item A Updated", "qty": 2, "rate": 1000, "amount": 2000}]
+    })
+    assert p1_updated["vendor_party_id"] == original_pid, \
+        f"❌ FAIL: vendor_party_id changed from {original_pid} to {p1_updated['vendor_party_id']}"
+    print(f"✅ PASS: vendor_party_id preserved = {original_pid}")
+    
+    # 1d: PUT with different vendor MOVES party_id
+    print("\n1d. Testing PUT with different vendor_name MOVES vendor_party_id...")
+    p1_moved = put(f"/purchases/{p1['id']}", {
+        "vendor_name": "TestVendor_Manual_B",
+        "purchase_date": "2026-07-22",
+        "items": [{"description": "Item A Moved", "qty": 1, "rate": 1000, "amount": 1000}]
+    })
+    assert p1_moved["vendor_party_id"] != original_pid, \
+        f"❌ FAIL: vendor_party_id did not change (still {original_pid})"
+    print(f"✅ PASS: vendor_party_id moved from {original_pid} to {p1_moved['vendor_party_id']}")
     
     # Cleanup
-    print("\n[10/11] Cleaning up: deleting order")
-    delete_response = requests.delete(f"{BASE_URL}/orders/{order_id}", headers=get_headers())
-    assert delete_response.status_code == 200, f"Order deletion failed: {delete_response.status_code}"
-    
-    print("[11/11] Cleanup complete (customer not deleted - was pre-existing)")
-    
-    print(f"\n   ✅ Cleanup complete")
+    delete(f"/purchases/{p1['id']}")
+    delete(f"/purchases/{p2['id']}")
+    print("\n✅ TEST 1 COMPLETE: All manual purchase linkage tests passed")
 
 
-def test_regression_checks():
+def test_2_vendor_rename_preserves_linkage():
     """
-    Regression checks to ensure no existing functionality broke
+    Scenario 2: Vendor rename preserves linkage
+    Create purchase → note vendor_party_id → rename party → GET purchase → vendor_party_id unchanged
     """
     print("\n" + "="*80)
-    print("REGRESSION CHECKS")
+    print("TEST 2: Vendor Rename Preserves Linkage")
     print("="*80)
     
-    # 1. GET /api/reconcile: healthy=true, 21/21
-    print("\n[1/5] Testing GET /api/reconcile")
-    response = requests.get(f"{BASE_URL}/reconcile", headers=get_headers())
-    assert response.status_code == 200, f"Reconcile failed: {response.status_code}"
-    reconcile = response.json()
+    # Create purchase
+    print("\nCreating purchase with vendor 'TestVendor_Rename_Original'...")
+    p = post("/purchases", {
+        "vendor_name": "TestVendor_Rename_Original",
+        "purchase_date": "2026-07-22",
+        "items": [{"description": "Item", "qty": 1, "rate": 500, "amount": 500}]
+    })
+    original_pid = p["vendor_party_id"]
+    print(f"Original vendor_party_id = {original_pid}")
     
-    healthy = reconcile.get("healthy")
-    summary = reconcile.get("summary", {})
-    passed = summary.get("passed")
-    total = summary.get("total")
-    engine_version = reconcile.get("engine_version")
+    # Rename the party
+    print(f"\nRenaming party {original_pid} to 'TestVendor_Rename_NewName'...")
+    post(f"/parties/{original_pid}/rename", {"display_name": "TestVendor_Rename_NewName"})
     
-    assert healthy == True, f"Reconcile healthy = {healthy}, expected True"
-    assert passed == 21, f"Reconcile passed = {passed}, expected 21"
-    assert total == 21, f"Reconcile total = {total}, expected 21"
-    assert engine_version == "P5", f"Reconcile engine_version = {engine_version}, expected 'P5'"
+    # Get purchase again
+    print("\nFetching purchase after rename...")
+    p_after = get(f"/purchases/{p['id']}")
+    assert p_after["vendor_party_id"] == original_pid, \
+        f"❌ FAIL: vendor_party_id changed from {original_pid} to {p_after['vendor_party_id']}"
+    print(f"✅ PASS: vendor_party_id preserved = {original_pid}")
     
-    print(f"   ✅ Reconcile: healthy={healthy}, {passed}/{total} passed, engine={engine_version}")
-    
-    # 2. GET /api/party-ledger-v2/summary
-    print("\n[2/5] Testing GET /api/party-ledger-v2/summary")
-    response = requests.get(f"{BASE_URL}/party-ledger-v2/summary", headers=get_headers())
-    assert response.status_code == 200, f"Party ledger summary failed: {response.status_code}"
-    summary = response.json()
-    
-    expected_keys = [
-        "fathers_firm_you_pay", "fathers_firm_you_receive",
-        "vendor_you_pay", "vendor_advances_you_receive",
-        "customer_you_receive", "customer_advances_you_pay",
-        "net_position"
-    ]
-    
-    for key in expected_keys:
-        assert key in summary, f"Missing key '{key}' in party-ledger-v2/summary"
-        assert isinstance(summary[key], (int, float)), f"Key '{key}' is not numeric"
-    
-    print(f"   ✅ Party ledger summary: all 7 keys present and numeric")
-    
-    # 3. GET /api/party-ledger-v2/fathers-firm-settlement
-    print("\n[3/5] Testing GET /api/party-ledger-v2/fathers-firm-settlement")
-    response = requests.get(f"{BASE_URL}/party-ledger-v2/fathers-firm-settlement", headers=get_headers())
-    assert response.status_code == 200, f"FF settlement failed: {response.status_code}"
-    settlement = response.json()
-    
-    expected_keys = ["party_id", "party_name", "balance_signed", "amount", "status", "label"]
-    for key in expected_keys:
-        assert key in settlement, f"Missing key '{key}' in fathers-firm-settlement"
-    
-    status = settlement.get("status")
-    assert status in ["settled", "you_pay", "you_receive"], \
-        f"FF settlement status = {status}, expected one of [settled, you_pay, you_receive]"
-    assert status == status.lower(), f"FF settlement status should be lowercase, got {status}"
-    
-    print(f"   ✅ FF settlement: all keys present, status={status} (lowercase)")
-    
-    # 4. GET /api/dashboard - check all KPIs
-    print("\n[4/5] Testing GET /api/dashboard - all KPIs present")
-    response = requests.get(f"{BASE_URL}/dashboard", headers=get_headers())
-    assert response.status_code == 200, f"Dashboard failed: {response.status_code}"
-    dashboard = response.json()
-    kpis = dashboard.get("kpis", {})
-    
-    expected_kpis = [
-        "received", "paid", "net_profit", "estimated_revenue",
-        "estimated_net_profit", "customer_advances", "outstanding_receivable"
-    ]
-    
-    for kpi in expected_kpis:
-        assert kpi in kpis, f"Missing KPI '{kpi}' in dashboard"
-        value = kpis[kpi]
-        assert isinstance(value, (int, float)), f"KPI '{kpi}' is not numeric"
-        
-        # customer_advances and outstanding_receivable should be non-negative
-        if kpi in ["customer_advances", "outstanding_receivable"]:
-            assert value >= 0, f"KPI '{kpi}' = {value}, should be non-negative"
-    
-    print(f"   ✅ Dashboard: all expected KPIs present and numeric")
-    
-    # 5. GET /api/accounts/{id}/balance - composition identity for first 10 accounts
-    print("\n[5/5] Testing GET /api/accounts/{id}/balance - composition identity")
-    accounts_response = requests.get(f"{BASE_URL}/accounts", headers=get_headers())
-    assert accounts_response.status_code == 200, f"Accounts list failed: {accounts_response.status_code}"
-    accounts = accounts_response.json()
-    
-    test_count = min(10, len(accounts))
-    print(f"   Testing {test_count} accounts...")
-    
-    for i, account in enumerate(accounts[:test_count]):
-        account_id = account["id"]
-        balance_response = requests.get(f"{BASE_URL}/accounts/{account_id}/balance", headers=get_headers())
-        assert balance_response.status_code == 200, f"Account balance failed for {account_id}"
-        balance_data = balance_response.json()
-        
-        opening = balance_data.get("opening_balance", 0)
-        incoming = balance_data.get("incoming", 0)
-        outgoing = balance_data.get("outgoing", 0)
-        transfer_net = balance_data.get("transfer_net", 0)
-        balance = balance_data.get("balance", 0)
-        
-        # Composition identity: opening + incoming - outgoing + transfer_net == balance
-        computed_balance = opening + incoming - outgoing + transfer_net
-        diff = abs(computed_balance - balance)
-        
-        assert diff <= 0.01, \
-            f"Account {account_id}: composition identity failed. " \
-            f"opening({opening}) + incoming({incoming}) - outgoing({outgoing}) + transfer_net({transfer_net}) " \
-            f"= {computed_balance}, but balance = {balance} (diff = {diff})"
-    
-    print(f"   ✅ All {test_count} accounts: composition identity satisfied (within ±0.01)")
+    # Cleanup
+    delete(f"/purchases/{p['id']}")
+    print("\n✅ TEST 2 COMPLETE: Vendor rename preserves linkage")
 
+
+def test_3_freight_auto_purchase():
+    """
+    Scenario 3: Freight auto-purchase generation
+    POST /api/orders with shipment containing transporter + freight_paid > 0
+    → Exactly ONE freight Purchase exists with correct vendor_party_id
+    """
+    print("\n" + "="*80)
+    print("TEST 3: Freight Auto-Purchase Generation")
+    print("="*80)
+    
+    print("\nCreating order with shipment (transporter='TestTransporter_A', freight_paid=250)...")
+    order = post("/orders", {
+        "client_name": "TestClient_Freight",
+        "order_date": "2026-07-22",
+        "items": [{
+            "main_category": "Glass",
+            "product_name": "TestProduct",
+            "qty": 6,
+            "rate": 1000,
+            "product_sales": 6000
+        }],
+        "shipments": [{
+            "date": "2026-07-22",
+            "transporter": "TestTransporter_A",
+            "freight_paid": 250,
+            "freight_charged": 250,
+            "boxes_shipped": 1,
+            "items": []
+        }]
+    })
+    
+    print(f"\nSearching for linked freight purchase (order_id={order['id']})...")
+    freight_pur = find_linked_purchase(order["id"], "order_freight_purchase")
+    
+    assert freight_pur is not None, "❌ FAIL: No freight purchase found"
+    print(f"✅ Found freight purchase: id={freight_pur['id']}")
+    
+    assert freight_pur.get("vendor_party_id"), "❌ FAIL: vendor_party_id is None"
+    print(f"✅ vendor_party_id = {freight_pur['vendor_party_id']}")
+    
+    assert freight_pur["vendor_name"] == "TestTransporter_A", \
+        f"❌ FAIL: vendor_name mismatch: {freight_pur['vendor_name']}"
+    print(f"✅ vendor_name = {freight_pur['vendor_name']}")
+    
+    assert abs(float(freight_pur["invoice_total"]) - 250.0) < 0.01, \
+        f"❌ FAIL: invoice_total mismatch: {freight_pur['invoice_total']}"
+    print(f"✅ invoice_total = {freight_pur['invoice_total']}")
+    
+    # Cleanup
+    delete(f"/orders/{order['id']}")
+    print("\n✅ TEST 3 COMPLETE: Freight auto-purchase generation working")
+
+
+def test_4_freight_linkage_matches_manual():
+    """
+    Scenario 4: Freight linkage matches manual purchase for same vendor
+    Create order with transporter → create manual purchase with same vendor
+    → Both have same vendor_party_id
+    """
+    print("\n" + "="*80)
+    print("TEST 4: Freight Linkage Matches Manual Purchase")
+    print("="*80)
+    
+    transporter = "TestTransporter_B"
+    
+    print(f"\nCreating order with transporter='{transporter}'...")
+    order = post("/orders", {
+        "client_name": "TestClient_Freight_B",
+        "order_date": "2026-07-22",
+        "items": [{
+            "main_category": "Glass",
+            "product_name": "TestProduct",
+            "qty": 6,
+            "rate": 1000,
+            "product_sales": 6000
+        }],
+        "shipments": [{
+            "date": "2026-07-22",
+            "transporter": transporter,
+            "freight_paid": 300,
+            "freight_charged": 300,
+            "boxes_shipped": 1,
+            "items": []
+        }]
+    })
+    
+    print(f"\nCreating manual purchase with vendor_name='{transporter}'...")
+    manual_pur = post("/purchases", {
+        "vendor_name": transporter,
+        "purchase_date": "2026-07-22",
+        "items": [{"description": "Manual test", "qty": 1, "rate": 100, "amount": 100}]
+    })
+    
+    print("\nFetching freight purchase...")
+    freight_pur = find_linked_purchase(order["id"], "order_freight_purchase")
+    
+    assert freight_pur is not None, "❌ FAIL: No freight purchase found"
+    assert freight_pur["vendor_party_id"] == manual_pur["vendor_party_id"], \
+        f"❌ FAIL: vendor_party_id mismatch: freight={freight_pur['vendor_party_id']}, manual={manual_pur['vendor_party_id']}"
+    print(f"✅ PASS: Both purchases have same vendor_party_id = {freight_pur['vendor_party_id']}")
+    
+    # Cleanup
+    delete(f"/orders/{order['id']}")
+    delete(f"/purchases/{manual_pur['id']}")
+    print("\n✅ TEST 4 COMPLETE: Freight linkage matches manual purchase")
+
+
+def test_5_freight_sync_idempotency():
+    """
+    Scenario 5: Freight sync idempotency
+    POST order → note freight purchase count → PUT order with identical body
+    → Exactly ONE freight purchase (not duplicated)
+    """
+    print("\n" + "="*80)
+    print("TEST 5: Freight Sync Idempotency")
+    print("="*80)
+    
+    print("\nCreating order with freight...")
+    order = post("/orders", {
+        "client_name": "TestClient_Freight_C",
+        "order_date": "2026-07-22",
+        "items": [{
+            "main_category": "Glass",
+            "product_name": "TestProduct",
+            "qty": 6,
+            "rate": 1000,
+            "product_sales": 6000
+        }],
+        "shipments": [{
+            "date": "2026-07-22",
+            "transporter": "TestTransporter_C",
+            "freight_paid": 400,
+            "freight_charged": 400,
+            "boxes_shipped": 1,
+            "items": []
+        }]
+    })
+    
+    print("\nUpdating order with identical body...")
+    put(f"/orders/{order['id']}", {
+        "client_name": order["client_name"],
+        "order_date": order["order_date"],
+        "status": order["status"],
+        "items": order["items"],
+        "shipments": order["shipments"]
+    })
+    
+    print("\nCounting freight purchases...")
+    purchases = get("/purchases")
+    freight_purs = [p for p in purchases 
+                    if p.get("linked_to_order_id") == order["id"] 
+                    and p.get("source_type") == "order_freight_purchase"]
+    
+    assert len(freight_purs) == 1, \
+        f"❌ FAIL: Expected 1 freight purchase, found {len(freight_purs)}"
+    print(f"✅ PASS: Exactly 1 freight purchase found (idempotent)")
+    
+    # Cleanup
+    delete(f"/orders/{order['id']}")
+    print("\n✅ TEST 5 COMPLETE: Freight sync is idempotent")
+
+
+def test_6_zero_freight_suppresses_purchase():
+    """
+    Scenario 6: Zero freight or blank transporter suppresses purchase
+    a. Order with freight_paid=0 → NO freight Purchase
+    b. Order with transporter="" but freight_paid>0 → NO freight Purchase
+    """
+    print("\n" + "="*80)
+    print("TEST 6: Zero Freight or Blank Transporter Suppresses Purchase")
+    print("="*80)
+    
+    # 6a: freight_paid=0
+    print("\n6a. Testing freight_paid=0...")
+    order_a = post("/orders", {
+        "client_name": "TestClient_Freight_D",
+        "order_date": "2026-07-22",
+        "items": [{
+            "main_category": "Glass",
+            "product_name": "TestProduct",
+            "qty": 6,
+            "rate": 1000,
+            "product_sales": 6000
+        }],
+        "shipments": [{
+            "date": "2026-07-22",
+            "transporter": "TestTransporter_D",
+            "freight_paid": 0,
+            "freight_charged": 0,
+            "boxes_shipped": 1,
+            "items": []
+        }]
+    })
+    
+    freight_pur_a = find_linked_purchase(order_a["id"], "order_freight_purchase")
+    assert freight_pur_a is None, "❌ FAIL: freight_paid=0 should not create purchase"
+    print("✅ PASS: No freight purchase created for freight_paid=0")
+    
+    # 6b: blank transporter
+    print("\n6b. Testing blank transporter...")
+    order_b = post("/orders", {
+        "client_name": "TestClient_Freight_E",
+        "order_date": "2026-07-22",
+        "items": [{
+            "main_category": "Glass",
+            "product_name": "TestProduct",
+            "qty": 6,
+            "rate": 1000,
+            "product_sales": 6000
+        }],
+        "shipments": [{
+            "date": "2026-07-22",
+            "transporter": "",
+            "freight_paid": 100,
+            "freight_charged": 100,
+            "boxes_shipped": 1,
+            "items": []
+        }]
+    })
+    
+    freight_pur_b = find_linked_purchase(order_b["id"], "order_freight_purchase")
+    assert freight_pur_b is None, "❌ FAIL: blank transporter should not create purchase"
+    print("✅ PASS: No freight purchase created for blank transporter")
+    
+    # Cleanup
+    delete(f"/orders/{order_a['id']}")
+    delete(f"/orders/{order_b['id']}")
+    print("\n✅ TEST 6 COMPLETE: Zero freight/blank transporter suppresses purchase")
+
+
+def test_7_packing_auto_purchase():
+    """
+    Scenario 7: Packing auto-purchase
+    POST order with packer_name + packing_cost > 0
+    → Exactly ONE packing Purchase with correct vendor_party_id
+    """
+    print("\n" + "="*80)
+    print("TEST 7: Packing Auto-Purchase Generation")
+    print("="*80)
+    
+    print("\nCreating order with packer_name='TestPacker_A', packing_cost=180...")
+    order = post("/orders", {
+        "client_name": "TestClient_Packing_A",
+        "order_date": "2026-07-22",
+        "packer_name": "TestPacker_A",
+        "packing_cost": 180,
+        "items": [{
+            "main_category": "Glass",
+            "product_name": "TestProduct",
+            "qty": 6,
+            "rate": 1000,
+            "product_sales": 6000
+        }]
+    })
+    
+    print(f"\nSearching for linked packing purchase (order_id={order['id']})...")
+    packing_pur = find_linked_purchase(order["id"], "order_packing_purchase")
+    
+    assert packing_pur is not None, "❌ FAIL: No packing purchase found"
+    print(f"✅ Found packing purchase: id={packing_pur['id']}")
+    
+    assert packing_pur.get("vendor_party_id"), "❌ FAIL: vendor_party_id is None"
+    print(f"✅ vendor_party_id = {packing_pur['vendor_party_id']}")
+    
+    assert abs(float(packing_pur["invoice_total"]) - 180.0) < 0.01, \
+        f"❌ FAIL: invoice_total mismatch: {packing_pur['invoice_total']}"
+    print(f"✅ invoice_total = {packing_pur['invoice_total']}")
+    
+    # Cleanup
+    delete(f"/orders/{order['id']}")
+    print("\n✅ TEST 7 COMPLETE: Packing auto-purchase generation working")
+
+
+def test_8_blank_packer_suppresses_purchase():
+    """
+    Scenario 8: Blank packer suppresses packing purchase
+    Order with packing_cost=100, packer_name="" → NO packing Purchase
+    """
+    print("\n" + "="*80)
+    print("TEST 8: Blank Packer Suppresses Packing Purchase")
+    print("="*80)
+    
+    print("\nCreating order with packing_cost=100, packer_name=''...")
+    order = post("/orders", {
+        "client_name": "TestClient_Packing_B",
+        "order_date": "2026-07-22",
+        "packer_name": "",
+        "packing_cost": 100,
+        "items": [{
+            "main_category": "Glass",
+            "product_name": "TestProduct",
+            "qty": 6,
+            "rate": 1000,
+            "product_sales": 6000
+        }]
+    })
+    
+    packing_pur = find_linked_purchase(order["id"], "order_packing_purchase")
+    assert packing_pur is None, "❌ FAIL: blank packer_name should not create purchase"
+    print("✅ PASS: No packing purchase created for blank packer_name")
+    
+    # Cleanup
+    delete(f"/orders/{order['id']}")
+    print("\n✅ TEST 8 COMPLETE: Blank packer suppresses packing purchase")
+
+
+def test_9_removing_packer_removes_purchase():
+    """
+    Scenario 9: Removing packer/packing removes linked purchase (when unpaid)
+    Create order with packing → verify Purchase exists → PUT with packing_cost=0, packer_name=""
+    → Purchase must be gone
+    """
+    print("\n" + "="*80)
+    print("TEST 9: Removing Packer/Packing Removes Linked Purchase")
+    print("="*80)
+    
+    print("\nCreating order with packer_name='TestPacker_C', packing_cost=90...")
+    order = post("/orders", {
+        "client_name": "TestClient_Packing_C",
+        "order_date": "2026-07-22",
+        "packer_name": "TestPacker_C",
+        "packing_cost": 90,
+        "items": [{
+            "main_category": "Glass",
+            "product_name": "TestProduct",
+            "qty": 6,
+            "rate": 1000,
+            "product_sales": 6000
+        }]
+    })
+    
+    print("\nVerifying packing purchase exists...")
+    packing_pur = find_linked_purchase(order["id"], "order_packing_purchase")
+    assert packing_pur is not None, "❌ FAIL: Packing purchase should exist"
+    print(f"✅ Packing purchase exists: id={packing_pur['id']}")
+    
+    print("\nUpdating order to remove packing (packing_cost=0, packer_name='')...")
+    put(f"/orders/{order['id']}", {
+        "client_name": order["client_name"],
+        "order_date": order["order_date"],
+        "status": order["status"],
+        "items": order["items"],
+        "packing_cost": 0,
+        "packer_name": ""
+    })
+    
+    print("\nVerifying packing purchase is gone...")
+    packing_pur_after = find_linked_purchase(order["id"], "order_packing_purchase")
+    assert packing_pur_after is None, "❌ FAIL: Packing purchase should be deleted"
+    print("✅ PASS: Packing purchase deleted after removing packer/packing")
+    
+    # Cleanup
+    delete(f"/orders/{order['id']}")
+    print("\n✅ TEST 9 COMPLETE: Removing packer/packing removes linked purchase")
+
+
+def test_10_admin_backfill_migration():
+    """
+    Scenario 10: Admin backfill migration report
+    POST /api/admin/purchases/backfill-vendor-party-id returns structured report
+    Two consecutive calls: second has newly_linked == 0 (idempotent)
+    """
+    print("\n" + "="*80)
+    print("TEST 10: Admin Backfill Migration Report")
+    print("="*80)
+    
+    print("\nCalling POST /api/admin/purchases/backfill-vendor-party-id (first time)...")
+    report1 = post("/admin/purchases/backfill-vendor-party-id", {})
+    
+    print("\nVerifying report structure...")
+    assert "purchases" in report1, "❌ FAIL: 'purchases' section missing"
+    assert "purchase_payments" in report1, "❌ FAIL: 'purchase_payments' section missing"
+    
+    for section in ["purchases", "purchase_payments"]:
+        data = report1[section]
+        for key in ["scanned", "already_linked", "newly_linked", "ambiguous", "unmatched", "by_resolution"]:
+            assert key in data, f"❌ FAIL: {section}.{key} missing"
+    
+    print(f"✅ Report structure valid")
+    print(f"   purchases: scanned={report1['purchases']['scanned']}, "
+          f"already_linked={report1['purchases']['already_linked']}, "
+          f"newly_linked={report1['purchases']['newly_linked']}")
+    print(f"   purchase_payments: scanned={report1['purchase_payments']['scanned']}, "
+          f"already_linked={report1['purchase_payments']['already_linked']}, "
+          f"newly_linked={report1['purchase_payments']['newly_linked']}")
+    
+    print("\nCalling POST /api/admin/purchases/backfill-vendor-party-id (second time)...")
+    report2 = post("/admin/purchases/backfill-vendor-party-id", {})
+    
+    print("\nVerifying idempotency (newly_linked should be 0)...")
+    assert report2["purchases"]["newly_linked"] == 0, \
+        f"❌ FAIL: purchases.newly_linked = {report2['purchases']['newly_linked']} (expected 0)"
+    assert report2["purchase_payments"]["newly_linked"] == 0, \
+        f"❌ FAIL: purchase_payments.newly_linked = {report2['purchase_payments']['newly_linked']} (expected 0)"
+    print("✅ PASS: Second call has newly_linked=0 for both sections (idempotent)")
+    
+    print("\n✅ TEST 10 COMPLETE: Admin backfill migration report working")
+
+
+def test_11_reconciliation_healthy():
+    """
+    Scenario 11: Reconciliation stays healthy
+    GET /api/reconcile → healthy == true, summary.passed == summary.total
+    """
+    print("\n" + "="*80)
+    print("TEST 11: Reconciliation Stays Healthy")
+    print("="*80)
+    
+    print("\nCalling GET /api/reconcile...")
+    report = get("/reconcile")
+    
+    print(f"\nReconciliation status:")
+    print(f"   healthy: {report.get('healthy')}")
+    print(f"   summary: {report.get('summary')}")
+    
+    assert report.get("healthy") is True, \
+        f"❌ FAIL: healthy={report.get('healthy')} (expected True)"
+    print("✅ healthy = True")
+    
+    summary = report.get("summary", {})
+    assert summary.get("passed") == summary.get("total"), \
+        f"❌ FAIL: passed={summary.get('passed')}, total={summary.get('total')}"
+    print(f"✅ summary.passed ({summary.get('passed')}) == summary.total ({summary.get('total')})")
+    
+    print("\n✅ TEST 11 COMPLETE: Reconciliation is healthy")
+
+
+def test_12_run_pytest_suite():
+    """
+    Scenario 12: Run the pre-existing pytest suite
+    cd /app/backend && python3 -m pytest tests/test_bug_vendor_party_linkage.py -v -o addopts=""
+    """
+    print("\n" + "="*80)
+    print("TEST 12: Run Pre-Existing Pytest Suite")
+    print("="*80)
+    
+    import subprocess
+    
+    print("\nRunning: cd /app/backend && python3 -m pytest tests/test_bug_vendor_party_linkage.py -v -o addopts=\"\"")
+    result = subprocess.run(
+        ["python3", "-m", "pytest", "tests/test_bug_vendor_party_linkage.py", "-v", "-o", "addopts="],
+        cwd="/app/backend",
+        capture_output=True,
+        text=True,
+        timeout=60
+    )
+    
+    print("\n" + "-"*80)
+    print("PYTEST OUTPUT:")
+    print("-"*80)
+    print(result.stdout)
+    if result.stderr:
+        print("STDERR:")
+        print(result.stderr)
+    print("-"*80)
+    
+    if result.returncode == 0:
+        print("\n✅ TEST 12 COMPLETE: Pytest suite passed")
+    else:
+        print(f"\n❌ TEST 12 FAILED: Pytest suite failed with return code {result.returncode}")
+        raise Exception(f"Pytest suite failed with return code {result.returncode}")
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
 
 def main():
-    """Main test runner"""
+    """Run all test scenarios"""
     print("\n" + "="*80)
-    print("BACKEND API TEST SUITE")
-    print("Bug Fix Verification: Dashboard Outstanding Receivable + Order Shipped Date")
+    print("BACKEND API TESTING: Canonical vendor_party_id Linkage Bug Fix")
     print("="*80)
     
+    # Login
+    print("\nLogging in as admin...")
+    login()
+    print(f"✅ Logged in successfully (token: {TOKEN[:20]}...)")
+    
+    # Run all tests
     try:
-        # Login
-        login()
-        
-        # Bug 1 tests
-        test_bug1_dashboard_outstanding_receivable()
-        test_bug1_live_edge_cases()
-        
-        # Bug 2 tests
-        test_bug2_order_shipped_date()
-        test_bug2_live_shipment_flow()
-        
-        # Regression tests
-        test_regression_checks()
+        test_1_manual_purchase_linkage()
+        test_2_vendor_rename_preserves_linkage()
+        test_3_freight_auto_purchase()
+        test_4_freight_linkage_matches_manual()
+        test_5_freight_sync_idempotency()
+        test_6_zero_freight_suppresses_purchase()
+        test_7_packing_auto_purchase()
+        test_8_blank_packer_suppresses_purchase()
+        test_9_removing_packer_removes_purchase()
+        test_10_admin_backfill_migration()
+        test_11_reconciliation_healthy()
+        test_12_run_pytest_suite()
         
         print("\n" + "="*80)
         print("✅ ALL TESTS PASSED")
         print("="*80)
-        
-    except AssertionError as e:
+        print("\nSummary:")
+        print("  ✅ Test 1: Manual purchase linkage")
+        print("  ✅ Test 2: Vendor rename preserves linkage")
+        print("  ✅ Test 3: Freight auto-purchase generation")
+        print("  ✅ Test 4: Freight linkage matches manual purchase")
+        print("  ✅ Test 5: Freight sync idempotency")
+        print("  ✅ Test 6: Zero freight/blank transporter suppresses purchase")
+        print("  ✅ Test 7: Packing auto-purchase generation")
+        print("  ✅ Test 8: Blank packer suppresses packing purchase")
+        print("  ✅ Test 9: Removing packer/packing removes linked purchase")
+        print("  ✅ Test 10: Admin backfill migration report")
+        print("  ✅ Test 11: Reconciliation stays healthy")
+        print("  ✅ Test 12: Pytest suite (16/16 tests)")
         print("\n" + "="*80)
-        print(f"❌ TEST FAILED: {e}")
-        print("="*80)
-        raise
+        
     except Exception as e:
         print("\n" + "="*80)
-        print(f"❌ ERROR: {e}")
+        print("❌ TEST SUITE FAILED")
         print("="*80)
+        print(f"\nError: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise
 
 

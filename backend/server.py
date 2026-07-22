@@ -231,6 +231,13 @@ class OrderBase(BaseModel):
     transporter: Optional[str] = ""
     lr_number: Optional[str] = ""
 
+    # Bug fix (2026-07-22) · Packing vendor linkage.
+    # When packing_cost > 0 AND packer_name is set, a canonical Purchase
+    # row is auto-created under this vendor (source_type='order_packing_purchase').
+    # If packer_name is empty the packing cost is treated as an internal
+    # expense (no vendor bill emitted).
+    packer_name: Optional[str] = ""
+
     # Future-ready adjustments — generic descriptor+amount rows
     other_revenue: List[AdjustmentEntry] = []
     other_expense: List[AdjustmentEntry] = []
@@ -801,12 +808,280 @@ async def _sync_order_linked_purchases(order: dict) -> dict:
             "kept_paid": kept_paid, "errors": errors}
 
 
+# ─── Bug fix (2026-07-22) · Freight & Packing → canonical Purchase rows ────
+#
+# Freight (per shipment) and Packing (per order) charges must become
+# canonical Purchase rows stamped with the transporter / packer's
+# `vendor_party_id` so:
+#   • Vendor Party Ledger shows freight & packing outgo against the correct
+#     transporter/packer.
+#   • Vendor Payments can allocate against these purchases.
+#   • Reconciliation invariant "every purchase has vendor_party_id" holds.
+#
+# Design:
+#   • FREIGHT — one purchase per SHIPMENT with (transporter, freight_paid>0).
+#     linked_source_key = f"{order_id}::shipment::{shipment_id}::freight".
+#   • PACKING — one purchase per ORDER with (packer_name, packing_cost>0).
+#     linked_source_key = f"{order_id}::order::packing".
+#   • Deterministic keys mean repeated syncs never create duplicates.
+#   • On removal (transporter cleared / amount zeroed / shipment deleted)
+#     the linked purchase is deleted UNLESS it already has payments, in
+#     which case it's marked stale (mirrors the product-purchase policy).
+
+FREIGHT_SOURCE_TYPE = "order_freight_purchase"
+PACKING_SOURCE_TYPE = "order_packing_purchase"
+
+
+async def _resolve_service_vendor_party(vendor_name: str) -> tuple[str | None, str]:
+    """Resolve (party_id, canonical_name) for a transporter / packer name.
+    Uses `get_or_create_vendor_party` — deterministic, idempotent, never
+    creates duplicates. Factory aliases route to SYSTEM_FF_ID.
+    Returns (None, "") if vendor_name is blank.
+    """
+    name = (vendor_name or "").strip()
+    if not name:
+        return None, ""
+    if is_ff_alias(name):
+        return SYSTEM_FF_ID, name
+    party = await get_or_create_vendor_party(db, name)
+    if party and party.get("id"):
+        return party["id"], party.get("name") or name
+    return None, name
+
+
+async def _upsert_linked_service_purchase(
+    *,
+    order_id: str,
+    linked_source_key: str,
+    source_type: str,
+    vendor_name: str,
+    vendor_party_id: str | None,
+    amount: float,
+    purchase_date: str,
+    description: str,
+    category: str,
+    notes: str,
+    linked_shipment_id: str | None = None,
+) -> str:
+    """Idempotently upsert one linked freight/packing Purchase row.
+    Returns one of: 'created', 'updated'.
+    """
+    existing = await db.purchases.find_one({"linked_source_key": linked_source_key}, {"_id": 0})
+    pur_item = {
+        "id": str(uuid.uuid4()),
+        "category": category,
+        "description": description,
+        "qty": 1, "rate": amount, "amount": amount,
+    }
+    base_doc = {
+        "vendor_name": vendor_name,
+        "vendor_party_id": vendor_party_id,
+        "purchase_date": purchase_date,
+        "items": [pur_item],
+        "freight": 0, "other_charges": 0,
+        "tax_applicable": False, "tax_type": "None", "tax_percent": 0,
+        "tax_amount": 0, "tax_amount_manual": False,
+        "notes": notes,
+        "linked_to_order_id": order_id,
+        "linked_source_key": linked_source_key,
+        "linked_shipment_id": linked_shipment_id,
+        "source_type": source_type,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if existing:
+        total_paid = float(existing.get("total_paid") or 0)
+        invoice_total = amount
+        outstanding = round(invoice_total - total_paid, 2)
+        payment_status = "Paid" if total_paid + 0.005 >= invoice_total \
+                        else ("Partial" if total_paid > 0.005 else "Unpaid")
+        upd = {
+            **base_doc,
+            "subtotal": amount, "invoice_total": amount,
+            "outstanding_balance": outstanding,
+            "payment_status": payment_status,
+            "stale": False,
+        }
+        # Preserve identity + payment history
+        upd["items"][0]["id"] = (existing.get("items") or [{}])[0].get("id") or upd["items"][0]["id"]
+        upd["id"] = existing.get("id")
+        await db.purchases.update_one({"id": existing["id"]}, {"$set": upd})
+        return "updated"
+    doc = {
+        **base_doc,
+        "subtotal": amount, "invoice_total": amount,
+        "total_paid": 0, "outstanding_balance": amount,
+        "payment_status": "Unpaid",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "stale": False,
+    }
+    doc["id"] = str(uuid.uuid4())
+    await db.purchases.insert_one(doc)
+    # Ensure vendor exists in vendors master (skip system aliases)
+    if not is_ff_alias(vendor_name):
+        await db.vendors.update_one(
+            {"name": vendor_name},
+            {"$setOnInsert": Vendor(name=vendor_name).model_dump()},
+            upsert=True,
+        )
+    return "created"
+
+
+async def _sync_order_linked_freight_purchases(order: dict) -> dict:
+    """Emit one Purchase per (shipment with transporter + freight_paid>0).
+    Deterministic key `{order_id}::shipment::{shipment_id}::freight`. Repeat
+    calls never duplicate. Removes stale rows when a shipment is deleted or
+    freight_paid → 0."""
+    order_id = order.get("id")
+    if not order_id:
+        return {"created": 0, "updated": 0, "deleted": 0, "kept_paid": 0}
+
+    keep_keys: set[str] = set()
+    created = updated = deleted = kept_paid = 0
+    order_date_fallback = (order.get("order_date")
+                           or datetime.now(timezone.utc).date().isoformat())
+
+    for sh in (order.get("shipments") or []):
+        transporter = (sh.get("transporter") or "").strip()
+        freight_paid = float(sh.get("freight_paid") or 0)
+        if not transporter or freight_paid <= 0.005:
+            continue
+        sh_id = sh.get("id") or ""
+        if not sh_id:
+            continue
+        vendor_pid, vendor_name = await _resolve_service_vendor_party(transporter)
+        if not vendor_name:
+            continue
+        key = f"{order_id}::shipment::{sh_id}::freight"
+        keep_keys.add(key)
+        lr = (sh.get("lr_number") or "").strip()
+        desc = f"Freight — Shipment {sh_id[:8]}"
+        if lr:
+            desc += f" · LR {lr}"
+        notes = (f"Auto-linked freight from Order {order_id[:8]} · Shipment {sh_id[:8]}"
+                 + (f" · LR {lr}" if lr else ""))
+        res = await _upsert_linked_service_purchase(
+            order_id=order_id,
+            linked_source_key=key,
+            source_type=FREIGHT_SOURCE_TYPE,
+            vendor_name=vendor_name,
+            vendor_party_id=vendor_pid,
+            amount=freight_paid,
+            purchase_date=(sh.get("date") or order_date_fallback),
+            description=desc,
+            category="Freight",
+            notes=notes,
+            linked_shipment_id=sh_id,
+        )
+        if res == "created":
+            created += 1
+        else:
+            updated += 1
+
+    # Purge / mark stale freight purchases no longer referenced.
+    async for old in db.purchases.find(
+        {"linked_to_order_id": order_id, "source_type": FREIGHT_SOURCE_TYPE}, {"_id": 0}
+    ):
+        if old.get("linked_source_key") in keep_keys:
+            continue
+        total_paid = float(old.get("total_paid") or 0)
+        if total_paid > 0.005:
+            await db.purchases.update_one({"id": old["id"]}, {"$set": {
+                "stale": True,
+                "notes": (old.get("notes") or "") + " · SHIPMENT / FREIGHT REMOVED — has payments, needs adjustment.",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }})
+            kept_paid += 1
+        else:
+            await db.purchases.delete_one({"id": old["id"]})
+            deleted += 1
+
+    return {"created": created, "updated": updated, "deleted": deleted, "kept_paid": kept_paid}
+
+
+async def _sync_order_linked_packing_purchases(order: dict) -> dict:
+    """Emit one Purchase per ORDER with (packer_name, packing_cost > 0).
+    Deterministic key `{order_id}::order::packing`."""
+    order_id = order.get("id")
+    if not order_id:
+        return {"created": 0, "updated": 0, "deleted": 0, "kept_paid": 0}
+
+    created = updated = deleted = kept_paid = 0
+    packer_name = (order.get("packer_name") or "").strip()
+    packing_cost = float(order.get("packing_cost") or 0)
+    key = f"{order_id}::order::packing"
+
+    should_have = bool(packer_name) and packing_cost > 0.005
+
+    if should_have:
+        vendor_pid, vendor_name = await _resolve_service_vendor_party(packer_name)
+        if vendor_name:
+            purchase_date = (order.get("order_date") or order.get("shipped_date")
+                             or datetime.now(timezone.utc).date().isoformat())
+            boxes = float(order.get("boxes_used") or 0)
+            desc = "Packing charges" + (f" ({boxes:g} boxes)" if boxes > 0 else "")
+            notes = f"Auto-linked packing from Order {order_id[:8]}"
+            res = await _upsert_linked_service_purchase(
+                order_id=order_id,
+                linked_source_key=key,
+                source_type=PACKING_SOURCE_TYPE,
+                vendor_name=vendor_name,
+                vendor_party_id=vendor_pid,
+                amount=packing_cost,
+                purchase_date=purchase_date,
+                description=desc,
+                category="Packing",
+                notes=notes,
+            )
+            if res == "created":
+                created += 1
+            else:
+                updated += 1
+        else:
+            should_have = False  # blank resolution — treat as removal
+
+    if not should_have:
+        # Purge / stale-mark the linked packing purchase (if any).
+        old = await db.purchases.find_one({"linked_source_key": key}, {"_id": 0})
+        if old:
+            total_paid = float(old.get("total_paid") or 0)
+            if total_paid > 0.005:
+                await db.purchases.update_one({"id": old["id"]}, {"$set": {
+                    "stale": True,
+                    "notes": (old.get("notes") or "") + " · PACKING VENDOR/COST REMOVED — has payments, needs adjustment.",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }})
+                kept_paid += 1
+            else:
+                await db.purchases.delete_one({"id": old["id"]})
+                deleted += 1
+
+    return {"created": created, "updated": updated, "deleted": deleted, "kept_paid": kept_paid}
+
+
+async def _sync_order_all_linked_purchases(order: dict) -> dict:
+    """Master sync: product purchase sources + freight + packing.
+    Returned dict combines all three sub-reports so callers see a single
+    view of the sync outcome."""
+    prod = await _sync_order_linked_purchases(order)
+    frt = await _sync_order_linked_freight_purchases(order)
+    pack = await _sync_order_linked_packing_purchases(order)
+    return {
+        "product": prod, "freight": frt, "packing": pack,
+        "created_total": prod["created"] + frt["created"] + pack["created"],
+        "updated_total": prod["updated"] + frt["updated"] + pack["updated"],
+        "deleted_total": prod["deleted"] + frt["deleted"] + pack["deleted"],
+    }
+
+
 async def _delete_order_linked_purchases(order_id: str) -> dict:
     """Called when an order is deleted — same policy as sync but for full removal:
-    delete unpaid linked purchases, keep the ones with payments as stale."""
+    delete unpaid linked purchases (of ANY auto-linked source_type), keep the
+    ones with payments as stale."""
     deleted = kept_paid = 0
     async for old in db.purchases.find(
-        {"linked_to_order_id": order_id, "source_type": "order_product_purchase"}, {"_id": 0}
+        {"linked_to_order_id": order_id,
+         "source_type": {"$in": ["order_product_purchase", FREIGHT_SOURCE_TYPE, PACKING_SOURCE_TYPE]}},
+        {"_id": 0},
     ):
         total_paid = float(old.get("total_paid") or 0)
         if total_paid > 0.005:
@@ -863,7 +1138,7 @@ async def create_order(payload: OrderBase):
             {"$setOnInsert": Customer(name=data["client_name"]).model_dump()},
             upsert=True,
         )
-    await _sync_order_linked_purchases(order)
+    await _sync_order_all_linked_purchases(order)
     return Order(**order)
 
 
@@ -930,7 +1205,7 @@ async def update_order(oid: str, payload: OrderBase):
         data["customer_party_id"] = party["id"]
     await db.orders.update_one({"id": oid}, {"$set": data})
     updated = await db.orders.find_one({"id": oid}, {"_id": 0})
-    await _sync_order_linked_purchases(updated)
+    await _sync_order_all_linked_purchases(updated)
     return Order(**updated)
 
 
@@ -4440,7 +4715,31 @@ async def update_purchase(pid: str, payload: PurchaseBase):
     data["id"] = pid
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     compute_purchase(data)
+    # Bug fix (2026-07-22): re-resolve vendor_party_id if vendor_name
+    # changed. Renaming a vendor NEVER moves the payable to a different
+    # party — but choosing a different vendor DOES. We resolve via the
+    # deterministic helper (never guesses on ambiguous matches; creates
+    # a canonical party if none matches exactly).
+    new_vname = (data.get("vendor_name") or "").strip()
+    old_vname = (existing.get("vendor_name") or "").strip()
+    existing_pid = existing.get("vendor_party_id")
+    if new_vname and (new_vname != old_vname or not existing_pid):
+        party = (await resolve_party(db, ptype="vendor", display_name=new_vname)
+                 if is_ff_alias(new_vname)
+                 else await get_or_create_vendor_party(db, new_vname))
+        if party:
+            data["vendor_party_id"] = party["id"]
+    elif existing_pid:
+        # keep the existing linkage
+        data["vendor_party_id"] = existing_pid
     await db.purchases.update_one({"id": pid}, {"$set": data})
+    # Ensure vendor exists in vendors master when vendor changed.
+    if new_vname and new_vname != old_vname and not is_ff_alias(new_vname):
+        await db.vendors.update_one(
+            {"name": new_vname},
+            {"$setOnInsert": Vendor(name=new_vname).model_dump()},
+            upsert=True,
+        )
     await _recompute_purchase_payment_aggregates([pid])
     fresh = await db.purchases.find_one({"id": pid}, {"_id": 0})
     return Purchase(**fresh)
@@ -4937,6 +5236,33 @@ async def _startup():
             )
     except Exception as e:
         logger.error(f"P0 legacy stamp failed: {e}")
+
+    # Bug fix (2026-07-22): idempotent auto-backfill of vendor_party_id on
+    # every purchases + purchase_payments row. Safe to run on every boot:
+    # already-linked rows are counted as `already_linked` and skipped.
+    # Ambiguous / unmatched rows are logged for admin follow-up.
+    try:
+        vp_report = await _backfill_purchase_vendor_party_ids()
+        pur = vp_report["purchases"]
+        pp = vp_report["purchase_payments"]
+        logger.info(
+            f"Vendor party linkage backfill OK — "
+            f"purchases: scanned={pur['scanned']}, already_linked={pur['already_linked']}, "
+            f"newly_linked={pur['newly_linked']}, ambiguous={len(pur['ambiguous'])}, "
+            f"unmatched={len(pur['unmatched'])}; "
+            f"purchase_payments: scanned={pp['scanned']}, already_linked={pp['already_linked']}, "
+            f"newly_linked={pp['newly_linked']}, ambiguous={len(pp['ambiguous'])}, "
+            f"unmatched={len(pp['unmatched'])}"
+        )
+        if pur["newly_linked"] or pp["newly_linked"] or pur["ambiguous"] or pur["unmatched"]:
+            await db.admin_migration_reports.insert_one({
+                "id": str(uuid.uuid4()),
+                "phase": "bug_fix_vendor_party_id_backfill_startup",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                **vp_report,
+            })
+    except Exception as e:
+        logger.error(f"Vendor party linkage backfill failed: {e}")
 
 
 @app.on_event("shutdown")
