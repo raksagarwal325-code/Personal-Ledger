@@ -103,6 +103,27 @@ def is_transfer_active(t: dict) -> bool:
     return (t.get("status") or "active") != "reversed"
 
 
+def is_transfer_countable_for_balance(t: dict) -> bool:
+    """Phase 6 · Slice 6 — filter used by ACCOUNT-BALANCE / PARTY-LEDGER
+    projections (distinct from `is_transfer_active` which is the KPI-scope
+    filter).
+
+    Every transfer row is countable for balance purposes: a reversed
+    ORIGINAL contributes its original delta, and the paired REVERSAL doc
+    (status='active', with `reverses_transfer_id` set, swapped sides)
+    contributes the opposite delta — so the pair nets to zero without any
+    additional filtering. Excluding reversed originals here would leave a
+    one-sided phantom effect from the reversal doc.
+
+    Contrast with `is_transfer_active` which is used for the "Received /
+    Paid / Modes" KPI aggregation where reversal pairs must NOT contribute
+    at all (they are audit-only events).
+    """
+    if not t:
+        return False
+    return True
+
+
 def is_account_active(a: dict) -> bool:
     """Archived accounts do not participate in fresh KPIs but their
     historical balances remain derivable."""
@@ -685,19 +706,72 @@ def apply_transfer_to_account_balance_paise(t: dict, account_id: str) -> int:
     """Signed impact of one transfer on ONE account, in paise. Pure.
 
     Positive → account balance increased; Negative → decreased.
-    Ignores reversed transfers.
+
+    Phase 6 · Slice 6 — reads the REAL Mongo schema fields `from_side` /
+    `to_side` (previously read `from` / `to` which never matched real
+    docs). Counts every transfer row (both active and reversed originals);
+    the paired reversal doc has swapped sides so the pair nets to zero.
     """
-    if not is_transfer_active(t):
+    if not is_transfer_countable_for_balance(t):
         return 0
     amt_p = to_paise(t.get("amount"))
-    from_side = t.get("from") or {}
-    to_side = t.get("to") or {}
+    from_side = t.get("from_side") or {}
+    to_side = t.get("to_side") or {}
     delta = 0
-    if from_side.get("account_id") == account_id:
+    if from_side.get("type") == "account" and from_side.get("account_id") == account_id:
         delta -= amt_p
-    if to_side.get("account_id") == account_id:
+    if to_side.get("type") == "account" and to_side.get("account_id") == account_id:
         delta += amt_p
     return delta
+
+
+def apply_transfer_to_ff_ledger_paise(t: dict, ff_party_id: str) -> int:
+    """Signed impact of one transfer on the Father's Firm PARTY LEDGER in
+    paise, using the party-ledger convention (+ve = Rakshit owes FF more,
+    -ve = FF owes Rakshit more). Pure.
+
+    Sign rules (Phase 3 · P1 · Transfers doc §Numeric example):
+      • `rakshit_to_ff`  → delta = -amount   (Rakshit paid FF; FF owed less)
+      • `ff_to_rakshit`  → delta = +amount   (FF paid Rakshit; Rakshit owes FF)
+      • `account_to_account` → 0  (never touches FF)
+
+    Counts every transfer row (active + reversed originals); the reversal
+    doc has swapped kind so the pair nets to zero — same reasoning as
+    `apply_transfer_to_account_balance_paise`.
+    """
+    if not is_transfer_countable_for_balance(t):
+        return 0
+    from_side = t.get("from_side") or {}
+    to_side = t.get("to_side") or {}
+    involves_ff = (
+        (from_side.get("type") == "party" and from_side.get("party_id") == ff_party_id) or
+        (to_side.get("type") == "party" and to_side.get("party_id") == ff_party_id)
+    )
+    if not involves_ff:
+        return 0
+    amt_p = to_paise(t.get("amount"))
+    kind = t.get("kind")
+    if kind == "rakshit_to_ff":
+        return -amt_p
+    if kind == "ff_to_rakshit":
+        return +amt_p
+    return 0
+
+
+def sum_ff_ledger_delta_from_transfers_paise(transfers: Iterable[dict],
+                                             ff_party_id: str) -> int:
+    """Σ `apply_transfer_to_ff_ledger_paise` over the given transfer rows.
+    Party-ledger convention (+ve = Rakshit owes FF more). Paise. Pure.
+
+    This is the helper `party_ledger_v2.fathers_firm_settlement` and
+    `transfers.ff_settlement_delta_from_transfers` route through in
+    Slice 6. Contrast with `sum_ff_settlement_delta_from_transfers_paise`
+    below which uses the OPPOSITE (dashboard-signed) convention — kept
+    for existing dashboard KPI code.
+    """
+    return sum(
+        apply_transfer_to_ff_ledger_paise(t, ff_party_id) for t in transfers
+    )
 
 
 def sum_cashbook_net_for_account_paise(cb_entries: Iterable[dict],
@@ -715,6 +789,39 @@ def sum_cashbook_net_for_account_paise(cb_entries: Iterable[dict],
             total += to_paise(e.get("amount"))
         elif kind == "general_expense":
             total -= to_paise(e.get("amount"))
+    return total
+
+
+def sum_cashbook_income_for_account_paise(cb_entries: Iterable[dict],
+                                          account_id: str) -> int:
+    """Σ general_income (positive) on canonical cash-book entries tagged
+    to `account_id`. Paise. Pure. Slice 6 — split-view of the signed net
+    for consumers (like `derive_account_balance`) that display income and
+    expense separately."""
+    total = 0
+    for e in cb_entries:
+        if not is_cash_book_entry_canonical(e):
+            continue
+        if e.get("account_id") != account_id:
+            continue
+        if e.get("kind") == "general_income":
+            total += to_paise(e.get("amount"))
+    return total
+
+
+def sum_cashbook_expense_for_account_paise(cb_entries: Iterable[dict],
+                                           account_id: str) -> int:
+    """Σ general_expense (positive) on canonical cash-book entries tagged
+    to `account_id`. Paise. Pure. Companion of
+    `sum_cashbook_income_for_account_paise`."""
+    total = 0
+    for e in cb_entries:
+        if not is_cash_book_entry_canonical(e):
+            continue
+        if e.get("account_id") != account_id:
+            continue
+        if e.get("kind") == "general_expense":
+            total += to_paise(e.get("amount"))
     return total
 
 

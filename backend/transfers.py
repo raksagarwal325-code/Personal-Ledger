@@ -63,6 +63,20 @@ from typing import Any, Optional, Literal
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
+# Phase 6 · Slice 6 — transfer + FF-ledger + account-balance calculations
+# consolidated in the shared domain layer. Every helper below is a thin
+# adapter over these paise-safe pure functions.
+from domain import (
+    to_paise, from_paise,
+    apply_transfer_to_account_balance_paise as _domain_apply_xfer_to_account,
+    apply_transfer_to_ff_ledger_paise as _domain_apply_xfer_to_ff_ledger,
+    sum_ff_ledger_delta_from_transfers_paise as _domain_sum_ff_ledger,
+    sum_cashbook_income_for_account_paise as _domain_cb_income_for_account,
+    sum_cashbook_expense_for_account_paise as _domain_cb_expense_for_account,
+    is_customer_payment_active as _domain_is_cust_pay_active,
+    is_purchase_payment_active as _domain_is_purch_pay_active,
+)
+
 from party_sync import SYSTEM_FF_ID
 
 
@@ -307,68 +321,82 @@ def _apply_transfer_to_account_balance(t: dict, account_id: str) -> float:
     """Return the signed delta this transfer produces on the given account.
     Includes both `active` originals AND `reversed` originals — the paired
     reversal transfer (which is itself active with swapped sides) cancels
-    a reversed original, so summing both is correct. Only reversal docs
-    that themselves have `reverses_transfer_id` set are still active and
-    counted; the original stays counted so history is preserved."""
-    fs = t.get("from_side") or {}
-    ts = t.get("to_side") or {}
-    delta = 0.0
-    if fs.get("type") == "account" and fs.get("account_id") == account_id:
-        delta -= float(t.get("amount") or 0)
-    if ts.get("type") == "account" and ts.get("account_id") == account_id:
-        delta += float(t.get("amount") or 0)
-    return delta
+    a reversed original, so summing both is correct.
+
+    Phase 6 · Slice 6 — now a thin adapter over
+    `domain.apply_transfer_to_account_balance_paise`.
+    """
+    return from_paise(_domain_apply_xfer_to_account(t, account_id))
 
 
 async def derive_account_balance(db, account_id: str) -> dict:
     """Consolidated account balance: opening + customer_payments (in)
     − purchase_payments (out) + cash_book_entries (income − expense)
-    ± transfers. All derived — no stored balance."""
+    ± transfers. All derived — no stored balance.
+
+    Phase 6 · Slice 6 — accumulates in PAISE via the shared domain
+    helpers (`is_customer_payment_active`, `is_purchase_payment_active`,
+    `sum_cashbook_income_for_account_paise`,
+    `sum_cashbook_expense_for_account_paise`,
+    `apply_transfer_to_account_balance_paise`). Byte-equivalent to the
+    pre-Slice-6 float walk on the seeded DB (in / out / transfer_net /
+    balance).
+    """
     acc = await db.accounts.find_one({"id": account_id}, {"_id": 0})
     if not acc:
         raise HTTPException(404, "Account not found")
 
-    opening = float(acc.get("opening_balance") or 0)
+    opening_p = to_paise(acc.get("opening_balance"))
 
-    incoming = 0.0
-    async for p in db.customer_payments.find({"account_id": account_id}, {"_id": 0, "amount": 1}):
-        incoming += float(p.get("amount") or 0)
-    outgoing = 0.0
-    async for p in db.purchase_payments.find({"account_id": account_id}, {"_id": 0, "amount": 1}):
-        outgoing += float(p.get("amount") or 0)
+    incoming_pay_p = 0
+    async for p in db.customer_payments.find(
+            {"account_id": account_id}, {"_id": 0, "amount": 1, "reversed": 1, "voided": 1}):
+        if not _domain_is_cust_pay_active(p):
+            continue
+        incoming_pay_p += to_paise(p.get("amount"))
 
-    cbe_in = 0.0
-    cbe_out = 0.0
-    async for e in db.cash_book_entries.find(
-        {"account_id": account_id,
-         "source": {"$ne": "legacy_shim"},
-         "migrated_to_transfer_id": {"$exists": False},
-         "reversed": {"$ne": True},
-         "kind": {"$ne": "transfer"}},   # transfers are handled below via db.transfers
-        {"_id": 0, "kind": 1, "amount": 1},
+    outgoing_pay_p = 0
+    async for p in db.purchase_payments.find(
+            {"account_id": account_id}, {"_id": 0, "amount": 1, "reversed": 1, "voided": 1}):
+        if not _domain_is_purch_pay_active(p):
+            continue
+        outgoing_pay_p += to_paise(p.get("amount"))
+
+    # Cash-book income + expense (split) for this account, canonical rows
+    # only. Domain helpers apply `is_cash_book_entry_canonical` — that
+    # already excludes legacy_shim, migrated transfers, reversed rows.
+    # We still filter out `kind == transfer` here because those are the
+    # LEGACY-MIGRATED transfer rows that pre-date the P3 refactor; they
+    # would otherwise leak into `incoming` / `outgoing`.
+    cb_entries = await db.cash_book_entries.find(
+        {"account_id": account_id, "kind": {"$ne": "transfer"}},
+        {"_id": 0},
+    ).to_list(10000)
+    cb_income_p = _domain_cb_income_for_account(cb_entries, account_id)
+    cb_expense_p = _domain_cb_expense_for_account(cb_entries, account_id)
+
+    transfer_delta_p = 0
+    # Include BOTH `active` and `reversed` originals — the paired reversal
+    # doc (active, swapped sides) cancels its original so the pair nets 0.
+    async for t in db.transfers.find(
+        {"$or": [{"from_side.account_id": account_id},
+                 {"to_side.account_id": account_id}]},
+        {"_id": 0},
     ):
-        if e.get("kind") == "general_income":
-            cbe_in += float(e.get("amount") or 0)
-        elif e.get("kind") == "general_expense":
-            cbe_out += float(e.get("amount") or 0)
+        transfer_delta_p += _domain_apply_xfer_to_account(t, account_id)
 
-    transfer_delta = 0.0
-    # Include BOTH `active` and `reversed` originals. Reversals themselves
-    # (which are `active` docs with `reverses_transfer_id` set) have swapped
-    # sides and cancel their originals — the net delta across the pair is 0.
-    async for t in db.transfers.find({"$or": [{"from_side.account_id": account_id},
-                                              {"to_side.account_id": account_id}]},
-                                     {"_id": 0}):
-        transfer_delta += _apply_transfer_to_account_balance(t, account_id)
+    incoming_p = incoming_pay_p + cb_income_p
+    outgoing_p = outgoing_pay_p + cb_expense_p
+    balance_p = opening_p + incoming_p - outgoing_p + transfer_delta_p
 
     return {
         "account_id": account_id,
         "account_name": acc.get("name"),
-        "opening_balance": opening,
-        "incoming": round(incoming + cbe_in, 2),
-        "outgoing": round(outgoing + cbe_out, 2),
-        "transfer_net": round(transfer_delta, 2),
-        "balance": round(opening + incoming + cbe_in - outgoing - cbe_out + transfer_delta, 2),
+        "opening_balance": from_paise(opening_p),
+        "incoming": from_paise(incoming_p),
+        "outgoing": from_paise(outgoing_p),
+        "transfer_net": from_paise(transfer_delta_p),
+        "balance": from_paise(balance_p),
     }
 
 
@@ -377,21 +405,18 @@ async def ff_settlement_delta_from_transfers(db) -> float:
     Party Ledger v2 FF settlement projection. Counts BOTH `active` and
     `reversed` originals — the reversal transfer (active, swapped sides)
     cancels its original via `classify_kind` flipping direction, so a
-    reversed rakshit_to_ff pairs with an active ff_to_rakshit to net 0."""
-    total = 0.0
-    async for t in db.transfers.find(
+    reversed rakshit_to_ff pairs with an active ff_to_rakshit to net 0.
+
+    Phase 6 · Slice 6 — now a thin async adapter that fetches the FF-side
+    transfer rows once, then delegates every sign / amount / active-record
+    decision to `domain.sum_ff_ledger_delta_from_transfers_paise`.
+    """
+    rows = await db.transfers.find(
         {"$or": [{"from_side.party_id": SYSTEM_FF_ID},
                  {"to_side.party_id": SYSTEM_FF_ID}]},
-        {"_id": 0}
-    ):
-        # rakshit_to_ff  → Rakshit paid FF → FF is owed less → delta_you_pay = -amount
-        # ff_to_rakshit  → FF paid Rakshit → Rakshit owes FF more → +amount
-        amt = float(t.get("amount") or 0)
-        if t.get("kind") == "rakshit_to_ff":
-            total -= amt
-        elif t.get("kind") == "ff_to_rakshit":
-            total += amt
-    return round(total, 2)
+        {"_id": 0},
+    ).to_list(50000)
+    return from_paise(_domain_sum_ff_ledger(rows, SYSTEM_FF_ID))
 
 
 # ─── Migration ──────────────────────────────────────────────────────────────

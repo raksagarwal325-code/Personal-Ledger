@@ -161,15 +161,22 @@ def synth_purchases():
 
 @pytest.fixture
 def synth_transfers():
+    # Real-schema shape (`from_side` / `to_side` with a `type` discriminator).
+    # Phase 6 · Slice 6 refactored the domain helpers to read the production
+    # Mongo schema instead of the previous synthetic `from`/`to` fields.
     return [
         {"id": "t1", "kind": "account_to_account", "amount": 2000,
-         "from": {"account_id": "acc-1"}, "to": {"account_id": "acc-2"}},
+         "from_side": {"type": "account", "account_id": "acc-1"},
+         "to_side":   {"type": "account", "account_id": "acc-2"}},
         {"id": "t2", "kind": "rakshit_to_ff", "amount": 1500,
-         "from": {"account_id": "acc-1"}, "to": {"party_id": "system_fathers_firm"}},
+         "from_side": {"type": "account", "account_id": "acc-1"},
+         "to_side":   {"type": "party", "party_id": "system_fathers_firm"}},
         {"id": "t3", "kind": "ff_to_rakshit", "amount": 500,
-         "from": {"party_id": "system_fathers_firm"}, "to": {"account_id": "acc-2"}},
+         "from_side": {"type": "party", "party_id": "system_fathers_firm"},
+         "to_side":   {"type": "account", "account_id": "acc-2"}},
         {"id": "t4", "kind": "account_to_account", "amount": 999,
-         "from": {"account_id": "acc-1"}, "to": {"account_id": "acc-2"},
+         "from_side": {"type": "account", "account_id": "acc-1"},
+         "to_side":   {"type": "account", "account_id": "acc-2"},
          "status": "reversed"},
     ]
 
@@ -499,14 +506,33 @@ class TestTransferHelpers:
         assert D.apply_transfer_to_account_balance_paise(t, "acc-2") == +2000 * 100
         assert D.apply_transfer_to_account_balance_paise(t, "acc-3") == 0
 
-    def test_apply_transfer_ignores_reversed(self, synth_transfers):
+    def test_apply_transfer_includes_reversed_original(self, synth_transfers):
+        """Phase 6 · Slice 6 — account-balance projection now INCLUDES
+        reversed originals (the paired reversal doc cancels them). This
+        matches the production `derive_account_balance` semantics."""
         reversed_t = synth_transfers[3]
-        assert D.apply_transfer_to_account_balance_paise(reversed_t, "acc-1") == 0
+        assert D.apply_transfer_to_account_balance_paise(reversed_t, "acc-1") == -999 * 100
+        assert D.apply_transfer_to_account_balance_paise(reversed_t, "acc-2") == +999 * 100
 
-    def test_ff_delta_signs(self, synth_transfers):
+    def test_ff_delta_signs_dashboard_convention(self, synth_transfers):
+        # Dashboard convention (+ve = Rakshit owes FF more) — excludes reversed:
         # +1500 (rakshit_to_ff) − 500 (ff_to_rakshit) = +1000 rupees = 100_000 paise
-        # The reversed a2a (t4) doesn't affect FF.
         assert D.sum_ff_settlement_delta_from_transfers_paise(synth_transfers) == 100_000
+
+    def test_ff_ledger_delta_signs_party_ledger_convention(self, synth_transfers):
+        """Phase 6 · Slice 6 — new party-ledger-convention helper
+        (`sum_ff_ledger_delta_from_transfers_paise`). Sign is FLIPPED
+        relative to the dashboard helper: rakshit_to_ff → -amount."""
+        # -1500 (rakshit_to_ff) + 500 (ff_to_rakshit) = -1000 rupees = -100_000 paise
+        got = D.sum_ff_ledger_delta_from_transfers_paise(
+            synth_transfers, "system_fathers_firm")
+        assert got == -100_000
+
+    def test_ff_ledger_delta_ignores_non_ff_transfers(self, synth_transfers):
+        # Only transfers touching FF contribute — t1 and t4 do not.
+        rows = [synth_transfers[0], synth_transfers[3]]
+        assert D.sum_ff_ledger_delta_from_transfers_paise(
+            rows, "system_fathers_firm") == 0
 
     def test_account_balance_composition(self, synth_cust_pays,
                                          synth_purchase_pays,
@@ -515,8 +541,9 @@ class TestTransferHelpers:
         # For acc-1 (nothing tagged in cust_pays/purchase_pays fixtures):
         #   opening 10_000_00
         #   + cb_entries net for acc-1: cb1 (+400) - cb2 (-150) = +250 → +25_000 paise
-        #   + transfers: t1 (−2000 = −200_000 p), t2 (from acc-1 for 1500 = −150_000 p)
-        # Total = 1_000_000 + 25_000 − 200_000 − 150_000 = 675_000 paise
+        #   + transfers: t1 (−2000 = −200_000 p), t2 (−1500 = −150_000 p),
+        #                t4 REVERSED (−999 = −99_900 p, NOW INCLUDED per Slice 6)
+        # Total = 1_000_000 + 25_000 − 200_000 − 150_000 − 99_900 = 575_100 paise
         bal = D.account_balance_paise(
             opening_paise=1_000_000,
             cust_pays=synth_cust_pays,
@@ -525,7 +552,7 @@ class TestTransferHelpers:
             transfers=synth_transfers,
             account_id="acc-1",
         )
-        assert bal == 675_000
+        assert bal == 575_100
 
 
 # ─── 9. Composable dashboard builders ──────────────────────────────────────
@@ -643,11 +670,17 @@ class TestOrderInsensitive:
 #                       balance) and 12 round() across _party_full_ledger,
 #                       _create_entry, dashboard_summary, fathers_firm_settlement,
 #                       export_summary_csv.
+#   Slice 6 (Transfer + Father's Firm settlement → domain helpers):
+#                       38 / 46 / 0 / 2  — removed 7 float(x.get(*amount*))
+#                       and 5 round() across transfers.py (derive_account_balance,
+#                       _apply_transfer_to_account_balance, ff_settlement_delta_from_transfers).
+#                       Also removed 1 reversed:$ne_true and 1 source:$ne_legacy_shim
+#                       inline query — is_cash_book_entry_canonical single-sources them now.
 CI_GUARD_BASELINE = {
-    "float_amount_get":        45,
-    "round_calls":             51,
-    "reversed_ne_true":         1,
-    "source_ne_legacy_shim":    3,
+    "float_amount_get":        38,
+    "round_calls":             46,
+    "reversed_ne_true":         0,
+    "source_ne_legacy_shim":    2,
 }
 
 _BACKEND_DIR = Path(__file__).resolve().parents[1]
