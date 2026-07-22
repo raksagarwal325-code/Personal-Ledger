@@ -131,6 +131,169 @@ user_problem_statement: |
       `derive_completion_shipped_date` — no manual entry.
 
 frontend:
+  - task: "Frontend polish — Canonical vendor linkage in Purchases + Packer/Transporter selectors + validation"
+    implemented: true
+    working: false
+    file: "frontend/src/pages/Purchases.jsx, frontend/src/pages/PartyLedger.jsx, frontend/src/components/OrderDialog.jsx, frontend/src/components/ShipmentDialog.jsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: false
+        agent: "testing"
+        comment: |
+          ✅ FRONTEND POLISH VERIFICATION COMPLETE — 7 of 10 scenarios PASSED, 3 CRITICAL FAILURES
+          
+          Executed comprehensive UI testing covering all 10 verification scenarios (A-J) from the review request.
+          
+          **PASSED SCENARIOS (7/10):**
+          
+          ✅ A. Vendor link in Purchases table: PASSED
+             - Created test purchase with vendor "UITestVendor_A"
+             - Vendor cell displays clickable button with data-testid="vendor-link-{purchase.id}"
+             - External link icon present
+             - Clicking navigates to /party-ledger?party_id={vendor_party_id}
+             - Party Ledger detail view opens correctly
+          
+          ✅ B. Manual purchase with brand-new vendor: PASSED (implicit)
+             - Covered by Scenario A - new vendor auto-creates canonical party
+          
+          ✅ D. OrderDialog packing validation (BLOCK save): PASSED
+             - Set packing_cost = 150, left packer_name blank
+             - Validation hint displayed in terracotta: "Required — the auto-generated packing Purchase will be linked to this vendor's Party Ledger."
+             - Toast error appeared: "Please select a Packer vendor — packing cost cannot be linked without one."
+             - Order dialog remained open (order NOT saved)
+          
+          ✅ E. Packing success flow: PASSED
+             - Set packer_name = "UITestPacker_A", packing_cost = 150
+             - Success toast appeared
+             - Verified via API: exactly ONE order_packing_purchase row created
+             - vendor_party_id = 8b4eca04-cf21-4cb5-a6a1-c55cfcc8a14f (non-null)
+             - invoice_total = 150
+          
+          ✅ F. Changing packer moves the payable: PASSED
+             - Changed packer_name from "UITestPacker_A" to "UITestPacker_B"
+             - vendor_party_id changed from 8b4eca04... to 8814597f... (payable moved)
+             - Still exactly ONE order_packing_purchase row (not duplicated)
+          
+          ✅ G. Blank packer + zero cost removes auto-purchase: PASSED
+             - Cleared packer_name and set packing_cost = 0
+             - Verified via API: order_packing_purchase row deleted (count = 0)
+          
+          ✅ H. ShipmentDialog transporter validation: PASSED
+             - Set freight_paid = 250, left transporter blank
+             - Validation error element visible (data-testid="ship-transporter-error")
+             - Toast error: "Please select a Transporter — freight cannot be recorded without a vendor."
+             - Shipment dialog remained open (shipment NOT saved)
+             - Filled transporter = "UITestTransporter_A" and saved successfully
+             - Verified via API: order_freight_purchase created with vendor_party_id = ed8412d3... and invoice_total = 250
+          
+          **FAILED SCENARIOS (3/10):**
+          
+          ❌ C. Vendor rename honoured via vendor_party_id: FAILED
+             - Renamed vendor from "UITestVendor_A" to "UITestVendor_A_Renamed" via API
+             - Party record updated correctly (verified via /api/party-ledger-v2/parties/{party_id})
+             - **ISSUE**: Purchases page still shows old vendor_name "UITestVendor_A" instead of resolving current name via vendor_party_id
+             - **ROOT CAUSE**: Purchases.jsx line 282 uses `party?.name || p.vendor_name` but the party lookup is failing or the vendor_name field is not being updated
+             - The vendor_party_id linkage exists, but the UI is not resolving the current display name through the canonical party
+          
+          ❌ I. Repeat-save idempotency: FAILED
+             - Before re-save: packing=0, freight=1
+             - After re-save (no changes): packing=0, freight=2
+             - **ISSUE**: Freight purchase count increased from 1 to 2 (duplicated)
+             - **ROOT CAUSE**: The backend _sync_order_linked_freight_purchases is not idempotent - it creates a new freight purchase on every save even when nothing changed
+             - This violates the idempotency requirement from the review request
+          
+          ❌ J. Reconcile still healthy: FAILED
+             - healthy = False
+             - summary: passed=20/21, failed=1
+             - **FAILED INVARIANT**: p4.orders.identities
+               * Description: "For every non-cancelled order: realized + unrealized net_profit == estimated net_profit, and realized cost ≤ estimated cost."
+               * Issue: "realized cost > estimated cost"
+               * Offending order: 6b934cc5-4adb-4baf-84a3-9e683eeca90...
+               * realized_cost = 239,675 paise, estimated_cost = 71,675 paise
+             - **ROOT CAUSE**: The Minakshi Jain order has realized_cost (₹2,396.75) exceeding estimated_cost (₹716.75), which violates the Phase 4 invariant
+             - This is likely caused by the freight purchase duplication issue from Scenario I
+          
+          **CRITICAL ISSUES SUMMARY:**
+          
+          1. **Vendor rename not reflected in Purchases UI** (Scenario C)
+             - Backend linkage is correct, but frontend is not resolving the current party name
+             - Fix needed in Purchases.jsx to properly resolve party name via vendor_party_id
+          
+          2. **Freight purchase duplication on re-save** (Scenario I)
+             - Backend _sync_order_linked_freight_purchases is not idempotent
+             - Creates duplicate freight purchases on every order save
+             - Fix needed in backend/server.py to check for existing freight purchases before creating new ones
+          
+          3. **Reconcile invariant failure** (Scenario J)
+             - p4.orders.identities invariant failing due to realized_cost > estimated_cost
+             - Likely caused by the freight purchase duplication issue
+             - Once duplication is fixed, reconcile should return to healthy state
+          
+          **ADMIN CREDENTIALS USED:**
+          - Email: admin@artisan.local
+          - Password: Admin@12345
+          - Source: /app/memory/test_credentials.md
+          
+          **CONCLUSION:**
+          The frontend polish implementation has 3 critical bugs that must be fixed before this feature can be considered complete:
+          1. Vendor rename not reflected in Purchases table UI
+          2. Freight purchase duplication on order re-save (breaks idempotency)
+          3. Reconcile invariant failure (consequence of issue #2)
+          
+          The packing vendor and transporter validation flows are working correctly (scenarios D, E, F, G, H all passed).
+      - working: "NA"
+        agent: "main"
+        comment: |
+          Frontend polish for the completed vendor-linkage backend fix
+          (2026-07-22). Changes:
+          
+          1. Purchases page (pages/Purchases.jsx):
+             - Loads canonical vendor parties from `/party-ledger-v2/parties`
+               (with legacy `/vendors` fallback).
+             - Vendor name column resolves the CURRENT display name through
+               `vendor_party_id → parties[id].name` — so vendor RENAMES are
+               reflected immediately (before the purchase row is re-saved).
+             - Vendor cell is a button (data-testid=`vendor-link-<id>`) that
+               navigates to `/party-ledger?party_id=<vendor_party_id>` and
+               opens that vendor's Party Ledger. ExternalLink icon appended.
+             - Rows without `vendor_party_id` show a warning icon
+               (data-testid=`vendor-unlinked-<id>`) so the operator can see
+               data-integrity gaps at a glance.
+             - Purchase edit dialog: datalist merges canonical parties first,
+               legacy vendors as fallback. Adds "Open in Party Ledger" quick
+               link inside the edit form when a party linkage exists
+               (data-testid=`p-vendor-open-ledger`).
+          
+          2. Party Ledger page (pages/PartyLedger.jsx):
+             - Now honours `?party_id=<uuid>` query param — when present,
+               opens PartyDetailView directly. Back button strips the param
+               (uses react-router `useSearchParams`).
+          
+          3. OrderDialog (components/OrderDialog.jsx):
+             - NEW "Packer vendor" field in the Packing section
+               (data-testid=`pack-packer`) — canonical datalist with legacy
+               fallback. Free text still allowed → backend quick-creates.
+             - Hint text (data-testid=`pack-packer-hint`) shows in terracotta
+               when packing_cost>0 but packer_name is blank (validation).
+             - `submit()` blocks save when `packing_cost>0 && !packer_name`,
+               and when any shipment has `freight_paid>0 && !transporter`.
+             - Kept transporter/freight vendor (per-shipment) SEPARATE from
+               packing vendor (order-level).
+          
+          4. ShipmentDialog (components/ShipmentDialog.jsx):
+             - Transporter Input converted to a datalist (canonical parties
+               + legacy fallback).
+             - Inline validation banner (data-testid=`ship-transporter-error`)
+               shows when freight_paid > 0 and transporter is blank.
+             - `submit()` blocks save on the same condition.
+          
+          Frontend compiles with only pre-existing lint warnings. Backend
+          contract unchanged — every canonical Purchase (product source,
+          freight, packing) already gets `vendor_party_id` stamped by
+          get_or_create_vendor_party on save.
+
   - task: "Login/Bootstrap — Toaster now global + CORS credentials fix"
     implemented: true
     working: "NA"
@@ -2590,12 +2753,148 @@ metadata:
   run_ui: true
 
 test_plan:
-  current_focus: []
+  current_focus:
+    - "Frontend polish — Canonical vendor linkage in Purchases + Packer/Transporter selectors + validation"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
 
 agent_communication:
+  - agent: "testing"
+    message: |
+      ✅ FRONTEND POLISH VERIFICATION COMPLETE — 7/10 PASSED, 3 CRITICAL FAILURES
+      
+      **PASSED (7):** A (vendor link), B (new vendor), D (packing validation), 
+      E (packing success), F (packer change), G (blank packer removal), H (transporter validation)
+      
+      **FAILED (3):**
+      
+      ❌ **C. Vendor rename not reflected in Purchases UI**
+         - Backend party renamed correctly (UITestVendor_A → UITestVendor_A_Renamed)
+         - Purchases page still shows old vendor_name instead of resolving via vendor_party_id
+         - Fix: Purchases.jsx needs to properly resolve party name from partyById lookup
+      
+      ❌ **I. Freight purchase duplication (NOT idempotent)**
+         - Re-saving order without changes duplicated freight purchase (1 → 2)
+         - Backend _sync_order_linked_freight_purchases creates new row every time
+         - Fix: Backend must check for existing freight purchase before creating
+      
+      ❌ **J. Reconcile unhealthy (20/21 passed)**
+         - p4.orders.identities invariant failed: realized_cost > estimated_cost
+         - Minakshi Jain order: realized=₹2,396.75, estimated=₹716.75
+         - Likely caused by freight purchase duplication from issue I
+      
+      **ACTION ITEMS FOR MAIN AGENT:**
+      1. Fix Purchases.jsx vendor name resolution (line 282 area)
+      2. Fix backend freight purchase idempotency in _sync_order_linked_freight_purchases
+      3. Verify reconcile returns to healthy after fixing issue #2
+      
+      Packing and transporter validation flows are working correctly.
+  
+  - agent: "main"
+    message: |
+      FRONTEND POLISH (2026-07-22) — user approved backend vendor-linkage
+      fix and asked for the small frontend integration so the new backend
+      capability is actually usable.
+      
+      CHANGES:
+      1. `pages/Purchases.jsx`:
+         - Loads `/party-ledger-v2/parties?type=vendor` for canonical
+           vendor list.
+         - Vendor cell resolves current display name via
+           `vendor_party_id → partyById[id].name` (rename-safe).
+         - Vendor cell is a clickable button
+           (data-testid=`vendor-link-<purchase.id>`) that navigates to
+           `/party-ledger?party_id=<vendor_party_id>`.
+         - Rows lacking `vendor_party_id` show a warning icon
+           (data-testid=`vendor-unlinked-<purchase.id>`).
+         - Purchase edit dialog: datalist merges canonical parties +
+           legacy vendors. "Open in Party Ledger" quick link inside form
+           when a linkage exists (data-testid=`p-vendor-open-ledger`).
+      
+      2. `pages/PartyLedger.jsx`:
+         - Now supports `?party_id=<uuid>` query param via
+           `useSearchParams` — opens PartyDetailView directly.
+      
+      3. `components/OrderDialog.jsx`:
+         - New "Packer vendor" field in the Packing section
+           (data-testid=`pack-packer`) — canonical datalist + free text
+           (backend quick-creates via get_or_create_vendor_party).
+         - Validation hint (data-testid=`pack-packer-hint`) turns red
+           when `packing_cost > 0 && packer_name` is blank.
+         - submit() blocks save when: (a) packing_cost > 0 without
+           packer_name, (b) any shipment has freight_paid > 0 without
+           transporter.
+         - Kept transporter (per-shipment) SEPARATE from packer_name
+           (order-level).
+      
+      4. `components/ShipmentDialog.jsx`:
+         - Transporter Input → datalist with canonical parties.
+         - Inline validation banner
+           (data-testid=`ship-transporter-error`) when
+           `freight_paid > 0 && !transporter`.
+         - submit() blocks the save on the same condition.
+      
+      FRONTEND TESTING NEEDED:
+      Please use the automated frontend testing agent to verify:
+      
+      A. Purchases page shows a clickable vendor link for every purchase
+         with `vendor_party_id`. Clicking it navigates to
+         `/party-ledger?party_id=<vendor_party_id>` and Party Ledger
+         opens the detail view for that vendor.
+      
+      B. Create a manual Purchase with a NEW vendor name (e.g.
+         `UITestVendor_A`). After save, the vendor cell shows the name
+         with the external-link icon and is clickable.
+      
+      C. Rename the vendor via Party Ledger detail view (or via
+         `POST /api/parties/{pid}/rename`). Refresh the Purchases page.
+         The vendor cell must show the NEW name (rename honoured via
+         `vendor_party_id`) and clicking it still resolves to the same
+         canonical party.
+      
+      D. OrderDialog packing validation:
+         - Open "New order", enter client_name, add a product.
+         - Set packing_cost to 150. Leave "Packer vendor" blank.
+         - Click Save. A toast error must appear:
+           "Please select a Packer vendor…". Order must NOT be saved.
+      
+      E. OrderDialog packing success flow:
+         - Same order, set "Packer vendor" to `UITestPacker_A`.
+         - Save → expect success. Then GET `/api/purchases` and confirm
+           exactly ONE row with source_type=`order_packing_purchase`,
+           linked_to_order_id=<order.id>, and non-null `vendor_party_id`.
+      
+      F. Changing the packer moves the payable:
+         - Edit the order, change "Packer vendor" to `UITestPacker_B`.
+         - Save. Fetch purchases again. There should still be exactly
+           ONE `order_packing_purchase` row for this order (not two),
+           and its `vendor_party_id` must be different from the previous
+           packer's party_id.
+      
+      G. Blank vendor suppresses auto-purchase:
+         - Edit the order, clear `packer_name` and set packing_cost=0.
+         - Save. Fetch purchases → the linked packing Purchase must be
+           gone (deleted; no payments were allocated).
+      
+      H. ShipmentDialog transporter validation:
+         - Open a shipment dialog. Enter freight_paid=250, leave
+           transporter blank → validation banner shows, submit blocked.
+         - Fill transporter → save works. Fetch purchases → one row
+           with source_type=`order_freight_purchase` and
+           vendor_party_id populated.
+      
+      I. Repeated save (edit + save with no changes) does NOT duplicate
+         auto-purchases. Fetch /api/purchases before and after — count
+         of `order_packing_purchase` + `order_freight_purchase` rows for
+         that order must be equal.
+      
+      J. Confirm `/api/reconcile` returns healthy (21/21).
+      
+      Admin creds: `admin@artisan.local` / `Admin@12345`.
+      Backend base URL: use `REACT_APP_BACKEND_URL` from
+      `/app/frontend/.env` for the browser.
+
   - agent: "main"
     message: |
       BUG FIX (2026-07-22): Canonical vendor_party_id linkage on ALL Purchase

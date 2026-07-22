@@ -5,11 +5,38 @@ import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { api, fmtINR } from "../lib/api";
 import { toast } from "sonner";
-import { Truck, Package } from "lucide-react";
+import { Truck, Package, AlertTriangle } from "lucide-react";
 
 export default function ShipmentDialog({ open, onOpenChange, order, shipment, onSaved }) {
   const [form, setForm] = useState(null);
   const [saving, setSaving] = useState(false);
+  // Bug fix (2026-07-22) · Canonical transporter selector.
+  // Load canonical vendor parties (with fallback to legacy /vendors).
+  // Free text still allowed — backend quick-creates a canonical party
+  // via get_or_create_vendor_party on save.
+  const [vendorParties, setVendorParties] = useState([]);
+  useEffect(() => {
+    if (!open) return;
+    Promise.all([
+      api.get("/party-ledger-v2/parties", { params: { type: "vendor" } })
+        .catch(() => ({ data: [] })),
+      api.get("/vendors").catch(() => ({ data: [] })),
+    ]).then(([partyRes, vendorRes]) => {
+      const parties = Array.isArray(partyRes.data) ? partyRes.data : [];
+      const legacy = Array.isArray(vendorRes.data) ? vendorRes.data : [];
+      const seen = new Set();
+      const merged = [];
+      parties.forEach((p) => {
+        const key = (p.name || "").trim().toLowerCase();
+        if (key && !seen.has(key)) { seen.add(key); merged.push({ id: p.id, name: p.name }); }
+      });
+      legacy.forEach((v) => {
+        const key = (v.name || "").trim().toLowerCase();
+        if (key && !seen.has(key)) { seen.add(key); merged.push({ id: v.id, name: v.name }); }
+      });
+      setVendorParties(merged);
+    });
+  }, [open]);
 
   useEffect(() => {
     if (!order) return;
@@ -61,6 +88,11 @@ export default function ShipmentDialog({ open, onOpenChange, order, shipment, on
     const items = form.items.filter((r) => Number(r.qty) > 0)
       .map((r) => ({ order_item_id: r.order_item_id, qty: Number(r.qty) }));
     if (items.length === 0) return toast.error("Add at least one product with a quantity to ship.");
+    // Bug fix (2026-07-22): Freight paid > 0 requires a transporter so the
+    // canonical freight Purchase can be linked to that vendor's Party Ledger.
+    if (Number(form.freight_paid) > 0 && !(form.transporter || "").trim()) {
+      return toast.error("Please select a Transporter — freight cannot be recorded without a vendor.");
+    }
 
     const payload = {
       date: form.date ? new Date(form.date).toISOString() : null,
@@ -113,9 +145,28 @@ export default function ShipmentDialog({ open, onOpenChange, order, shipment, on
                      className="mt-1.5 bg-white border-[var(--border-warm)]" />
             </div>
             <div>
-              <Label className="text-[10px] label-caps">Transporter</Label>
-              <Input value={form.transporter} onChange={(e) => setForm({ ...form, transporter: e.target.value })}
-                     className="mt-1.5 bg-white border-[var(--border-warm)]" />
+              <Label className="text-[10px] label-caps">Transporter{Number(form.freight_paid) > 0 ? "*" : ""}</Label>
+              <Input list="shipment-transporter-list"
+                     value={form.transporter}
+                     data-testid="ship-transporter"
+                     onChange={(e) => setForm({ ...form, transporter: e.target.value })}
+                     className="mt-1.5 bg-white border-[var(--border-warm)]"
+                     placeholder={Number(form.freight_paid) > 0
+                       ? "Required when freight paid > 0"
+                       : "Optional — select or type to quick-create"} />
+              <datalist id="shipment-transporter-list">
+                {vendorParties.map((v) => (
+                  <option key={`tp-${v.id}`} value={v.name} />
+                ))}
+              </datalist>
+              {Number(form.freight_paid) > 0 && !(form.transporter || "").trim() ? (
+                <div className="text-[10px] mt-1 flex items-center gap-1"
+                     style={{ color: "var(--terracotta)" }}
+                     data-testid="ship-transporter-error">
+                  <AlertTriangle size={10} strokeWidth={2} />
+                  Required — freight paid is linked to this vendor&apos;s Party Ledger.
+                </div>
+              ) : null}
             </div>
             <div>
               <Label className="text-[10px] label-caps">LR / tracking</Label>

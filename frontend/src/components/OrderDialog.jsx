@@ -65,6 +65,11 @@ const emptyOrder = () => ({
   boxes_used: 0,
   cost_per_box: 0,
   packing_cost: 0,
+  // Bug fix (2026-07-22) · Packing vendor linkage — when packing_cost > 0
+  // and packer_name is set, the backend auto-generates a canonical
+  // Purchase under this vendor (source_type='order_packing_purchase').
+  // Kept distinct from `transporter` (per-shipment freight vendor).
+  packer_name: "",
   boxes_shipped: 0,
   freight_charged: 0,
   freight_paid: 0,
@@ -203,6 +208,35 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
 
   useEffect(() => {
     api.get("/meta").then((r) => setMeta((m) => ({ ...m, ...r.data })));
+  }, []);
+
+  // Bug fix (2026-07-22) · Canonical vendor selectors for Packer & Transporter.
+  // Loaded from Party Ledger v2 (canonical) with fallback to legacy /vendors
+  // for anything not yet migrated. Free text is still allowed — the backend
+  // calls get_or_create_vendor_party on save so a NEW name quick-creates a
+  // canonical party. This gives us "canonical selector + quick-create".
+  const [vendorParties, setVendorParties] = useState([]);
+  useEffect(() => {
+    Promise.all([
+      api.get("/party-ledger-v2/parties", { params: { type: "vendor" } })
+        .catch(() => ({ data: [] })),
+      api.get("/vendors").catch(() => ({ data: [] })),
+    ]).then(([partyRes, vendorRes]) => {
+      const parties = Array.isArray(partyRes.data) ? partyRes.data : [];
+      const legacy = Array.isArray(vendorRes.data) ? vendorRes.data : [];
+      // dedupe by name, prefer canonical parties (they carry a stable id)
+      const seen = new Set();
+      const merged = [];
+      parties.forEach((p) => {
+        const key = (p.name || "").trim().toLowerCase();
+        if (key && !seen.has(key)) { seen.add(key); merged.push({ id: p.id, name: p.name }); }
+      });
+      legacy.forEach((v) => {
+        const key = (v.name || "").trim().toLowerCase();
+        if (key && !seen.has(key)) { seen.add(key); merged.push({ id: v.id, name: v.name }); }
+      });
+      setVendorParties(merged);
+    });
   }, []);
 
   useEffect(() => {
@@ -515,6 +549,23 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
     if (!form.client_name?.trim()) return toast.error("Please enter the client name.");
     if (form.items.length === 0) return toast.error("Add at least one product.");
 
+    // Bug fix (2026-07-22) · Vendor linkage validation.
+    // Packing cost > 0 requires a Packer vendor so the canonical
+    // packing Purchase can be auto-generated with vendor_party_id.
+    if (Number(form.packing_cost) > 0 && !(form.packer_name || "").trim()) {
+      toast.error("Please select a Packer vendor — packing cost cannot be linked without one.");
+      return;
+    }
+    // Any shipment with freight_paid > 0 requires a transporter so the
+    // canonical freight Purchase can be auto-generated.
+    const badShip = (form.shipments || []).find((s) =>
+      Number(s.freight_paid || 0) > 0 && !(s.transporter || "").trim()
+    );
+    if (badShip) {
+      toast.error(`Shipment ${(badShip.id || "").slice(0, 8)} has freight paid without a transporter — please select one.`);
+      return;
+    }
+
     setSaving(true);
     try {
       const payload = {
@@ -752,6 +803,36 @@ export default function OrderDialog({ open, onOpenChange, order, onSaved }) {
                      testId="pack-charged"
                      onChange={(v) => updateField("packing_recovery", v)}
                      hint="Adds to revenue" />
+              </div>
+              {/* Canonical Packer selector (Bug fix 2026-07-22).
+                  Kept separate from transporter (per-shipment freight vendor).
+                  Blank = internal expense (no auto-Purchase). */}
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mt-3">
+                <div className="md:col-span-2">
+                  <Label className="text-[10px] label-caps">Packer vendor</Label>
+                  <Input list="packer-vendor-list" value={form.packer_name || ""}
+                         data-testid="pack-packer"
+                         onChange={(e) => updateField("packer_name", e.target.value)}
+                         className="mt-1.5 bg-white border-[var(--border-warm)]"
+                         placeholder={Number(form.packing_cost) > 0
+                           ? "Required when packing cost > 0"
+                           : "Optional — select or type to quick-create"} />
+                  <datalist id="packer-vendor-list">
+                    {vendorParties.map((v) => (
+                      <option key={`pkr-${v.id}`} value={v.name} />
+                    ))}
+                  </datalist>
+                  <div className="text-[10px] mt-1"
+                       style={{ color: Number(form.packing_cost) > 0 && !(form.packer_name || "").trim()
+                         ? "var(--terracotta)" : "var(--muted)" }}
+                       data-testid="pack-packer-hint">
+                    {Number(form.packing_cost) > 0 && !(form.packer_name || "").trim()
+                      ? "Required — the auto-generated packing Purchase will be linked to this vendor's Party Ledger."
+                      : (form.packer_name
+                          ? "A canonical Purchase for packing will be created under this vendor."
+                          : "Leave blank to treat packing as an internal expense (no vendor bill).")}
+                  </div>
+                </div>
               </div>
               {form.packing_cost_manual && (
                 <div className="mt-2 flex justify-end">

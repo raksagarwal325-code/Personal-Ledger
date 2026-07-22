@@ -1,4 +1,5 @@
 import { useEffect, useState, useMemo } from "react";
+import { useNavigate } from "react-router-dom";
 import { api, fmtINR, fmtDate } from "../lib/api";
 import PageHeader from "../components/PageHeader";
 import { Button } from "../components/ui/button";
@@ -8,7 +9,7 @@ import { Textarea } from "../components/ui/textarea";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "../components/ui/select";
-import { Plus, Pencil, Trash2, ShoppingBag, Search, Trash } from "lucide-react";
+import { Plus, Pencil, Trash2, ShoppingBag, Search, Trash, AlertTriangle, ExternalLink } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
 } from "../components/ui/dialog";
@@ -40,9 +41,11 @@ const emptyPurchase = () => ({
 });
 
 export default function Purchases() {
+  const navigate = useNavigate();
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [vendors, setVendors] = useState([]);
+  const [parties, setParties] = useState([]);     // canonical vendor parties (id ↔ name)
   const [meta, setMeta] = useState({});
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("all");
@@ -68,7 +71,27 @@ export default function Purchases() {
   useEffect(() => {
     api.get("/vendors").then((r) => setVendors(r.data));
     api.get("/meta").then((r) => setMeta(r.data));
+    // Canonical vendor parties — used to (a) resolve current display names
+    // by vendor_party_id and (b) navigate to the vendor's Party Ledger via
+    // the stable party id. Financial linkage keys off vendor_party_id;
+    // vendor_name is denormalised for display only.
+    api.get("/party-ledger-v2/parties", { params: { type: "vendor" } })
+      .then((r) => setParties(Array.isArray(r.data) ? r.data : []))
+      .catch(() => setParties([]));
   }, []);
+
+  // Fast lookup: party_id → canonical current name (post-rename safe).
+  const partyById = useMemo(() => {
+    const m = {};
+    (parties || []).forEach((p) => { m[p.id] = p; });
+    return m;
+  }, [parties]);
+
+  // Open the Party Ledger for a given canonical vendor party id.
+  const openVendorLedger = (partyId) => {
+    if (!partyId) return;
+    navigate(`/party-ledger?party_id=${encodeURIComponent(partyId)}`);
+  };
 
   const totals = useMemo(() => rows.reduce(
     (a, p) => ({
@@ -252,10 +275,39 @@ export default function Purchases() {
               )}
               {rows.map((p) => {
                 const s = PAY_STYLE[p.payment_status] || PAY_STYLE.Unpaid;
+                // Canonical vendor party — resolve current display name
+                // through party_id so vendor RENAMES are honoured in the
+                // table even before the purchase row is re-saved.
+                const party = p.vendor_party_id ? partyById[p.vendor_party_id] : null;
+                const displayName = party?.name || p.vendor_name;
+                const hasLinkage = !!p.vendor_party_id;
                 return (
                   <tr key={p.id} data-testid={`purchase-row-${p.id}`}>
                     <td className="whitespace-nowrap">{fmtDate(p.purchase_date)}</td>
-                    <td className="font-medium">{p.vendor_name}</td>
+                    <td className="font-medium">
+                      {hasLinkage ? (
+                        <button
+                          type="button"
+                          onClick={() => openVendorLedger(p.vendor_party_id)}
+                          data-testid={`vendor-link-${p.id}`}
+                          className="inline-flex items-center gap-1 hover:underline focus:outline-none focus:underline"
+                          style={{ color: "var(--foreground)" }}
+                          title={`Open ${displayName} in Party Ledger`}
+                        >
+                          {displayName}
+                          <ExternalLink size={11} strokeWidth={1.75}
+                                        style={{ color: "var(--muted)" }} />
+                        </button>
+                      ) : (
+                        <span className="inline-flex items-center gap-1"
+                              data-testid={`vendor-unlinked-${p.id}`}
+                              title="This purchase is not linked to a canonical vendor party. Edit and save to link it.">
+                          {displayName}
+                          <AlertTriangle size={12} strokeWidth={1.75}
+                                         style={{ color: "var(--terracotta)" }} />
+                        </span>
+                      )}
+                    </td>
                     <td className="num" style={{ color: "var(--muted)" }}>{p.invoice_no || "—"}</td>
                     <td className="num">{(p.items || []).length}</td>
                     <td className="num font-medium">{fmtINR(p.invoice_total)}</td>
@@ -322,9 +374,27 @@ export default function Purchases() {
                        onChange={(e) => setForm({ ...form, vendor_name: e.target.value })}
                        className="mt-1 bg-white border-[var(--border-warm)]"
                        placeholder="Type or select…" required />
+                {/* Canonical vendor parties first (stable party_id linkage);
+                    fall back to the legacy vendors master for any names not
+                    yet migrated. Free text is still allowed — the backend
+                    calls get_or_create_vendor_party on save to quick-create
+                    a canonical party for new names. */}
                 <datalist id="vendor-list">
-                  {vendors.map((v) => <option key={v.id} value={v.name} />)}
+                  {parties.map((v) => <option key={`p-${v.id}`} value={v.name} />)}
+                  {vendors
+                    .filter((v) => !parties.some((p) => p.name === v.name))
+                    .map((v) => <option key={`v-${v.id}`} value={v.name} />)}
                 </datalist>
+                {editing && editing.vendor_party_id ? (
+                  <button type="button"
+                          onClick={() => { setDialogOpen(false); openVendorLedger(editing.vendor_party_id); }}
+                          className="text-[10px] mt-1 hover:underline inline-flex items-center gap-1"
+                          data-testid="p-vendor-open-ledger"
+                          style={{ color: "var(--terracotta)" }}>
+                    <ExternalLink size={10} strokeWidth={1.75} />
+                    Open in Party Ledger
+                  </button>
+                ) : null}
               </div>
               <div>
                 <Label className="text-[11px] label-caps">Bill date</Label>

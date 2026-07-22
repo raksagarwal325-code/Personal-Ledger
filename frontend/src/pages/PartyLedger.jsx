@@ -1,4 +1,5 @@
 import { useEffect, useState, useMemo } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api, fmtINR, fmtDate } from "../lib/api";
 import PageHeader from "../components/PageHeader";
 import { Input } from "../components/ui/input";
@@ -554,6 +555,35 @@ export default function PartyLedger() {
   const [quickEntryFor, setQuickEntryFor] = useState(null); // { party } or true
   const [openingFor, setOpeningFor] = useState(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // Deep-link: /party-ledger?party_id=XXX opens the party detail view
+  // directly. Used by the Purchases page to route "click the vendor
+  // name to open their Party Ledger" through the canonical party id.
+  useEffect(() => {
+    const pid = searchParams.get("party_id");
+    if (pid && (!selected || selected.id !== pid)) {
+      // PartyDetailView loads its own data via partyId — we only need the id.
+      setSelected({ id: pid });
+    } else if (!pid && selected) {
+      setSelected(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  const openParty = (p) => {
+    setSelected(p);
+    const next = new URLSearchParams(searchParams);
+    next.set("party_id", p.id);
+    setSearchParams(next, { replace: false });
+  };
+
+  const backToList = () => {
+    setSelected(null);
+    const next = new URLSearchParams(searchParams);
+    next.delete("party_id");
+    setSearchParams(next, { replace: false });
+  };
 
   const handleQuickEntrySaved = () => {
     setQuickEntryFor(null);
@@ -565,12 +595,12 @@ export default function PartyLedger() {
       {selected
         ? <PartyDetailView
             partyId={selected.id}
-            onBack={() => setSelected(null)}
+            onBack={backToList}
             onQuickEntry={(p) => setQuickEntryFor({ party: p })}
             onEditOpening={(p) => setOpeningFor(p)}
           />
         : <PartyListView
-            onOpen={setSelected}
+            onOpen={openParty}
             onNewParty={() => setOpeningFor({})}
             onQuickEntry={(p) => setQuickEntryFor({ party: p })}
           />}
