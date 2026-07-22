@@ -485,26 +485,22 @@ def purchase_outstanding_from_alloc(purchase: dict, alloc_sum_paise: int) -> int
 
 # ─── Party ledger helpers ──────────────────────────────────────────────────
 
-def party_status_from_paise(balance_paise: int) -> str:
-    """UX label used by Party Ledger v2.
-      |bal| <= SETTLED_THRESHOLD_PAISE  → 'Settled'
-      bal > 0                            → 'You Pay'
-      bal < 0                            → 'You Receive'
-    """
-    b = int(balance_paise or 0)
-    if abs(b) <= SETTLED_THRESHOLD_PAISE:
-        return "Settled"
-    return "You Pay" if b > 0 else "You Receive"
-
-
 CATEGORY_SIGN_MAP = {
-    # Categories whose sign is fixed regardless of caller intent.
+    # Customer-side (party_ledger_v2 canonical signs, paise-domain).
     "sale_invoice":     -1,   # customer owes you → you-pay decreases
     "customer_payment": +1,
     "customer_refund":  -1,
+    # Vendor-side.
     "purchase":         +1,   # you owe vendor → you-pay increases
+    "purchase_return":  -1,
     "vendor_payment":   -1,
     "purchase_refund":  +1,
+    "advance":          -1,   # vendor advance = extra paid
+    # Ancillary rows appearing on the merged ledger.
+    "packing":          +1,
+    "expense":          -1,   # Rakshit paid an expense on the party's behalf
+    "income":           +1,   # party gave Rakshit income
+    "credit_note":      -1,
     "discount":         -1,
     # 'opening_balance', 'transfer', 'adjustment' use explicit direction hint.
 }
@@ -514,9 +510,10 @@ def party_delta_for_row(category: str, amount_paise: int,
                         direction: Optional[str] = None) -> int:
     """Sign-corrected delta for a party ledger row (paise). Pure.
 
-    Mirrors the legacy `_resolve_delta` but in paise. When category is
-    directional (opening_balance/transfer/adjustment), the caller must
-    pass `direction ∈ {'you_pay', 'you_receive'}`. Default = 'you_pay'.
+    Mirrors the legacy `_resolve_delta` from party_ledger_v2 in paise.
+    When category is directional (opening_balance/transfer/adjustment),
+    the caller must pass `direction ∈ {'you_pay', 'you_receive'}`.
+    Default = 'you_pay'.
     """
     amt = abs(int(amount_paise or 0))
     if category in CATEGORY_SIGN_MAP:
@@ -524,6 +521,21 @@ def party_delta_for_row(category: str, amount_paise: int,
     if direction == "you_receive":
         return -amt
     return +amt  # you_pay (default)
+
+
+def party_status_from_paise(balance_paise: int) -> str:
+    """UX label used by Party Ledger v2 — STRICT less-than semantics.
+      |bal| <  SETTLED_THRESHOLD_PAISE (50)  → 'Settled'
+      bal >  0                                → 'You Pay'
+      bal <  0                                → 'You Receive'
+    Note: strict `<` matches the pre-Phase-6 `if abs(bal) < 0.5` rule.
+    A balance of EXACTLY 50 paise (₹0.50) is NOT settled — it's a labelled
+    direction. Boundary pinned by test_party_status_from_paise_settled_boundary.
+    """
+    b = int(balance_paise or 0)
+    if abs(b) < SETTLED_THRESHOLD_PAISE:
+        return "Settled"
+    return "You Pay" if b > 0 else "You Receive"
 
 
 # ─── Transfer + account balance helpers ────────────────────────────────────

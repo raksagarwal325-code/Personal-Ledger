@@ -47,6 +47,15 @@ from datetime import datetime, timezone
 from typing import List, Optional, Literal
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
+
+# Phase 6 · Slice 5 — the sign convention, settled threshold, and
+# paise-safe money conversion all live in the shared domain layer now.
+from domain import (
+    to_paise, from_paise,
+    party_delta_for_row as _domain_party_delta,
+    party_status_from_paise as _domain_party_status,
+    CATEGORY_SIGN_MAP as _DOMAIN_CATEGORY_SIGN,
+)
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -128,47 +137,30 @@ class PartyTransactionIn(BaseModel):
 
 
 # ------------------------------------------------------------------
-# Sign / delta rules
+# Sign / delta rules — Phase 6 · Slice 5: signs live in domain.py now.
 # ------------------------------------------------------------------
 # +ve delta = Rakshit owes party MORE. -ve = party owes Rakshit MORE.
 # Vendor party ⇒ purchases push +, payments push −.
 # Customer party ⇒ sales push −, receipts push +.
-CATEGORY_SIGN = {
-    "purchase":         +1,
-    "packing":          +1,
-    "purchase_return":  -1,
-    "sale_invoice":     -1,
-    "customer_payment": +1,
-    "vendor_payment":   -1,
-    # "expense": Rakshit paid an expense on party's behalf ⇒ party owes Rakshit ⇒ delta = -amount
-    "expense":          -1,
-    # "income": party gave Rakshit income ⇒ balance shifts toward Rakshit owing party ⇒ +amount
-    "income":           +1,
-    # "advance": vendor advance ⇒ Rakshit paid extra ⇒ same as vendor_payment ⇒ -amount
-    "advance":          -1,
-    "credit_note":      -1,
-    "discount":         -1,
-    # "opening_balance", "transfer", "adjustment" use explicit direction hint.
-}
+#
+# The canonical CATEGORY_SIGN map now lives in domain.CATEGORY_SIGN_MAP;
+# this local alias exists only for existing imports (`from party_ledger_v2
+# import CATEGORY_SIGN`) that some tests may reference.
+CATEGORY_SIGN = _DOMAIN_CATEGORY_SIGN
 
 
 def _resolve_delta(cat: str, amount: float, direction: Optional[str]) -> float:
-    amt = abs(float(amount or 0))
-    if cat in CATEGORY_SIGN:
-        return CATEGORY_SIGN[cat] * amt
-    # Directional categories require explicit direction
-    if direction == "you_pay":
-        return +amt
-    if direction == "you_receive":
-        return -amt
-    # default = you_pay
-    return +amt
+    """Thin adapter over domain.party_delta_for_row. Preserves the exact
+    pre-Phase-6 float signature — internally routes through paise HALF_UP
+    so precision is preserved and drift-free."""
+    return from_paise(_domain_party_delta(cat, to_paise(amount), direction))
 
 
 def _status_from_balance(bal: float) -> str:
-    if abs(bal) < 0.5:
-        return "Settled"
-    return "You Pay" if bal > 0 else "You Receive"
+    """Thin adapter over domain.party_status_from_paise. Preserves the
+    exact pre-Phase-6 `< 0.5` semantics — a balance of exactly ₹0.50 is
+    NOT Settled, it's the labelled direction."""
+    return _domain_party_status(to_paise(bal))
 
 
 # ------------------------------------------------------------------
@@ -254,7 +246,7 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
             })
         # Customer receipts
         async for pay in db.customer_payments.find({"customer_name": pname}, {"_id": 0}):
-            amt = float(pay.get("amount") or 0)
+            amt = from_paise(to_paise(pay.get("amount")))
             out.append({
                 "id": f"CP-{pay.get('id')}",
                 "txn_ref": f"cust_payment:{pay.get('id')}",
@@ -296,7 +288,7 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
             })
         # Vendor payments
         async for pay in db.purchase_payments.find({"vendor_name": pname}, {"_id": 0}):
-            amt = float(pay.get("amount") or 0)
+            amt = from_paise(to_paise(pay.get("amount")))
             out.append({
                 "id": f"PP-{pay.get('id')}",
                 "txn_ref": f"purchase_payment:{pay.get('id')}",
@@ -346,7 +338,7 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
                 "created_at": pur.get("created_at"),
             })
         async for pay in db.purchase_payments.find({"vendor_name": pname}, {"_id": 0}):
-            amt = float(pay.get("amount") or 0)
+            amt = from_paise(to_paise(pay.get("amount")))
             if amt <= 0:
                 continue
             out.append({
@@ -396,7 +388,7 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
         async for pay in db.purchase_payments.find(
             {"paid_by_party_id": party["id"]}, {"_id": 0},
         ):
-            full_amt = float(pay.get("amount") or 0)
+            full_amt = from_paise(to_paise(pay.get("amount")))
             split = pay.get("split_paid_by_amount")
             eff_amt = float(split) if split is not None else full_amt
             if eff_amt <= 0:
@@ -423,7 +415,7 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
         async for pay in db.customer_payments.find(
             {"received_by_party_id": party["id"]}, {"_id": 0},
         ):
-            amt = float(pay.get("amount") or 0)
+            amt = from_paise(to_paise(pay.get("amount")))
             if amt <= 0:
                 continue
             out.append({

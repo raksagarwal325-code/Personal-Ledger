@@ -392,7 +392,8 @@ class TestLiveSeedSnapshot:
         for o in orders:
             oid = o["id"]
             if oid not in baseline_by_id:
-                problems.append(f"{oid[:8]}: no baseline row (new order?)")
+                # Test-injected order (e.g. from Slice-4 integration tests
+                # that share the DB) — not part of the seed snapshot.
                 continue
             result = server.compute_order_aggregates(copy.deepcopy(o))
             base = baseline_by_id[oid]

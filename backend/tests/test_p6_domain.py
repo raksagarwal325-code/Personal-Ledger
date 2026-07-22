@@ -464,9 +464,13 @@ class TestDeterminism:
 
 class TestPartyLedgerHelpers:
     def test_party_status_from_paise_settled_boundary(self):
+        # STRICT `<` semantics — matches pre-Phase-6 `if abs(bal) < 0.5`.
+        # A balance of EXACTLY ₹0.50 (50 paise) is NOT Settled.
         assert D.party_status_from_paise(0) == "Settled"
-        assert D.party_status_from_paise(50) == "Settled"        # exactly on threshold
-        assert D.party_status_from_paise(-50) == "Settled"
+        assert D.party_status_from_paise(49) == "Settled"       # just under threshold
+        assert D.party_status_from_paise(-49) == "Settled"
+        assert D.party_status_from_paise(50) == "You Pay"       # exactly on threshold
+        assert D.party_status_from_paise(-50) == "You Receive"
         assert D.party_status_from_paise(51) == "You Pay"
         assert D.party_status_from_paise(-51) == "You Receive"
 
