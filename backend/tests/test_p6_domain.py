@@ -635,9 +635,17 @@ class TestOrderInsensitive:
 #                       (item amount fallback, manual tax on purchase, alloc
 #                       amount sum) and 3 round() (auto tax on purchase,
 #                       total_paid, outstanding).
+#   Slice 5 (Party Ledger v2 derived rows + running balance + FF settlement
+#            → domain helpers):
+#                       45 / 51 / 1 / 3  — removed 5 float(x.get(*amount*))
+#                       across _derived_entries_for_party (sale_invoice,
+#                       customer_payment, purchase, vendor_payment, opening
+#                       balance) and 12 round() across _party_full_ledger,
+#                       _create_entry, dashboard_summary, fathers_firm_settlement,
+#                       export_summary_csv.
 CI_GUARD_BASELINE = {
-    "float_amount_get":        50,
-    "round_calls":             63,
+    "float_amount_get":        45,
+    "round_calls":             51,
     "reversed_ne_true":         1,
     "source_ne_legacy_shim":    3,
 }

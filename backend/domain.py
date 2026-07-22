@@ -538,6 +538,147 @@ def party_status_from_paise(balance_paise: int) -> str:
     return "You Pay" if b > 0 else "You Receive"
 
 
+# ─── Party Ledger v2 · Slice 5 · derived row + running balance helpers ─────
+#
+# Party Ledger v2 previously walked its merged (derived + manual) entry list
+# in float and accumulated `running_balance` via `balance += float(delta)`.
+# That produced 1-paise-per-entry drift on very long ledgers and made the
+# running balance NOT byte-equivalent to a paise-safe recomputation.
+#
+# These helpers accept the SAME entry dict shape party_ledger_v2 already
+# uses (`origin`, `reversed_at`, `delta_you_pay`) so the module can be
+# converted to paise arithmetic without touching the API surface.
+#
+# Convention on entries (unchanged from party_ledger_v2 module):
+#   • `delta_you_pay > 0` → Rakshit owes party MORE
+#   • `delta_you_pay < 0` → party owes Rakshit MORE (Rakshit owes party less)
+#   • `origin == "reversal"` → excluded from balance (audit-only)
+#   • `reversed_at` non-null → excluded (this entry was later reversed)
+
+def entry_counts_in_balance(entry: dict) -> bool:
+    """True if this party-ledger row participates in the running balance.
+    Reversal entries and reversed-out originals do NOT count."""
+    if not entry:
+        return False
+    if entry.get("origin") == "reversal":
+        return False
+    if entry.get("reversed_at"):
+        return False
+    return True
+
+
+def sum_delta_you_pay_paise(entries: Iterable[dict]) -> int:
+    """Sum of `delta_you_pay` (in paise) over entries that count in the
+    balance. Pure — never mutates. Rounds each delta via to_paise HALF_UP
+    so accumulation is exact regardless of the incoming float representation.
+    """
+    total = 0
+    for e in entries:
+        if not entry_counts_in_balance(e):
+            continue
+        total += to_paise(e.get("delta_you_pay"))
+    return total
+
+
+def annotate_running_balances_paise(entries: list) -> int:
+    """Walks `entries` IN THE ORDER GIVEN and annotates each row with:
+      • `running_balance_paise`  — int, cumulative counted-delta so far
+      • `running_balance`         — float rupees (rounded, for API back-compat)
+      • `running_status`          — party-ledger label from that paise balance
+      • `counts_in_balance`       — bool
+    Returns the final cumulative balance in paise. The caller may still
+    round-trip that through from_paise to get a display float.
+    Pure w.r.t. side-effects other than the annotation of each dict.
+    """
+    bal_p = 0
+    for e in entries:
+        counts = entry_counts_in_balance(e)
+        if counts:
+            bal_p += to_paise(e.get("delta_you_pay"))
+        e["running_balance_paise"] = bal_p
+        e["running_balance"] = from_paise(bal_p)
+        e["running_status"] = party_status_from_paise(bal_p)
+        e["counts_in_balance"] = counts
+    return bal_p
+
+
+# Categories that DO participate in the derived party-ledger read layer.
+# Anything else (adjustments, arbitrary transfers) is manual-only.
+DERIVED_ROW_CATEGORIES = frozenset({
+    "sale_invoice", "customer_payment",
+    "purchase", "vendor_payment",
+    "opening_balance",
+})
+
+
+def derived_row_delta_paise(category: str, amount_paise: int) -> int:
+    """Sign-corrected delta for a DERIVED party ledger row. Paise. Pure.
+
+    Derived rows always come from the source module (Order / Purchase /
+    Customer Payment / Purchase Payment / Opening Balance) so the sign is
+    fully determined by category — no `direction` hint is needed. This is
+    the read-time projection helper used by `_derived_entries_for_party`.
+
+    For `opening_balance` the caller passes SIGNED paise (may be negative)
+    since the party doc stores the opening balance as +ve = "you owe them
+    from day-1", -ve = "they owe you from day-1". Sign is preserved.
+    """
+    amt_p = int(amount_paise or 0)
+    if category == "opening_balance":
+        return amt_p  # already signed
+    if category in CATEGORY_SIGN_MAP:
+        return CATEGORY_SIGN_MAP[category] * abs(amt_p)
+    # Unknown / manual-only category — fall through to +ve (you_pay default)
+    return abs(amt_p)
+
+
+# ─── Party Ledger v2 · Slice 5 · Father's Firm settlement helpers ──────────
+
+# The FF card on the dashboard uses lowercase status labels intentionally
+# ("you_receive" / "you_pay" / "settled") — distinct from the general
+# party status labels ("You Receive" / "You Pay" / "Settled"). It also
+# uses STRICTLY GREATER-THAN 50 paise as the "labeled direction" threshold,
+# whereas the general party status uses STRICTLY LESS-THAN 50 paise as the
+# "settled" threshold — so a balance of EXACTLY 50 paise is:
+#   • Settled          on the FF settlement card         (`> 50` fails)
+#   • Labeled direction on any other party-ledger card   (`< 50` fails)
+# This 1-paise asymmetry is pre-existing and must be preserved (test in
+# test_p6_slice5_party_ledger.py pins the boundary).
+
+FF_SETTLED_THRESHOLD_PAISE = 50
+
+
+def fathers_firm_signed_amount_paise(ledger_balance_paise: int,
+                                     transfer_delta_paise: int = 0) -> int:
+    """Signed FF settlement amount (paise) using the DASHBOARD UI convention:
+        +ve → FF owes Rakshit (status='you_receive')
+        -ve → Rakshit owes FF (status='you_pay')
+        ~0  → settled (within FF_SETTLED_THRESHOLD_PAISE)
+
+    Composition:
+      • `ledger_balance_paise` is the sum of derived+manual FF ledger rows
+        in the party-ledger convention (+ve = Rakshit owes FF).
+      • `transfer_delta_paise` is the FF-side contribution from `db.transfers`,
+        ALSO in the party-ledger convention. (See transfers.py's
+        `ff_settlement_delta_from_transfers` — negative for rakshit_to_ff.)
+    We flip the sign at the boundary so the returned value reads naturally
+    as +ve = you_receive.
+    """
+    return -(int(ledger_balance_paise or 0) + int(transfer_delta_paise or 0))
+
+
+def fathers_firm_status_label(signed_paise: int) -> str:
+    """Lowercase FF card status. STRICT `>` / `<` semantics against the
+    50-paise threshold — a balance of EXACTLY ±50 paise resolves to
+    'settled', matching the pre-Slice-5 `> 0.5 / < -0.5` float rule."""
+    s = int(signed_paise or 0)
+    if s > FF_SETTLED_THRESHOLD_PAISE:
+        return "you_receive"
+    if s < -FF_SETTLED_THRESHOLD_PAISE:
+        return "you_pay"
+    return "settled"
+
+
 # ─── Transfer + account balance helpers ────────────────────────────────────
 
 def apply_transfer_to_account_balance_paise(t: dict, account_id: str) -> int:

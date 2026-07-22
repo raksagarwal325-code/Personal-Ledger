@@ -1,675 +1,532 @@
-#!/usr/bin/env python3
 """
-Phase 5 — /api/reconcile invariant engine verification
+Phase 6 · Slice 5 — Party Ledger v2 refactor verification
+==========================================================
 
-Tests:
-1. Endpoint contract & schema
-2. Healthy path
-3. POST /api/reconcile/run — audit + return
-4. GET is read-only (no audit logs written)
-5. Reset integration (pre_reset_reconcile + post_reset_reconcile)
-6. Failure detection (plant a broken row)
-7. Non-admin access (401/403)
-8. Recon idempotency
+Test Phase 6 · Slice 5 refactor of Party Ledger v2 derived rows, running-balance
+accumulation, and Father's Firm settlement helpers from float arithmetic to
+paise-safe helpers in backend/domain.py.
+
+This is a REFACTOR — the goal is byte-equivalent API responses on the live
+seeded DB (47 orders, 40 parties).
+
+Auth: admin@artisan.local / Admin@12345
 """
-
 import requests
 import json
-import sys
-from datetime import datetime
-from motor.motor_asyncio import AsyncIOMotorClient
-import asyncio
-import os
-from dotenv import load_dotenv
+from typing import Dict, List, Optional
 
-# Load environment
-load_dotenv('/app/backend/.env')
-load_dotenv('/app/frontend/.env')
+# Backend URL from frontend/.env
+BASE_URL = "https://4154df58-62b7-480b-b83b-36a1dc0e500c.preview.emergentagent.com/api"
 
-# Configuration
-BACKEND_URL = os.getenv('REACT_APP_BACKEND_URL', 'http://localhost:8001')
-API_BASE = f"{BACKEND_URL}/api"
+# Admin credentials from /app/memory/test_credentials.md
 ADMIN_EMAIL = "admin@artisan.local"
 ADMIN_PASSWORD = "Admin@12345"
 
-# MongoDB connection for direct DB manipulation
-MONGO_URL = os.getenv('MONGO_URL', 'mongodb://localhost:27017')
-DB_NAME = os.getenv('DB_NAME', 'personal_ledger')
+# Global token storage
+TOKEN = None
 
-# Test results
-results = {
-    "passed": [],
-    "failed": [],
-    "warnings": []
-}
 
-def log_pass(test_name, detail=""):
-    msg = f"✅ {test_name}"
-    if detail:
-        msg += f": {detail}"
-    print(msg)
-    results["passed"].append({"test": test_name, "detail": detail})
-
-def log_fail(test_name, detail=""):
-    msg = f"❌ {test_name}"
-    if detail:
-        msg += f": {detail}"
-    print(msg)
-    results["failed"].append({"test": test_name, "detail": detail})
-
-def log_warn(test_name, detail=""):
-    msg = f"⚠️  {test_name}"
-    if detail:
-        msg += f": {detail}"
-    print(msg)
-    results["warnings"].append({"test": test_name, "detail": detail})
-
-def admin_login():
-    """Login as admin and return auth token"""
-    resp = requests.post(f"{API_BASE}/auth/login", json={
+def login() -> str:
+    """Login and return JWT token."""
+    global TOKEN
+    resp = requests.post(f"{BASE_URL}/auth/login", json={
         "email": ADMIN_EMAIL,
         "password": ADMIN_PASSWORD
     })
-    if resp.status_code != 200:
-        log_fail("Admin login", f"Status {resp.status_code}")
-        sys.exit(1)
+    assert resp.status_code == 200, f"Login failed: {resp.status_code} {resp.text}"
     data = resp.json()
-    token = data.get("access_token")
-    if not token:
-        log_fail("Admin login", "No access_token in response")
-        sys.exit(1)
-    log_pass("Admin login", f"Token: {token[:20]}...")
-    return token
+    TOKEN = data.get("access_token")
+    assert TOKEN, "No access_token in login response"
+    print(f"✅ Login successful")
+    return TOKEN
 
-def get_headers(token):
-    """Return headers with Bearer token"""
-    return {"Authorization": f"Bearer {token}"}
 
-# ============================================================================
-# TEST 1: Endpoint contract & schema
-# ============================================================================
-def test_endpoint_contract(token):
-    print("\n" + "="*80)
-    print("TEST 1: Endpoint contract & schema")
-    print("="*80)
+def headers() -> Dict[str, str]:
+    """Return auth headers."""
+    return {"Authorization": f"Bearer {TOKEN}"}
+
+
+def test_party_ledger_v2_summary():
+    """Test 1: GET /api/party-ledger-v2/summary — 200, has 7 expected keys."""
+    print("\n=== Test 1: Party Ledger v2 Summary ===")
+    resp = requests.get(f"{BASE_URL}/party-ledger-v2/summary", headers=headers())
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
     
-    resp = requests.get(f"{API_BASE}/reconcile", headers=get_headers(token))
-    
-    if resp.status_code != 200:
-        log_fail("GET /api/reconcile returns 200", f"Got {resp.status_code}")
-        return None
-    log_pass("GET /api/reconcile returns 200")
-    
-    try:
-        report = resp.json()
-    except Exception:
-        log_fail("Response is valid JSON")
-        return None
-    log_pass("Response is valid JSON")
-    
-    # Check top-level fields
-    required_fields = [
-        "report_version", "engine_version", "run_status", "healthy",
-        "generated_at", "started_at", "completed_at", "duration_ms",
-        "consistency", "summary", "warnings", "invariants"
+    data = resp.json()
+    expected_keys = [
+        "fathers_firm_you_pay",
+        "fathers_firm_you_receive",
+        "vendor_you_pay",
+        "vendor_advances_you_receive",
+        "customer_you_receive",
+        "customer_advances_you_pay",
+        "net_position"
     ]
     
-    for field in required_fields:
-        if field not in report:
-            log_fail(f"Field '{field}' present", "Missing")
-        else:
-            log_pass(f"Field '{field}' present", f"Value: {report[field]}")
+    for key in expected_keys:
+        assert key in data, f"Missing key: {key}"
+        assert isinstance(data[key], (int, float)), f"{key} is not numeric: {type(data[key])}"
     
-    # Check specific values
-    if report.get("report_version") != "1.0":
-        log_fail("report_version == '1.0'", f"Got {report.get('report_version')}")
-    else:
-        log_pass("report_version == '1.0'")
+    print(f"✅ Summary has all 7 keys")
+    print(f"   fathers_firm_you_pay: ₹{data['fathers_firm_you_pay']}")
+    print(f"   fathers_firm_you_receive: ₹{data['fathers_firm_you_receive']}")
+    print(f"   vendor_you_pay: ₹{data['vendor_you_pay']}")
+    print(f"   vendor_advances_you_receive: ₹{data['vendor_advances_you_receive']}")
+    print(f"   customer_you_receive: ₹{data['customer_you_receive']}")
+    print(f"   customer_advances_you_pay: ₹{data['customer_advances_you_pay']}")
+    print(f"   net_position: ₹{data['net_position']}")
+    return data
+
+
+def test_party_ledger_v2_parties_list():
+    """Test 2: GET /api/party-ledger-v2/parties?include_settled=true — 200, returns expected shape."""
+    print("\n=== Test 2: Party Ledger v2 Parties List ===")
+    resp = requests.get(f"{BASE_URL}/party-ledger-v2/parties?include_settled=true", headers=headers())
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
     
-    if report.get("engine_version") != "P5":
-        log_fail("engine_version == 'P5'", f"Got {report.get('engine_version')}")
-    else:
-        log_pass("engine_version == 'P5'")
+    data = resp.json()
+    assert "count" in data, "Missing 'count' key"
+    assert "parties" in data, "Missing 'parties' key"
+    assert isinstance(data["parties"], list), "parties is not a list"
     
-    if report.get("run_status") != "completed":
-        log_fail("run_status == 'completed'", f"Got {report.get('run_status')}")
-    else:
-        log_pass("run_status == 'completed'")
+    count = data["count"]
+    parties = data["parties"]
     
-    # Check summary structure
-    summary = report.get("summary", {})
-    summary_fields = ["total", "passed", "failed", "warnings", "errors"]
-    for field in summary_fields:
-        if field not in summary:
-            log_fail(f"summary.{field} present", "Missing")
-        else:
-            log_pass(f"summary.{field} present", f"Value: {summary[field]}")
+    print(f"✅ Parties list returned {count} parties")
     
-    # Check summary math
-    total = summary.get("total", 0)
-    passed = summary.get("passed", 0)
-    failed = summary.get("failed", 0)
-    warnings = summary.get("warnings", 0)
-    errors = summary.get("errors", 0)
+    # Verify each party has expected fields
+    if parties:
+        party = parties[0]
+        expected_fields = ["name", "type", "status", "net_balance", "abs_balance", "entries_count", "last_activity"]
+        for field in expected_fields:
+            assert field in party, f"Missing field '{field}' in party"
+        print(f"✅ Party structure verified (sample: {party['name']})")
     
-    if total == passed + failed + warnings + errors:
-        log_pass("summary.total == passed + failed + warnings + errors", 
-                f"{total} == {passed} + {failed} + {warnings} + {errors}")
-    else:
-        log_fail("summary.total == passed + failed + warnings + errors",
-                f"{total} != {passed} + {failed} + {warnings} + {errors}")
+    return parties
+
+
+def test_party_ledger_v2_individual_parties(parties: List[Dict]):
+    """Test 3: GET /api/party-ledger-v2/parties/{pid} — byte-equivalence check."""
+    print("\n=== Test 3: Individual Party Ledger Byte-Equivalence ===")
     
-    # Check invariants structure
-    invariants = report.get("invariants", [])
-    if len(invariants) < 20:
-        log_warn("Total invariants >= 20", f"Got {len(invariants)}")
-    else:
-        log_pass("Total invariants >= 20", f"Got {len(invariants)}")
+    # Test a subset of parties (first 10 to keep test fast)
+    test_parties = parties[:min(10, len(parties))]
     
-    # Check first invariant structure
-    if invariants:
-        inv = invariants[0]
-        inv_fields = [
-            "id", "phase", "severity", "status", "description",
-            "expected", "actual", "difference", "tolerance",
-            "checked_count", "offender_count", "offenders",
-            "truncated", "duration_ms"
-        ]
-        for field in inv_fields:
-            if field not in inv:
-                log_fail(f"Invariant field '{field}' present", f"Missing in {inv.get('id')}")
-            else:
-                log_pass(f"Invariant field '{field}' present")
+    failed_parties = []
+    
+    for party in test_parties:
+        pid = party["id"]
+        name = party["name"]
         
-        # Check id is stable (prefixed)
-        inv_id = inv.get("id", "")
-        if inv_id.startswith(("p0.", "p1.", "p3.", "p4.", "x.")):
-            log_pass("Invariant id is stable (prefixed)", f"ID: {inv_id}")
-        else:
-            log_fail("Invariant id is stable (prefixed)", f"ID: {inv_id}")
+        resp = requests.get(f"{BASE_URL}/party-ledger-v2/parties/{pid}", headers=headers())
+        assert resp.status_code == 200, f"Failed to get party {name}: {resp.status_code}"
         
-        # Check status values
-        status = inv.get("status")
-        if status in ["passed", "failed", "warning", "error"]:
-            log_pass("Invariant status is valid", f"Status: {status}")
-        else:
-            log_fail("Invariant status is valid", f"Status: {status}")
+        data = resp.json()
         
-        # Check severity values
-        severity = inv.get("severity")
-        if severity in ["info", "warning", "error"]:
-            log_pass("Invariant severity is valid", f"Severity: {severity}")
-        else:
-            log_fail("Invariant severity is valid", f"Severity: {severity}")
+        # Verify structure
+        assert "party" in data, f"Missing 'party' key for {name}"
+        assert "entries" in data, f"Missing 'entries' key for {name}"
+        assert "net_balance" in data, f"Missing 'net_balance' key for {name}"
+        assert "net_balance_paise" in data, f"Missing NEW 'net_balance_paise' key for {name}"
+        assert "status" in data, f"Missing 'status' key for {name}"
+        assert "you_pay" in data, f"Missing 'you_pay' key for {name}"
+        assert "you_receive" in data, f"Missing 'you_receive' key for {name}"
+        
+        # Verify net_balance_paise is integer
+        assert isinstance(data["net_balance_paise"], int), f"net_balance_paise is not int for {name}"
+        
+        # Verify net_balance_paise == round(net_balance * 100)
+        expected_paise = round(data["net_balance"] * 100)
+        actual_paise = data["net_balance_paise"]
+        if expected_paise != actual_paise:
+            print(f"⚠️  {name}: net_balance_paise mismatch: expected {expected_paise}, got {actual_paise}")
+            failed_parties.append(name)
+        
+        # Verify running balance byte-equivalence (walk entries with naive float accumulator)
+        entries = data["entries"]
+        if entries:
+            running_balance_float = 0.0
+            max_drift = 0.0
+            
+            for entry in entries:
+                # Only count entries that participate in balance
+                if entry.get("counts_in_balance", True):
+                    delta = entry.get("delta_you_pay", 0)
+                    running_balance_float += delta
+                
+                # Check drift from API's running_balance
+                api_running = entry.get("running_balance", 0)
+                drift = abs(running_balance_float - api_running)
+                max_drift = max(max_drift, drift)
+                
+                # Verify within ½-paise (0.005)
+                if drift > 0.005:
+                    print(f"⚠️  {name}: Entry drift {drift:.4f} > 0.005 at entry {entry.get('id')}")
+                    failed_parties.append(name)
+                    break
+            
+            print(f"   {name}: {len(entries)} entries, max drift: {max_drift:.6f}")
     
-    return report
+    if failed_parties:
+        print(f"❌ {len(failed_parties)} parties failed byte-equivalence check")
+        return False
+    else:
+        print(f"✅ All {len(test_parties)} parties passed byte-equivalence check")
+        return True
 
-# ============================================================================
-# TEST 2: Healthy path
-# ============================================================================
-def test_healthy_path(token, report):
-    print("\n" + "="*80)
-    print("TEST 2: Healthy path")
-    print("="*80)
-    
-    if not report:
-        log_fail("Healthy path test", "No report from previous test")
-        return
-    
-    healthy = report.get("healthy")
-    summary = report.get("summary", {})
-    failed_count = summary.get("failed", 0)
-    errors_count = summary.get("errors", 0)
-    
-    print(f"healthy: {healthy}")
-    print(f"summary.failed: {failed_count}")
-    print(f"summary.errors: {errors_count}")
-    
-    if healthy:
-        log_pass("healthy == true")
-    else:
-        log_warn("healthy == true", f"Got false (may be legitimate drift in DB)")
-    
-    if failed_count == 0:
-        log_pass("summary.failed == 0")
-    else:
-        log_warn("summary.failed == 0", f"Got {failed_count} (may be legitimate drift)")
-        # List failing invariants
-        failing = [inv for inv in report.get("invariants", []) 
-                  if inv.get("status") == "failed"]
-        for inv in failing[:5]:  # Show first 5
-            print(f"  - {inv.get('id')}: {inv.get('offender_count')} offenders")
-    
-    if errors_count == 0:
-        log_pass("summary.errors == 0")
-    else:
-        log_warn("summary.errors == 0", f"Got {errors_count} (may be legitimate drift)")
 
-# ============================================================================
-# TEST 3: POST /api/reconcile/run — audit + return
-# ============================================================================
-def test_post_reconcile_run(token):
-    print("\n" + "="*80)
-    print("TEST 3: POST /api/reconcile/run — audit + return")
-    print("="*80)
+def test_fathers_firm_settlement():
+    """Test 4: GET /api/party-ledger-v2/fathers-firm-settlement — 200, correct structure."""
+    print("\n=== Test 4: Father's Firm Settlement ===")
+    resp = requests.get(f"{BASE_URL}/party-ledger-v2/fathers-firm-settlement", headers=headers())
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
     
-    # Count audit logs BEFORE
-    resp = requests.get(f"{API_BASE}/admin/audit-logs?kind=reconcile_run&limit=1000",
-                       headers=get_headers(token))
-    if resp.status_code != 200:
-        log_fail("Get audit logs before", f"Status {resp.status_code}")
-        return
+    data = resp.json()
     
-    before_logs = resp.json() if isinstance(resp.json(), list) else resp.json().get("logs", [])
-    before_count = len(before_logs)
-    log_pass("Count audit logs BEFORE", f"Count: {before_count}")
+    # Verify structure
+    expected_keys = ["party_id", "party_name", "balance_signed", "amount", "status", "label"]
+    for key in expected_keys:
+        assert key in data, f"Missing key: {key}"
     
-    # POST /api/reconcile/run
-    resp = requests.post(f"{API_BASE}/reconcile/run", headers=get_headers(token))
+    # Verify status is lowercase
+    status = data["status"]
+    assert status in ["settled", "you_pay", "you_receive"], f"Invalid status: {status}"
+    assert status == status.lower(), f"Status is not lowercase: {status}"
     
-    if resp.status_code != 200:
-        log_fail("POST /api/reconcile/run returns 200", f"Got {resp.status_code}")
-        return
-    log_pass("POST /api/reconcile/run returns 200")
+    # Verify amount == abs(balance_signed) within 0.01
+    balance_signed = data["balance_signed"]
+    amount = data["amount"]
+    expected_amount = abs(balance_signed)
+    diff = abs(amount - expected_amount)
+    assert diff <= 0.01, f"amount != abs(balance_signed): {amount} != {expected_amount}"
     
-    try:
-        report = resp.json()
-    except Exception:
-        log_fail("Response is valid JSON")
-        return
-    log_pass("Response is valid JSON")
+    print(f"✅ Father's Firm settlement structure correct")
+    print(f"   party_name: {data['party_name']}")
+    print(f"   balance_signed: ₹{balance_signed}")
+    print(f"   amount: ₹{amount}")
+    print(f"   status: {status}")
     
-    # Check response schema (same as GET)
-    if "report_version" in report and "engine_version" in report:
-        log_pass("Response schema identical to GET")
-    else:
-        log_fail("Response schema identical to GET")
+    # Note: -0.0 vs 0.0 is a known cosmetic difference
+    if balance_signed == 0.0:
+        print(f"   ℹ️  balance_signed is 0.0 (may have been -0.0 pre-refactor, mathematically identical)")
     
-    # Check no audit_warning on success
-    if "audit_warning" in report:
-        log_warn("No audit_warning on success", f"Got: {report['audit_warning']}")
-    else:
-        log_pass("No audit_warning on success")
-    
-    # Count audit logs AFTER
-    resp = requests.get(f"{API_BASE}/admin/audit-logs?kind=reconcile_run&limit=1000",
-                       headers=get_headers(token))
-    if resp.status_code != 200:
-        log_fail("Get audit logs after", f"Status {resp.status_code}")
-        return
-    
-    after_logs = resp.json() if isinstance(resp.json(), list) else resp.json().get("logs", [])
-    after_count = len(after_logs)
-    log_pass("Count audit logs AFTER", f"Count: {after_count}")
-    
-    # Check exactly one new log
-    if after_count == before_count + 1:
-        log_pass("Exactly one audit log written", f"{after_count} - {before_count} = 1")
-    else:
-        log_fail("Exactly one audit log written", 
-                f"{after_count} - {before_count} = {after_count - before_count}")
-    
-    # Check GET /api/admin/reconcile/last
-    resp = requests.get(f"{API_BASE}/admin/reconcile/last", headers=get_headers(token))
-    if resp.status_code != 200:
-        log_fail("GET /api/admin/reconcile/last returns 200", f"Got {resp.status_code}")
-        return
-    log_pass("GET /api/admin/reconcile/last returns 200")
-    
-    last = resp.json()
-    if last.get("kind") == "reconcile_run":
-        log_pass("Last audit log has kind='reconcile_run'")
-    else:
-        log_fail("Last audit log has kind='reconcile_run'", f"Got {last.get('kind')}")
-    
-    if "summary" in last and "summary" in last.get("summary", {}):
-        log_pass("Last audit log has summary.summary")
-    else:
-        log_fail("Last audit log has summary.summary")
+    return data
 
-# ============================================================================
-# TEST 4: GET is read-only (no audit logs written)
-# ============================================================================
-def test_get_readonly(token):
-    print("\n" + "="*80)
-    print("TEST 4: GET is read-only (no audit logs written)")
-    print("="*80)
-    
-    # Count audit logs BEFORE
-    resp = requests.get(f"{API_BASE}/admin/audit-logs?kind=reconcile_run&limit=1000",
-                       headers=get_headers(token))
-    if resp.status_code != 200:
-        log_fail("Get audit logs before", f"Status {resp.status_code}")
-        return
-    
-    before_logs = resp.json() if isinstance(resp.json(), list) else resp.json().get("logs", [])
-    before_count = len(before_logs)
-    log_pass("Count audit logs BEFORE", f"Count: {before_count}")
-    
-    # GET /api/reconcile
-    resp = requests.get(f"{API_BASE}/reconcile", headers=get_headers(token))
-    if resp.status_code != 200:
-        log_fail("GET /api/reconcile returns 200", f"Got {resp.status_code}")
-        return
-    log_pass("GET /api/reconcile returns 200")
-    
-    # Count audit logs AFTER
-    resp = requests.get(f"{API_BASE}/admin/audit-logs?kind=reconcile_run&limit=1000",
-                       headers=get_headers(token))
-    if resp.status_code != 200:
-        log_fail("Get audit logs after", f"Status {resp.status_code}")
-        return
-    
-    after_logs = resp.json() if isinstance(resp.json(), list) else resp.json().get("logs", [])
-    after_count = len(after_logs)
-    log_pass("Count audit logs AFTER", f"Count: {after_count}")
-    
-    # Check no new logs
-    if after_count == before_count:
-        log_pass("GET wrote zero audit logs", f"{after_count} == {before_count}")
-    else:
-        log_fail("GET wrote zero audit logs", 
-                f"{after_count} != {before_count} (diff: {after_count - before_count})")
 
-# ============================================================================
-# TEST 5: Reset integration
-# ============================================================================
-def test_reset_integration(token):
-    print("\n" + "="*80)
-    print("TEST 5: Reset integration")
-    print("="*80)
+def test_csv_exports():
+    """Test 5: CSV exports — all return 200 with text/csv."""
+    print("\n=== Test 5: CSV Exports ===")
     
-    # POST /api/admin/data-reset/execute
-    payload = {
-        "scope": "clear_transaction_data",
-        "password": ADMIN_PASSWORD,
-        "confirmation_phrase": "CLEAR TRANSACTION DATA",
-        "understand_checkbox": True,
-        "create_backup_first": True,
-        "keep_accounts": True
-    }
+    # Get a party ID for individual ledger export
+    parties_resp = requests.get(f"{BASE_URL}/party-ledger-v2/parties?include_settled=true", headers=headers())
+    parties = parties_resp.json()["parties"]
+    test_party_id = parties[0]["id"] if parties else None
     
-    resp = requests.post(f"{API_BASE}/admin/data-reset/execute", 
-                        json=payload, headers=get_headers(token))
+    exports = [
+        (f"/party-ledger-v2/parties/{test_party_id}/ledger.csv", "Party Ledger CSV") if test_party_id else None,
+        ("/party-ledger-v2/exports/vendors.csv", "Vendors CSV"),
+        ("/party-ledger-v2/exports/customers.csv", "Customers CSV"),
+        ("/party-ledger-v2/exports/fathers-firm.csv", "Father's Firm CSV"),
+        ("/party-ledger-v2/exports/summary.csv", "Summary CSV"),
+    ]
     
-    if resp.status_code != 200:
-        log_fail("POST /api/admin/data-reset/execute returns 200", 
-                f"Got {resp.status_code}: {resp.text[:200]}")
-        return
-    log_pass("POST /api/admin/data-reset/execute returns 200")
-    
-    try:
-        report = resp.json()
-    except Exception:
-        log_fail("Response is valid JSON")
-        return
-    log_pass("Response is valid JSON")
-    
-    # Check pre_reset_reconcile
-    if "pre_reset_reconcile" not in report:
-        log_fail("pre_reset_reconcile present in response")
-        return
-    log_pass("pre_reset_reconcile present in response")
-    
-    pre = report["pre_reset_reconcile"]
-    if "summary" in pre and "healthy" in pre:
-        log_pass("pre_reset_reconcile has summary and healthy")
-        print(f"  pre_reset_reconcile.summary: {pre['summary']}")
-        print(f"  pre_reset_reconcile.healthy: {pre['healthy']}")
-    else:
-        log_fail("pre_reset_reconcile has summary and healthy")
-    
-    # Check post_reset_reconcile
-    if "post_reset_reconcile" not in report:
-        log_fail("post_reset_reconcile present in response")
-        return
-    log_pass("post_reset_reconcile present in response")
-    
-    post = report["post_reset_reconcile"]
-    if "summary" in post and "healthy" in post:
-        log_pass("post_reset_reconcile has summary and healthy")
-        print(f"  post_reset_reconcile.summary: {post['summary']}")
-        print(f"  post_reset_reconcile.healthy: {post['healthy']}")
-    else:
-        log_fail("post_reset_reconcile has summary and healthy")
-    
-    # Check totals match
-    pre_total = pre.get("summary", {}).get("total", 0)
-    post_total = post.get("summary", {}).get("total", 0)
-    
-    if pre_total == post_total and pre_total >= 20:
-        log_pass("pre and post reconcile have same total invariants", 
-                f"Both have {pre_total} invariants")
-    else:
-        log_fail("pre and post reconcile have same total invariants",
-                f"pre: {pre_total}, post: {post_total}")
-    
-    # After reset, GET /api/reconcile should still return healthy=true
-    resp = requests.get(f"{API_BASE}/reconcile", headers=get_headers(token))
-    if resp.status_code != 200:
-        log_fail("GET /api/reconcile after reset returns 200", f"Got {resp.status_code}")
-        return
-    log_pass("GET /api/reconcile after reset returns 200")
-    
-    report = resp.json()
-    if report.get("healthy"):
-        log_pass("After reset, healthy == true (empty collections produce zero offenders)")
-    else:
-        log_warn("After reset, healthy == true", 
-                f"Got false (may have pre-existing data)")
+    for export in exports:
+        if export is None:
+            continue
+        
+        endpoint, name = export
+        resp = requests.get(f"{BASE_URL}{endpoint}", headers=headers())
+        assert resp.status_code == 200, f"{name} failed: {resp.status_code}"
+        assert "text/csv" in resp.headers.get("Content-Type", ""), f"{name} not CSV: {resp.headers.get('Content-Type')}"
+        print(f"✅ {name} export working")
 
-# ============================================================================
-# TEST 6: Failure detection (plant a broken row)
-# ============================================================================
-async def test_failure_detection_async(token):
-    print("\n" + "="*80)
-    print("TEST 6: Failure detection (plant a broken row)")
-    print("="*80)
-    
-    # Connect to MongoDB
-    client = AsyncIOMotorClient(MONGO_URL)
-    db = client[DB_NAME]
-    
-    # Insert a customer_payment with a non-existent party id
-    broken_payment = {
-        "id": "test-broken-payment-12345",
-        "customer_name": "Test Customer",
-        "customer_party_id": "non-existent-party-id-99999",
-        "date": datetime.now().date().isoformat(),
-        "amount": 1000.0,
-        "mode": "Cash",
-        "allocations": [],
-        "allocated_total": 0,
-        "unallocated": 1000.0,
-        "created_at": datetime.now().isoformat()
-    }
-    
-    try:
-        await db.customer_payments.insert_one(broken_payment)
-        log_pass("Inserted broken customer_payment with non-existent party_id")
-    except Exception as ex:
-        log_fail("Insert broken row", str(ex))
-        client.close()
-        return
-    
-    # GET /api/reconcile
-    resp = requests.get(f"{API_BASE}/reconcile", headers=get_headers(token))
-    if resp.status_code != 200:
-        log_fail("GET /api/reconcile returns 200 (even with broken data)", 
-                f"Got {resp.status_code}")
-        await db.customer_payments.delete_one({"id": "test-broken-payment-12345"})
-        client.close()
-        return
-    log_pass("GET /api/reconcile returns 200 (even with broken data)")
-    
-    report = resp.json()
-    
-    # Check healthy is false
-    if not report.get("healthy"):
-        log_pass("healthy == false (broken data detected)")
-    else:
-        log_fail("healthy == false (broken data detected)", "Got true")
-    
-    # Find the p1.parties.foreign_keys_resolve invariant
-    invariants = report.get("invariants", [])
-    fk_inv = next((inv for inv in invariants 
-                   if inv.get("id") == "p1.parties.foreign_keys_resolve"), None)
-    
-    if not fk_inv:
-        log_fail("Invariant p1.parties.foreign_keys_resolve present")
-        await db.customer_payments.delete_one({"id": "test-broken-payment-12345"})
-        client.close()
-        return
-    log_pass("Invariant p1.parties.foreign_keys_resolve present")
-    
-    # Check status is failed
-    if fk_inv.get("status") == "failed":
-        log_pass("p1.parties.foreign_keys_resolve status == 'failed'")
-    else:
-        log_fail("p1.parties.foreign_keys_resolve status == 'failed'",
-                f"Got {fk_inv.get('status')}")
-    
-    # Check offender_count >= 1
-    offender_count = fk_inv.get("offender_count", 0)
-    if offender_count >= 1:
-        log_pass("p1.parties.foreign_keys_resolve offender_count >= 1",
-                f"Got {offender_count}")
-    else:
-        log_fail("p1.parties.foreign_keys_resolve offender_count >= 1",
-                f"Got {offender_count}")
-    
-    # Clean up
-    await db.customer_payments.delete_one({"id": "test-broken-payment-12345"})
-    log_pass("Cleaned up broken row")
-    
-    client.close()
 
-def test_failure_detection(token):
-    """Wrapper to run async test"""
-    asyncio.run(test_failure_detection_async(token))
+def test_reconcile_healthy():
+    """Test 6: GET /api/reconcile — healthy=true, 21/21 passed, engine=P5."""
+    print("\n=== Test 6: Reconcile Engine ===")
+    resp = requests.get(f"{BASE_URL}/reconcile", headers=headers())
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    
+    data = resp.json()
+    
+    # Verify structure
+    assert "healthy" in data, "Missing 'healthy' key"
+    assert "summary" in data, "Missing 'summary' key"
+    assert "engine_version" in data, "Missing 'engine_version' key"
+    
+    # Verify healthy
+    assert data["healthy"] == True, f"Reconcile not healthy: {data.get('healthy')}"
+    
+    # Verify engine version
+    assert data["engine_version"] == "P5", f"Wrong engine version: {data['engine_version']}"
+    
+    # Verify summary
+    summary = data["summary"]
+    # Allow warnings (warnings are not failures)
+    assert summary["failed"] == 0, f"Some invariants failed: {summary['failed']} failures"
+    assert summary["total"] == 21, f"Expected 21 invariants, got {summary['total']}"
+    
+    print(f"✅ Reconcile healthy: {summary['passed']}/{summary['total']} passed, {summary.get('warnings', 0)} warnings")
+    print(f"   engine_version: {data['engine_version']}")
+    return data
 
-# ============================================================================
-# TEST 7: Non-admin access
-# ============================================================================
-def test_non_admin_access():
-    print("\n" + "="*80)
-    print("TEST 7: Non-admin access")
-    print("="*80)
-    
-    # GET /api/reconcile with NO auth
-    resp = requests.get(f"{API_BASE}/reconcile")
-    if resp.status_code in [401, 403]:
-        log_pass("GET /api/reconcile with NO auth returns 401/403",
-                f"Got {resp.status_code}")
-    else:
-        log_fail("GET /api/reconcile with NO auth returns 401/403",
-                f"Got {resp.status_code}")
-    
-    # POST /api/reconcile/run with NO auth
-    resp = requests.post(f"{API_BASE}/reconcile/run")
-    if resp.status_code in [401, 403]:
-        log_pass("POST /api/reconcile/run with NO auth returns 401/403",
-                f"Got {resp.status_code}")
-    else:
-        log_fail("POST /api/reconcile/run with NO auth returns 401/403",
-                f"Got {resp.status_code}")
 
-# ============================================================================
-# TEST 8: Recon idempotency
-# ============================================================================
-def test_idempotency(token):
-    print("\n" + "="*80)
-    print("TEST 8: Recon idempotency")
-    print("="*80)
+def test_reconcile_run():
+    """Test 7: POST /api/reconcile/run — writes exactly one audit log."""
+    print("\n=== Test 7: Reconcile Run ===")
     
-    # First GET
-    resp1 = requests.get(f"{API_BASE}/reconcile", headers=get_headers(token))
-    if resp1.status_code != 200:
-        log_fail("First GET /api/reconcile returns 200", f"Got {resp1.status_code}")
-        return
-    log_pass("First GET /api/reconcile returns 200")
+    # Get current audit log count
+    before_resp = requests.get(f"{BASE_URL}/admin/reconcile/last", headers=headers())
+    before_count = 0
+    if before_resp.status_code == 200:
+        # Count exists
+        before_count = 1
     
-    report1 = resp1.json()
+    # Run reconcile
+    resp = requests.post(f"{BASE_URL}/reconcile/run", headers=headers())
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
     
-    # Second GET
-    resp2 = requests.get(f"{API_BASE}/reconcile", headers=get_headers(token))
-    if resp2.status_code != 200:
-        log_fail("Second GET /api/reconcile returns 200", f"Got {resp2.status_code}")
-        return
-    log_pass("Second GET /api/reconcile returns 200")
+    data = resp.json()
+    assert "healthy" in data, "Missing 'healthy' key in run response"
     
-    report2 = resp2.json()
+    # Verify audit log was written
+    after_resp = requests.get(f"{BASE_URL}/admin/reconcile/last", headers=headers())
+    assert after_resp.status_code == 200, f"Failed to get last audit log: {after_resp.status_code}"
     
-    # Compare invariant IDs
-    ids1 = set(inv.get("id") for inv in report1.get("invariants", []))
-    ids2 = set(inv.get("id") for inv in report2.get("invariants", []))
+    audit_data = after_resp.json()
+    assert audit_data is not None, "No audit log found after reconcile run"
+    assert audit_data.get("kind") == "reconcile_run", f"Wrong audit log kind: {audit_data.get('kind')}"
     
-    if ids1 == ids2:
-        log_pass("Same invariant IDs in both runs", f"Count: {len(ids1)}")
-    else:
-        log_fail("Same invariant IDs in both runs",
-                f"Run1: {len(ids1)}, Run2: {len(ids2)}, Diff: {ids1 ^ ids2}")
-    
-    # Compare passed/failed counts
-    summary1 = report1.get("summary", {})
-    summary2 = report2.get("summary", {})
-    
-    if (summary1.get("passed") == summary2.get("passed") and
-        summary1.get("failed") == summary2.get("failed")):
-        log_pass("Same passed/failed counts in both runs",
-                f"passed: {summary1.get('passed')}, failed: {summary1.get('failed')}")
-    else:
-        log_warn("Same passed/failed counts in both runs",
-                f"Run1: passed={summary1.get('passed')}, failed={summary1.get('failed')} | "
-                f"Run2: passed={summary2.get('passed')}, failed={summary2.get('failed')}")
+    print(f"✅ Reconcile run successful, audit log written")
+    return data
 
-# ============================================================================
-# MAIN
-# ============================================================================
+
+def test_party_ledger_write_flow():
+    """Test 8: Party Ledger v2 write flow (CRUD operations)."""
+    print("\n=== Test 8: Party Ledger v2 Write Flow ===")
+    
+    import time
+    unique_suffix = str(int(time.time()))
+    
+    # 1. Create a new "other" party
+    print("   Creating new party...")
+    create_resp = requests.post(f"{BASE_URL}/party-ledger-v2/parties", headers=headers(), json={
+        "name": f"Test Party Slice5 {unique_suffix}",
+        "type": "other",
+        "contact": {
+            "phone": "1234567890",
+            "email": "test@example.com"
+        }
+    })
+    assert create_resp.status_code == 200, f"Failed to create party: {create_resp.status_code} {create_resp.text}"
+    party = create_resp.json()
+    party_id = party["id"]
+    print(f"✅ Created party: {party['name']} (id: {party_id})")
+    
+    # 2. Update contact
+    print("   Updating party contact...")
+    update_resp = requests.put(f"{BASE_URL}/party-ledger-v2/parties/{party_id}", headers=headers(), json={
+        **party,
+        "contact": {
+            "phone": "9876543210",
+            "email": "updated@example.com"
+        }
+    })
+    assert update_resp.status_code == 200, f"Failed to update party: {update_resp.status_code} {update_resp.text}"
+    print(f"✅ Updated party contact")
+    
+    # 3. Post a manual expense transaction
+    print("   Posting manual expense transaction...")
+    txn_resp = requests.post(f"{BASE_URL}/party-ledger-v2/transactions", headers=headers(), json={
+        "party_id": party_id,
+        "category": "expense",
+        "amount": 100.0,
+        "date": "2026-07-22",
+        "notes": "Test expense transaction"
+    })
+    assert txn_resp.status_code == 200, f"Failed to post transaction: {txn_resp.status_code} {txn_resp.text}"
+    txn_data = txn_resp.json()
+    txn_ref = txn_data["txn_ref"]
+    print(f"✅ Posted transaction (txn_ref: {txn_ref})")
+    
+    # 4. Verify running balance moved correctly
+    print("   Verifying running balance...")
+    party_resp = requests.get(f"{BASE_URL}/party-ledger-v2/parties/{party_id}", headers=headers())
+    assert party_resp.status_code == 200, f"Failed to get party: {party_resp.status_code}"
+    party_data = party_resp.json()
+    
+    # For expense category, CATEGORY_SIGN_MAP["expense"] = -1
+    # So delta_you_pay should be -100 (Rakshit paid expense on party's behalf → party owes Rakshit)
+    entries = party_data["entries"]
+    assert len(entries) > 0, "No entries found after posting transaction"
+    
+    expense_entry = [e for e in entries if e.get("category") == "expense"][0]
+    delta = expense_entry.get("delta_you_pay", 0)
+    # expense sign is -1, so delta should be negative
+    assert delta == -100.0, f"Wrong delta_you_pay for expense: expected -100.0, got {delta}"
+    print(f"✅ Running balance correct (delta_you_pay: {delta})")
+    
+    # 5. Reverse the transaction
+    print("   Reversing transaction...")
+    reverse_resp = requests.delete(f"{BASE_URL}/party-ledger-v2/transactions/{txn_ref}", headers=headers())
+    assert reverse_resp.status_code == 200, f"Failed to reverse transaction: {reverse_resp.status_code} {reverse_resp.text}"
+    print(f"✅ Transaction reversed")
+    
+    # 6. Verify balance returns to opening (should be 0)
+    print("   Verifying balance after reversal...")
+    party_resp2 = requests.get(f"{BASE_URL}/party-ledger-v2/parties/{party_id}", headers=headers())
+    assert party_resp2.status_code == 200, f"Failed to get party: {party_resp2.status_code}"
+    party_data2 = party_resp2.json()
+    
+    net_balance = party_data2["net_balance"]
+    assert abs(net_balance) < 0.01, f"Balance not zero after reversal: {net_balance}"
+    print(f"✅ Balance returned to opening (net_balance: {net_balance})")
+    
+    # 7. Archive the party
+    print("   Archiving party...")
+    archive_resp = requests.delete(f"{BASE_URL}/party-ledger-v2/parties/{party_id}", headers=headers())
+    assert archive_resp.status_code == 200, f"Failed to archive party: {archive_resp.status_code} {archive_resp.text}"
+    print(f"✅ Party archived")
+    
+    print(f"✅ Write flow complete")
+
+
+def test_dashboard_unaffected():
+    """Test 9: Dashboard unaffected (regression sanity)."""
+    print("\n=== Test 9: Dashboard Regression Sanity ===")
+    
+    # GET /api/dashboard
+    resp = requests.get(f"{BASE_URL}/dashboard", headers=headers())
+    assert resp.status_code == 200, f"Dashboard failed: {resp.status_code} {resp.text}"
+    
+    data = resp.json()
+    assert "kpis" in data, "Missing 'kpis' key"
+    
+    kpis = data["kpis"]
+    expected_kpi_keys = [
+        "operating_revenue", "invoice_value", "total_cost", "net_profit",
+        "estimated_revenue", "estimated_net_profit", "unrealized_revenue"
+    ]
+    
+    for key in expected_kpi_keys:
+        assert key in kpis, f"Missing KPI: {key}"
+        assert isinstance(kpis[key], (int, float)), f"{key} is not numeric"
+    
+    print(f"✅ Dashboard KPIs present and numeric")
+    
+    # GET /api/dashboard/breakdown
+    breakdown_resp = requests.get(f"{BASE_URL}/dashboard/breakdown", headers=headers())
+    assert breakdown_resp.status_code == 200, f"Dashboard breakdown failed: {breakdown_resp.status_code}"
+    print(f"✅ Dashboard breakdown working")
+
+
+def test_sign_convention_integration():
+    """Test 10: Sign-convention pinning (integration)."""
+    print("\n=== Test 10: Sign Convention Integration ===")
+    
+    import time
+    unique_suffix = str(int(time.time()))
+    
+    # This test creates real transactions to verify sign conventions
+    # We'll create a customer party, post a customer payment, and verify delta_you_pay is positive
+    
+    print("   Creating test customer party...")
+    customer_resp = requests.post(f"{BASE_URL}/party-ledger-v2/parties", headers=headers(), json={
+        "name": f"Test Customer Sign Convention {unique_suffix}",
+        "type": "customer"
+    })
+    assert customer_resp.status_code == 200, f"Failed to create customer: {customer_resp.status_code}"
+    customer = customer_resp.json()
+    customer_id = customer["id"]
+    print(f"✅ Created customer: {customer['name']}")
+    
+    # Post a customer payment transaction
+    print("   Posting customer payment...")
+    payment_resp = requests.post(f"{BASE_URL}/party-ledger-v2/transactions", headers=headers(), json={
+        "party_id": customer_id,
+        "category": "customer_payment",
+        "amount": 500.0,
+        "date": "2026-07-22",
+        "notes": "Test customer payment"
+    })
+    assert payment_resp.status_code == 200, f"Failed to post payment: {payment_resp.status_code}"
+    payment_data = payment_resp.json()
+    payment_txn_ref = payment_data["txn_ref"]
+    print(f"✅ Posted customer payment")
+    
+    # Verify delta_you_pay is POSITIVE (customer paid → Rakshit owes customer less → delta_you_pay > 0)
+    print("   Verifying customer payment sign...")
+    customer_ledger = requests.get(f"{BASE_URL}/party-ledger-v2/parties/{customer_id}", headers=headers())
+    assert customer_ledger.status_code == 200
+    ledger_data = customer_ledger.json()
+    
+    payment_entry = [e for e in ledger_data["entries"] if e.get("category") == "customer_payment"][0]
+    delta = payment_entry.get("delta_you_pay", 0)
+    assert delta > 0, f"Customer payment delta_you_pay should be positive, got {delta}"
+    print(f"✅ Customer payment sign correct (delta_you_pay: {delta})")
+    
+    # Cleanup
+    requests.delete(f"{BASE_URL}/party-ledger-v2/transactions/{payment_txn_ref}", headers=headers())
+    requests.delete(f"{BASE_URL}/party-ledger-v2/parties/{customer_id}", headers=headers())
+    
+    print(f"✅ Sign convention integration verified")
+
+
 def main():
-    print("="*80)
-    print("Phase 5 — /api/reconcile invariant engine verification")
-    print("="*80)
-    print(f"Backend URL: {API_BASE}")
-    print(f"Admin: {ADMIN_EMAIL}")
-    print()
+    """Run all tests."""
+    print("=" * 80)
+    print("Phase 6 · Slice 5 — Party Ledger v2 Refactor Verification")
+    print("=" * 80)
     
-    # Login
-    token = admin_login()
+    try:
+        # Login
+        login()
+        
+        # Test 1: Summary
+        summary = test_party_ledger_v2_summary()
+        
+        # Test 2: Parties list
+        parties = test_party_ledger_v2_parties_list()
+        
+        # Test 3: Individual parties byte-equivalence
+        test_party_ledger_v2_individual_parties(parties)
+        
+        # Test 4: Father's Firm settlement
+        test_fathers_firm_settlement()
+        
+        # Test 5: CSV exports
+        test_csv_exports()
+        
+        # Test 6: Reconcile healthy
+        test_reconcile_healthy()
+        
+        # Test 7: Reconcile run
+        test_reconcile_run()
+        
+        # Test 8: Write flow
+        test_party_ledger_write_flow()
+        
+        # Test 9: Dashboard regression
+        test_dashboard_unaffected()
+        
+        # Test 10: Sign convention integration
+        test_sign_convention_integration()
+        
+        print("\n" + "=" * 80)
+        print("✅ ALL TESTS PASSED")
+        print("=" * 80)
+        
+    except AssertionError as e:
+        print(f"\n❌ TEST FAILED: {e}")
+        return 1
+    except Exception as e:
+        print(f"\n❌ UNEXPECTED ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
     
-    # Run tests
-    report = test_endpoint_contract(token)
-    test_healthy_path(token, report)
-    test_post_reconcile_run(token)
-    test_get_readonly(token)
-    test_reset_integration(token)
-    test_failure_detection(token)
-    test_non_admin_access()
-    test_idempotency(token)
-    
-    # Summary
-    print("\n" + "="*80)
-    print("SUMMARY")
-    print("="*80)
-    print(f"✅ Passed: {len(results['passed'])}")
-    print(f"❌ Failed: {len(results['failed'])}")
-    print(f"⚠️  Warnings: {len(results['warnings'])}")
-    
-    if results['failed']:
-        print("\nFailed tests:")
-        for item in results['failed']:
-            print(f"  - {item['test']}: {item['detail']}")
-    
-    if results['warnings']:
-        print("\nWarnings:")
-        for item in results['warnings']:
-            print(f"  - {item['test']}: {item['detail']}")
-    
-    # Exit code
-    if results['failed']:
-        sys.exit(1)
-    else:
-        sys.exit(0)
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    exit(main())

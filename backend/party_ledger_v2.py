@@ -48,13 +48,19 @@ from typing import List, Optional, Literal
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-# Phase 6 · Slice 5 — the sign convention, settled threshold, and
-# paise-safe money conversion all live in the shared domain layer now.
+# Phase 6 · Slice 5 — the sign convention, settled threshold, paise-safe
+# money conversion, running-balance accumulation, and Father's Firm status
+# all live in the shared domain layer now.
 from domain import (
     to_paise, from_paise,
     party_delta_for_row as _domain_party_delta,
     party_status_from_paise as _domain_party_status,
     CATEGORY_SIGN_MAP as _DOMAIN_CATEGORY_SIGN,
+    annotate_running_balances_paise as _domain_annotate_running,
+    sum_delta_you_pay_paise as _domain_sum_delta_you_pay,
+    derived_row_delta_paise as _domain_derived_delta,
+    fathers_firm_signed_amount_paise as _domain_ff_signed,
+    fathers_firm_status_label as _domain_ff_status,
 )
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -228,17 +234,18 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
         # Sales invoices — one line per order (uses stored invoice_total which
         # already reflects shipped-portion tax).
         async for o in db.orders.find({"client_name": pname}, {"_id": 0}):
-            inv = float(o.get("invoice_total") or 0)
-            if inv <= 0 and not (o.get("shipments") or []):
+            inv_p = to_paise(o.get("invoice_total"))
+            if inv_p <= 0 and not (o.get("shipments") or []):
                 continue
+            delta_p = _domain_derived_delta("sale_invoice", inv_p)
             out.append({
                 "id": f"ORD-{o.get('id')}",
                 "txn_ref": f"order:{o.get('id')}",
                 "party_id": party["id"], "party_name": pname,
                 "date": o.get("last_shipped_date") or o.get("shipped_date") or o.get("order_date"),
                 "category": "sale_invoice",
-                "amount": inv,
-                "delta_you_pay": -inv,
+                "amount": from_paise(inv_p),
+                "delta_you_pay": from_paise(delta_p),
                 "notes": f"Order #{(o.get('id') or '')[:8]}",
                 "related_order_id": o.get("id"),
                 "origin": "auto",
@@ -246,15 +253,16 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
             })
         # Customer receipts
         async for pay in db.customer_payments.find({"customer_name": pname}, {"_id": 0}):
-            amt = from_paise(to_paise(pay.get("amount")))
+            amt_p = to_paise(pay.get("amount"))
+            delta_p = _domain_derived_delta("customer_payment", amt_p)
             out.append({
                 "id": f"CP-{pay.get('id')}",
                 "txn_ref": f"cust_payment:{pay.get('id')}",
                 "party_id": party["id"], "party_name": pname,
                 "date": pay.get("date"),
                 "category": "customer_payment",
-                "amount": amt,
-                "delta_you_pay": +amt,
+                "amount": from_paise(amt_p),
+                "delta_you_pay": from_paise(delta_p),
                 "notes": f"Payment · {pay.get('mode') or 'Cash'}"
                          + (f" → {pay.get('account_name')}" if pay.get("account_name") else "")
                          + (f" · Ref {pay.get('reference')}" if pay.get("reference") else ""),
@@ -271,15 +279,16 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
         if party.get("legacy_vendor_id"):
             query = {"$or": [{"vendor_id": party["legacy_vendor_id"]}, {"vendor_name": pname}]}
         async for pur in db.purchases.find(query, {"_id": 0}):
-            inv = float(pur.get("invoice_total") or 0)
+            inv_p = to_paise(pur.get("invoice_total"))
+            delta_p = _domain_derived_delta("purchase", inv_p)
             out.append({
                 "id": f"PUR-{pur.get('id')}",
                 "txn_ref": f"purchase:{pur.get('id')}",
                 "party_id": party["id"], "party_name": pname,
                 "date": pur.get("purchase_date") or pur.get("date") or pur.get("created_at"),
                 "category": "purchase",
-                "amount": inv,
-                "delta_you_pay": +inv,
+                "amount": from_paise(inv_p),
+                "delta_you_pay": from_paise(delta_p),
                 "notes": f"Purchase #{(pur.get('id') or '')[:8]}"
                          + (f" · Bill {pur.get('bill_number')}" if pur.get("bill_number") else ""),
                 "related_purchase_id": pur.get("id"),
@@ -288,15 +297,16 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
             })
         # Vendor payments
         async for pay in db.purchase_payments.find({"vendor_name": pname}, {"_id": 0}):
-            amt = from_paise(to_paise(pay.get("amount")))
+            amt_p = to_paise(pay.get("amount"))
+            delta_p = _domain_derived_delta("vendor_payment", amt_p)
             out.append({
                 "id": f"PP-{pay.get('id')}",
                 "txn_ref": f"purchase_payment:{pay.get('id')}",
                 "party_id": party["id"], "party_name": pname,
                 "date": pay.get("date"),
                 "category": "vendor_payment",
-                "amount": amt,
-                "delta_you_pay": -amt,
+                "amount": from_paise(amt_p),
+                "delta_you_pay": from_paise(delta_p),
                 "notes": f"Payment · {pay.get('mode') or 'Cash'}"
                          + (f" ← {pay.get('account_name')}" if pay.get("account_name") else "")
                          + (f" · Ref {pay.get('reference')}" if pay.get("reference") else ""),
@@ -316,17 +326,18 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
         async for pur in db.purchases.find(
             {"vendor_name": pname}, {"_id": 0},
         ):
-            inv = float(pur.get("invoice_total") or 0)
-            if inv <= 0:
+            inv_p = to_paise(pur.get("invoice_total"))
+            if inv_p <= 0:
                 continue
+            delta_p = _domain_derived_delta("purchase", inv_p)
             out.append({
                 "id": f"PUR-{pur.get('id')}",
                 "txn_ref": f"purchase:{pur.get('id')}",
                 "party_id": party["id"], "party_name": pname,
                 "date": pur.get("purchase_date") or pur.get("date") or pur.get("created_at"),
                 "category": "purchase",
-                "amount": inv,
-                "delta_you_pay": +inv,
+                "amount": from_paise(inv_p),
+                "delta_you_pay": from_paise(delta_p),
                 "notes": f"Factory purchase #{(pur.get('id') or '')[:8]}"
                          + (f" · Order {(pur.get('linked_to_order_id') or '')[:8]}"
                             if pur.get("linked_to_order_id") else "")
@@ -338,17 +349,18 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
                 "created_at": pur.get("created_at"),
             })
         async for pay in db.purchase_payments.find({"vendor_name": pname}, {"_id": 0}):
-            amt = from_paise(to_paise(pay.get("amount")))
-            if amt <= 0:
+            amt_p = to_paise(pay.get("amount"))
+            if amt_p <= 0:
                 continue
+            delta_p = _domain_derived_delta("vendor_payment", amt_p)
             out.append({
                 "id": f"PP-{pay.get('id')}",
                 "txn_ref": f"purchase_payment:{pay.get('id')}",
                 "party_id": party["id"], "party_name": pname,
                 "date": pay.get("date"),
                 "category": "vendor_payment",
-                "amount": amt,
-                "delta_you_pay": -amt,
+                "amount": from_paise(amt_p),
+                "delta_you_pay": from_paise(delta_p),
                 "notes": f"Payment to Father's Firm · {pay.get('mode') or 'Cash'}"
                          + (f" ← {pay.get('account_name')}" if pay.get("account_name") else "")
                          + (f" · Ref {pay.get('reference')}" if pay.get("reference") else ""),
@@ -360,16 +372,21 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
             })
 
     # Opening balance as a synthetic first entry
-    ob = float(party.get("opening_balance") or 0)
-    if abs(ob) >= 0.01:
+    # `opening_balance` may be signed on the party doc: +ve = you owe them,
+    # -ve = they owe you. Routed through the domain helper (which passes the
+    # sign through unchanged for this category) so the paise-safe path is
+    # single-sourced.
+    ob_p = to_paise(party.get("opening_balance"))
+    if abs(ob_p) >= 1:  # >=1 paise (matches pre-Slice-5 `abs(ob) >= 0.01`)
+        delta_p = _domain_derived_delta("opening_balance", ob_p)
         out.append({
             "id": f"OPEN-{party['id']}",
             "txn_ref": f"opening:{party['id']}",
             "party_id": party["id"], "party_name": pname,
             "date": party.get("opening_date") or party.get("created_at"),
             "category": "opening_balance",
-            "amount": abs(ob),
-            "delta_you_pay": ob,
+            "amount": from_paise(abs(ob_p)),
+            "delta_you_pay": from_paise(delta_p),
             "notes": party.get("opening_notes") or "Opening balance",
             "origin": "auto",
             "created_at": party.get("created_at"),
@@ -388,10 +405,15 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
         async for pay in db.purchase_payments.find(
             {"paid_by_party_id": party["id"]}, {"_id": 0},
         ):
-            full_amt = from_paise(to_paise(pay.get("amount")))
+            full_amt_p = to_paise(pay.get("amount"))
             split = pay.get("split_paid_by_amount")
-            eff_amt = float(split) if split is not None else full_amt
-            if eff_amt <= 0:
+            eff_amt_p = to_paise(split) if split is not None else full_amt_p
+            # Clamp to [0, full] to match pre-Slice-5 min/max semantics.
+            if eff_amt_p < 0:
+                eff_amt_p = 0
+            if eff_amt_p > full_amt_p:
+                eff_amt_p = full_amt_p
+            if eff_amt_p <= 0:
                 continue
             out.append({
                 "id": f"PP-LINK-{pay.get('id')}",
@@ -399,8 +421,13 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
                 "party_id": party["id"], "party_name": pname,
                 "date": pay.get("date"),
                 "category": "vendor_payment",
-                "amount": eff_amt,
-                "delta_you_pay": +eff_amt,   # you now owe this party more
+                "amount": from_paise(eff_amt_p),
+                # Linked party paid on Rakshit's behalf → Rakshit now owes them
+                # MORE → delta_you_pay is +eff_amt (opposite of the normal
+                # vendor_payment sign because here the party is the SPONSOR,
+                # not the vendor). This is a pre-existing exception to the
+                # category-sign rule so we compute it directly.
+                "delta_you_pay": from_paise(+eff_amt_p),
                 "notes": f"Paid to {pay.get('vendor_name')} on your behalf"
                          + (f" · Ref {pay.get('reference')}" if pay.get("reference") else ""),
                 "related_purchase_payment_id": pay.get("id"),
@@ -415,8 +442,8 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
         async for pay in db.customer_payments.find(
             {"received_by_party_id": party["id"]}, {"_id": 0},
         ):
-            amt = from_paise(to_paise(pay.get("amount")))
-            if amt <= 0:
+            amt_p = to_paise(pay.get("amount"))
+            if amt_p <= 0:
                 continue
             out.append({
                 "id": f"CP-LINK-{pay.get('id')}",
@@ -424,8 +451,12 @@ async def _derived_entries_for_party(db, party: dict) -> List[dict]:
                 "party_id": party["id"], "party_name": pname,
                 "date": pay.get("date"),
                 "category": "customer_payment",
-                "amount": amt,
-                "delta_you_pay": -amt,   # you now hold Rakshit's money → they owe you back
+                "amount": from_paise(amt_p),
+                # Linked party is HOLDING money owed to Rakshit → they owe him.
+                # Pre-existing exception to the category-sign rule (normal
+                # customer_payment on a customer party is +ve = Rakshit owes
+                # customer less; on the LINKED sponsor party it must be -ve).
+                "delta_you_pay": from_paise(-amt_p),
                 "notes": f"Collected from {pay.get('customer_name')} on your behalf"
                          + (f" · Ref {pay.get('reference')}" if pay.get("reference") else ""),
                 "related_customer_payment_id": pay.get("id"),
@@ -468,25 +499,23 @@ async def _party_full_ledger(db, party: dict, include_reversed: bool = False) ->
 
     entries.sort(key=_sort_key)
 
-    balance = 0.0
+    # Phase 6 · Slice 5 — running balance walk now happens in paise via the
+    # shared domain helper. Each entry is annotated with `running_balance`
+    # (float rupees, back-compat), `running_balance_paise` (int, exact),
+    # `running_status`, and `counts_in_balance` — see domain.annotate_running_balances_paise.
+    bal_paise = _domain_annotate_running(entries)
     for e in entries:
-        # reversed / reversal entries are excluded from balance running but shown in audit view
-        counts_in_balance = not (e.get("origin") == "reversal" or e.get("reversed_at"))
-        if counts_in_balance:
-            balance += float(e.get("delta_you_pay") or 0)
-        e["running_balance"] = round(balance, 2)
-        e["running_status"] = _status_from_balance(balance)
-        e["counts_in_balance"] = counts_in_balance
         e["category_label"] = CATEGORY_LABELS.get(e.get("category"), e.get("category"))
 
-    bal_r = round(balance, 2)
+    bal_r = from_paise(bal_paise)
     return {
         "party": party,
         "entries": entries,
         "net_balance": bal_r,
-        "status": _status_from_balance(bal_r),
-        "you_pay": bal_r if bal_r > 0 else 0.0,
-        "you_receive": -bal_r if bal_r < 0 else 0.0,
+        "net_balance_paise": bal_paise,
+        "status": _domain_party_status(bal_paise),
+        "you_pay": bal_r if bal_paise > 0 else 0.0,
+        "you_receive": from_paise(-bal_paise) if bal_paise < 0 else 0.0,
     }
 
 
@@ -572,37 +601,38 @@ def make_router(db):
 
     @r.get("/summary")
     async def dashboard_summary():
-        """Aggregate cards for the dashboard."""
+        """Aggregate cards for the dashboard. Accumulates totals in PAISE
+        (Slice 5) so the roll-ups are drift-free regardless of ledger size."""
         parties = await db.parties.find({"archived": False}, {"_id": 0}).to_list(5000)
-        totals = {
-            "fathers_firm_you_pay": 0.0,
-            "fathers_firm_you_receive": 0.0,
-            "vendor_you_pay": 0.0,
-            "vendor_advances_you_receive": 0.0,
-            "customer_you_receive": 0.0,
-            "customer_advances_you_pay": 0.0,
-            "net_position": 0.0,   # positive = you pay overall, negative = you receive overall
+        totals_p = {
+            "fathers_firm_you_pay": 0,
+            "fathers_firm_you_receive": 0,
+            "vendor_you_pay": 0,
+            "vendor_advances_you_receive": 0,
+            "customer_you_receive": 0,
+            "customer_advances_you_pay": 0,
+            "net_position": 0,   # positive = you pay overall, negative = you receive overall
         }
         for p in parties:
             data = await _party_full_ledger(db, p)
-            bal = data["net_balance"]
-            totals["net_position"] += bal
+            bal_p = int(data.get("net_balance_paise") or 0)
+            totals_p["net_position"] += bal_p
             if p["type"] == "fathers_firm":
-                if bal > 0:
-                    totals["fathers_firm_you_pay"] += bal
+                if bal_p > 0:
+                    totals_p["fathers_firm_you_pay"] += bal_p
                 else:
-                    totals["fathers_firm_you_receive"] += -bal
+                    totals_p["fathers_firm_you_receive"] += -bal_p
             elif p["type"] == "vendor":
-                if bal > 0:
-                    totals["vendor_you_pay"] += bal
+                if bal_p > 0:
+                    totals_p["vendor_you_pay"] += bal_p
                 else:
-                    totals["vendor_advances_you_receive"] += -bal
+                    totals_p["vendor_advances_you_receive"] += -bal_p
             elif p["type"] == "customer":
-                if bal < 0:
-                    totals["customer_you_receive"] += -bal
+                if bal_p < 0:
+                    totals_p["customer_you_receive"] += -bal_p
                 else:
-                    totals["customer_advances_you_pay"] += bal
-        return {k: round(v, 2) for k, v in totals.items()}
+                    totals_p["customer_advances_you_pay"] += bal_p
+        return {k: from_paise(v) for k, v in totals_p.items()}
 
     @r.get("/parties/{pid}")
     async def get_party(pid: str, include_reversed: bool = False):
@@ -986,37 +1016,35 @@ def make_router(db):
         there is no drift or double-counting. Also returns the underlying
         signed balance from the party ledger so the frontend can display a
         single card without doing any calculation itself.
+
+        Phase 6 · Slice 5 — sign convention + settled threshold now live in
+        `domain.fathers_firm_signed_amount_paise` /
+        `domain.fathers_firm_status_label`. The FF-side delta contributed by
+        `db.transfers` still comes from `transfers.ff_settlement_delta_from_transfers`
+        (which uses the party-ledger convention: rakshit_to_ff → -amount).
         """
         p = await db.parties.find_one({"type": "fathers_firm", "archived": False}, {"_id": 0})
         if not p:
             return {"balance_signed": 0.0, "amount": 0.0, "status": "settled",
                     "label": "Father's Firm Settlement", "party_id": None}
         data = await _party_full_ledger(db, p)
-        # In this ledger convention, delta_you_pay > 0 means Rakshit owes party
-        # (you_pay), and < 0 means party owes Rakshit (you_receive). Convert to a
-        # single signed "amount" where +ve = you_receive, -ve = you_pay to match
-        # the UI spec (Positive → You Receive).
-        bal = float(data.get("net_balance") or 0.0)
+        ledger_bal_p = int(data.get("net_balance_paise") or 0)
         # Phase 3: fold in derived transfer effects. `db.transfers` is the sole
         # source of truth for account-level transfers involving FF, so its
         # signed contribution must be added to the ledger-entry-derived total.
+        transfer_delta_p = 0
         try:
             from transfers import ff_settlement_delta_from_transfers
-            bal += await ff_settlement_delta_from_transfers(db)
+            transfer_delta_p = to_paise(await ff_settlement_delta_from_transfers(db))
         except Exception:
-            pass
-        signed = -bal  # flip sign so +ve = you_receive
-        if signed > 0.5:
-            status = "you_receive"
-        elif signed < -0.5:
-            status = "you_pay"
-        else:
-            status = "settled"
+            transfer_delta_p = 0
+        signed_p = _domain_ff_signed(ledger_bal_p, transfer_delta_p)
+        status = _domain_ff_status(signed_p)
         return {
             "party_id": p.get("id"),
             "party_name": p.get("name"),
-            "balance_signed": round(signed, 2),
-            "amount": round(abs(signed), 2),
+            "balance_signed": from_paise(signed_p),
+            "amount": from_paise(abs(signed_p)),
             "status": status,
             "label": "Father's Firm Settlement",
         }
@@ -1032,35 +1060,41 @@ def make_router(db):
 
     @r.get("/exports/summary.csv")
     async def export_summary_csv():
-        # Reuse the same aggregation logic as /summary
+        # Reuse the same aggregation logic as /summary — paise-safe (Slice 5).
         parties = await db.parties.find({"archived": False}, {"_id": 0}).to_list(5000)
-        totals = {
-            "fathers_firm_you_pay": 0.0, "fathers_firm_you_receive": 0.0,
-            "vendor_you_pay": 0.0, "vendor_advances_you_receive": 0.0,
-            "customer_you_receive": 0.0, "customer_advances_you_pay": 0.0,
-            "net_position": 0.0,
+        totals_p = {
+            "fathers_firm_you_pay": 0, "fathers_firm_you_receive": 0,
+            "vendor_you_pay": 0, "vendor_advances_you_receive": 0,
+            "customer_you_receive": 0, "customer_advances_you_pay": 0,
+            "net_position": 0,
         }
         for p in parties:
             data = await _party_full_ledger(db, p)
-            bal = data["net_balance"]
-            totals["net_position"] += bal
+            bal_p = int(data.get("net_balance_paise") or 0)
+            totals_p["net_position"] += bal_p
             if p["type"] == "fathers_firm":
-                (totals.__setitem__("fathers_firm_you_pay", totals["fathers_firm_you_pay"] + bal) if bal > 0
-                 else totals.__setitem__("fathers_firm_you_receive", totals["fathers_firm_you_receive"] + (-bal)))
+                if bal_p > 0:
+                    totals_p["fathers_firm_you_pay"] += bal_p
+                else:
+                    totals_p["fathers_firm_you_receive"] += -bal_p
             elif p["type"] == "vendor":
-                (totals.__setitem__("vendor_you_pay", totals["vendor_you_pay"] + bal) if bal > 0
-                 else totals.__setitem__("vendor_advances_you_receive", totals["vendor_advances_you_receive"] + (-bal)))
+                if bal_p > 0:
+                    totals_p["vendor_you_pay"] += bal_p
+                else:
+                    totals_p["vendor_advances_you_receive"] += -bal_p
             elif p["type"] == "customer":
-                (totals.__setitem__("customer_you_receive", totals["customer_you_receive"] + (-bal)) if bal < 0
-                 else totals.__setitem__("customer_advances_you_pay", totals["customer_advances_you_pay"] + bal))
+                if bal_p < 0:
+                    totals_p["customer_you_receive"] += -bal_p
+                else:
+                    totals_p["customer_advances_you_pay"] += bal_p
         rows = [
-            {"metric": "You Pay Father's Firm",       "amount": round(totals["fathers_firm_you_pay"], 2)},
-            {"metric": "You Receive from Father's Firm", "amount": round(totals["fathers_firm_you_receive"], 2)},
-            {"metric": "Total vendor payables",       "amount": round(totals["vendor_you_pay"], 2)},
-            {"metric": "Vendor advances",             "amount": round(totals["vendor_advances_you_receive"], 2)},
-            {"metric": "Customer receivables",        "amount": round(totals["customer_you_receive"], 2)},
-            {"metric": "Customer advances",           "amount": round(totals["customer_advances_you_pay"], 2)},
-            {"metric": "Net settlement position",     "amount": round(totals["net_position"], 2)},
+            {"metric": "You Pay Father's Firm",       "amount": from_paise(totals_p["fathers_firm_you_pay"])},
+            {"metric": "You Receive from Father's Firm", "amount": from_paise(totals_p["fathers_firm_you_receive"])},
+            {"metric": "Total vendor payables",       "amount": from_paise(totals_p["vendor_you_pay"])},
+            {"metric": "Vendor advances",             "amount": from_paise(totals_p["vendor_advances_you_receive"])},
+            {"metric": "Customer receivables",        "amount": from_paise(totals_p["customer_you_receive"])},
+            {"metric": "Customer advances",           "amount": from_paise(totals_p["customer_advances_you_pay"])},
+            {"metric": "Net settlement position",     "amount": from_paise(totals_p["net_position"])},
         ]
         return _stream_csv(rows, "party_ledger_summary.csv")
 
